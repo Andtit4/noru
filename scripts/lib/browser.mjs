@@ -51,14 +51,26 @@ export async function launchBrowser(path = findBrowser()) {
     'about:blank',
   ])
   let port
+  const portFile = join(profile, 'DevToolsActivePort')
   for (let i = 0; i < 150 && !port; i++) {
     await sleep(100)
-    const file = join(profile, 'DevToolsActivePort')
-    if (existsSync(file)) port = readFileSync(file, 'utf8').split('\n')[0].trim()
+    try {
+      // The browser may still be writing the file: EBUSY on Windows, or partial content.
+      const first = readFileSync(portFile, 'utf8').split('\n')[0].trim()
+      if (/^\d+$/.test(first)) port = first
+    } catch {}
   }
   if (!port) throw new Error('browser did not start')
-  const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()
-  const ws = new WebSocket(targets.find((t) => t.type === 'page').webSocketDebuggerUrl)
+  let page
+  for (let i = 0; i < 50 && !page; i++) {
+    try {
+      const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json()
+      page = targets.find((t) => t.type === 'page')
+    } catch {}
+    if (!page) await sleep(100)
+  }
+  if (!page) throw new Error('browser did not open a page')
+  const ws = new WebSocket(page.webSocketDebuggerUrl)
   await new Promise((resolve) => ws.addEventListener('open', resolve, { once: true }))
   let nextId = 1
   const pending = new Map()
