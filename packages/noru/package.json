@@ -44,7 +44,7 @@
   },
   "napi": {
     "binaryName": "noru",
-    "packageName": "noru",
+    "packageName": "@titoandele/noru",
     "targets": [
       "x86_64-pc-windows-msvc",
       "aarch64-pc-windows-msvc",

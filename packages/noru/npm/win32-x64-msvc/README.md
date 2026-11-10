@@ -1,3 +1,3 @@
-# `noru-win32-x64-msvc`
+# `@titoandele/noru-win32-x64-msvc`
 
-This is the **x86_64-pc-windows-msvc** binary for `noru`
+This is the **x86_64-pc-windows-msvc** binary for `@titoandele/noru`

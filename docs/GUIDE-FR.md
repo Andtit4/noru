@@ -67,7 +67,7 @@ crates/noru_core/     Le cœur en Rust : analyse, transformation, bundling, serv
   src/vendor/         Runtime React Refresh (licence MIT, Meta)
 crates/noru_cli/      La commande `noru` en Rust (pour développer et tester vite)
 packages/noru/        Le package npm : module natif Node (napi-rs) + commande `noru` en JS
-  npm/                Un sous-package par plateforme (noru-win32-x64-msvc, noru-darwin-arm64, ...)
+  npm/                Un sous-package par plateforme (@titoandele/noru-win32-x64-msvc, ...)
 fixtures/             Projets de test : react-ts (template Vite) et features (33 auto-tests)
 scripts/              Tests de bout en bout, benchmarks, générateur de gros projet
 .github/workflows/    CI (tests à chaque push) et Release (publication npm sur un tag)
@@ -112,9 +112,11 @@ Le projet doit avoir un `index.html` à la racine avec `<script type="module" sr
 
 ## 5. Publier sur npm
 
-Ce qui est publié : le paquet `noru` (JS + commande) et 8 paquets `noru-<plateforme>` qui contiennent
-le binaire natif (npm n'installe que celui de la machine). Le scope `@noru` appartient déjà à
-quelqu'un d'autre sur npm, d'où ces noms sans scope.
+Ce qui est publié : le paquet `noru` (JS + commande) et 8 paquets `@titoandele/noru-<plateforme>`
+qui contiennent le binaire natif (npm n'installe que celui de la machine). Pourquoi l'organisation
+`titoandele` : le scope `@noru` appartient déjà à quelqu'un d'autre, et npm bloque les noms sans
+scope du type `noru-win32-x64-msvc` (« spam detection »). Le token npm doit pouvoir publier dans
+l'organisation `titoandele`.
 
 À faire une seule fois :
 

@@ -1,5 +1,5 @@
 {
-  "name": "noru-darwin-arm64",
+  "name": "@titoandele/noru-darwin-arm64",
   "version": "0.1.0",
   "cpu": [
     "arm64"

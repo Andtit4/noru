@@ -1,3 +1,3 @@
-# `noru-linux-arm64-gnu`
+# `@titoandele/noru-linux-arm64-gnu`
 
-This is the **aarch64-unknown-linux-gnu** binary for `noru`
+This is the **aarch64-unknown-linux-gnu** binary for `@titoandele/noru`

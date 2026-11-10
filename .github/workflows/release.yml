@@ -1,7 +1,7 @@
 name: Release
 
 # Pushing a tag like v0.1.0 builds noru for 8 platforms and publishes it to npm:
-# `noru` (JS + CLI) and the native binaries `noru-<platform>` (optional dependencies).
+# `noru` (JS + CLI) and the native binaries `@titoandele/noru-<platform>` (optional dependencies).
 #
 # Requires the repository secret NPM_TOKEN (npm granular access token, read and write).
 #

@@ -1,5 +1,5 @@
 {
-  "name": "noru-win32-arm64-msvc",
+  "name": "@titoandele/noru-win32-arm64-msvc",
   "version": "0.1.0",
   "cpu": [
     "arm64"
