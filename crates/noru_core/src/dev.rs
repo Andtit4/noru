@@ -205,7 +205,7 @@ impl DevServer {
         watch_project(&mut watcher, &root, &out_dir);
 
         let rebuild_shared = Arc::clone(&shared);
-        let rebuild_root = root.clone();
+        let project = ProjectRoot::new(&root);
         std::thread::spawn(move || {
             while let Ok(first) = rx.recv() {
                 let mut events = vec![first];
@@ -218,11 +218,11 @@ impl DevServer {
                         Err(RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                let changed = relevant_paths(events, &rebuild_root, &out_dir);
+                let changed = relevant_paths(events, &project, &out_dir);
                 if changed.is_empty() || rebuild_shared.shutdown.load(Ordering::Relaxed) {
                     continue;
                 }
-                rebuild(&mut builder, &rebuild_shared, &rebuild_root, &changed, log);
+                rebuild(&mut builder, &rebuild_shared, &project, &changed, log);
             }
         });
 
@@ -281,8 +281,9 @@ impl DevServer {
     }
 }
 
-fn rebuild(builder: &mut Builder, shared: &Shared, root: &Path, changed: &[PathBuf], log: bool) {
+fn rebuild(builder: &mut Builder, shared: &Shared, project: &ProjectRoot, changed: &[PathBuf], log: bool) {
     let started = Instant::now();
+    let root = &project.root;
     let is_env = |p: &PathBuf| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(".env"));
     let env_changed = changed.iter().any(is_env);
     let html_changed = changed.iter().any(|p| p == &root.join("index.html"));
@@ -290,7 +291,10 @@ fn rebuild(builder: &mut Builder, shared: &Shared, root: &Path, changed: &[PathB
         // Compile-time constants changed: every module must be processed again.
         builder.cache.clear();
     } else {
-        builder.cache.invalidate(changed);
+        // Modules found by the resolver are keyed by their real path (symlinks resolved).
+        let mut stale = changed.to_vec();
+        stale.extend(changed.iter().filter_map(|p| project.to_real(p)));
+        builder.cache.invalidate(&stale);
     }
     let names: Vec<String> = changed
         .iter()
@@ -395,7 +399,45 @@ fn watch_project(watcher: &mut RecommendedWatcher, root: &Path, out_dir: &Path) 
     }
 }
 
-fn relevant_paths(events: Vec<notify::Result<notify::Event>>, root: &Path, out_dir: &Path) -> Vec<PathBuf> {
+/// The project root as configured and, when it differs, its real path (symlinks resolved).
+/// File watchers report real paths: on macOS a project in `/var/folders/...` (the temp dir) is
+/// reported as `/private/var/folders/...`. The rest of the dev server uses the configured root.
+struct ProjectRoot {
+    root: PathBuf,
+    real: Option<PathBuf>,
+}
+
+impl ProjectRoot {
+    fn new(root: &Path) -> Self {
+        let real = std::fs::canonicalize(root).ok().map(strip_verbatim_prefix).filter(|real| real != root);
+        Self { root: root.to_path_buf(), real }
+    }
+
+    /// Maps a path reported by the watcher to the configured root (`None`: outside the project).
+    fn to_project(&self, path: &Path) -> Option<PathBuf> {
+        if path.starts_with(&self.root) {
+            return Some(path.to_path_buf());
+        }
+        let rest = path.strip_prefix(self.real.as_ref()?).ok()?;
+        Some(self.root.join(rest))
+    }
+
+    /// The real path of a project file, when it differs.
+    fn to_real(&self, path: &Path) -> Option<PathBuf> {
+        let rest = path.strip_prefix(&self.root).ok()?;
+        Some(self.real.as_ref()?.join(rest))
+    }
+}
+
+/// `\\?\C:\dir` (what `canonicalize` returns on Windows) -> `C:\dir`.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    match path.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
+}
+
+fn relevant_paths(events: Vec<notify::Result<notify::Event>>, project: &ProjectRoot, out_dir: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = events
         .into_iter()
         .flatten()
@@ -403,6 +445,7 @@ fn relevant_paths(events: Vec<notify::Result<notify::Event>>, root: &Path, out_d
             matches!(e.kind, EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) | EventKind::Any)
         })
         .flat_map(|e| e.paths)
+        .filter_map(|p| project.to_project(&p))
         .filter(|p| {
             !p.starts_with(out_dir)
                 && !p.components().any(|c| {
@@ -410,7 +453,6 @@ fn relevant_paths(events: Vec<notify::Result<notify::Event>>, root: &Path, out_d
                     s == "node_modules" || s == ".git"
                 })
                 && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| !n.ends_with('~') && !n.ends_with(".swp"))
-                && p.starts_with(root)
                 && !p.is_dir()
         })
         .collect();
@@ -539,4 +581,47 @@ fn paint(code: &str, text: &str) -> String {
 /// Dev responses: no gzip (on localhost it costs more CPU time than it saves).
 fn dev_ok<'a>(content_type: &'a str, body: &'a [u8]) -> Response<'a> {
     Response { compress: false, ..Response::ok(content_type, body) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{CreateKind, ModifyKind};
+
+    fn event(kind: EventKind, path: &str) -> notify::Result<notify::Event> {
+        Ok(notify::Event::new(kind).add_path(PathBuf::from(path)))
+    }
+
+    #[test]
+    fn watcher_paths_through_a_symlinked_root() {
+        // macOS: the temp dir /var/folders/... is a symlink to /private/var/folders/..., and the
+        // watcher reports the real path.
+        let root = PathBuf::from("/var/folders/app");
+        let project = ProjectRoot { root: root.clone(), real: Some(PathBuf::from("/private/var/folders/app")) };
+        let modify = EventKind::Modify(ModifyKind::Any);
+        let events = vec![
+            event(modify, "/private/var/folders/app/src/App.tsx"),
+            event(EventKind::Create(CreateKind::File), "/var/folders/app/src/New.tsx"),
+            event(modify, "/private/var/folders/app/index.html"),
+            event(modify, "/private/var/folders/app/dist/index.html"),
+            event(modify, "/private/var/folders/app/node_modules/react/index.js"),
+            event(modify, "/private/var/folders/other/src/App.tsx"),
+        ];
+        let changed = relevant_paths(events, &project, &root.join("dist"));
+        assert_eq!(changed, vec![root.join("index.html"), root.join("src/App.tsx"), root.join("src/New.tsx")]);
+        assert_eq!(
+            project.to_real(&root.join("src/App.tsx")),
+            Some(PathBuf::from("/private/var/folders/app/src/App.tsx"))
+        );
+    }
+
+    #[test]
+    fn strips_the_windows_verbatim_prefix() {
+        assert_eq!(strip_verbatim_prefix(PathBuf::from(r"\\?\D:\app")), PathBuf::from(r"D:\app"));
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share")),
+            PathBuf::from(r"\\?\UNC\server\share")
+        );
+        assert_eq!(strip_verbatim_prefix(PathBuf::from("/private/var")), PathBuf::from("/private/var"));
+    }
 }
