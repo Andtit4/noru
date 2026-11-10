@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Format & lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Rust unit tests
+        run: cargo test --workspace
+
+      - name: Build the CLI
+        run: cargo build -p noru_cli
+
+      - name: End-to-end tests (real browser)
+        run: node scripts/e2e.mjs target/debug/noru${{ runner.os == 'Windows' && '.exe' || '' }}
+
+      - name: Dev server tests (live reload, CSS update, error overlay)
+        run: node scripts/e2e-dev.mjs target/debug/noru${{ runner.os == 'Windows' && '.exe' || '' }}
+
+      - name: npm package smoke test
+        working-directory: packages/noru
+        run: |
+          npm ci
+          npm run build:debug
+          npm test

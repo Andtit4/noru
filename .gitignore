@@ -1,0 +1,23 @@
+# Rust
+/target/
+
+# Node
+node_modules/
+*.log
+
+# Build outputs
+dist/
+dist-*/
+
+# Native binaries (built locally or by CI)
+*.node
+packages/noru/artifacts/
+
+# Generated benchmark app
+bench/large-app/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

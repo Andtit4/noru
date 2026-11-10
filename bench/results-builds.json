@@ -1,0 +1,138 @@
+{
+  "date": "2026-11-10T10:57:49.633Z",
+  "results": [
+    {
+      "id": "noru",
+      "label": "noru",
+      "version": "0.1.0",
+      "lang": "Rust",
+      "build": {
+        "ms": 1123.2135,
+        "size": {
+          "raw": 3236261,
+          "gzip": 177586
+        }
+      },
+      "dev": {
+        "readyMs": 571.9090999999999,
+        "firstPageMs": 7231.431500000001,
+        "reloadMs": 233.5648000000001,
+        "hmrMs": 186.6926999999996,
+        "hmrKeepsState": true
+      }
+    },
+    {
+      "id": "vite",
+      "label": "Vite",
+      "version": "8.3.7",
+      "lang": "Rust (Rolldown) + JS",
+      "build": {
+        "ms": 3063.027399999999,
+        "size": {
+          "raw": 2460442,
+          "gzip": 156815
+        }
+      },
+      "dev": {
+        "readyMs": 759.8798000000024,
+        "firstPageMs": 25633.7772,
+        "reloadMs": 21734.024999999994,
+        "hmrMs": 935.7419999999984,
+        "hmrKeepsState": true
+      }
+    },
+    {
+      "id": "rsbuild",
+      "label": "Rsbuild (Rspack)",
+      "version": "2.3.1",
+      "lang": "Rust + JS",
+      "build": {
+        "ms": 3148.777299999987,
+        "size": {
+          "raw": 2459315,
+          "gzip": 158324
+        }
+      },
+      "dev": {
+        "readyMs": 227.9591999999975,
+        "firstPageMs": 4242.314599999998,
+        "reloadMs": 1388.3436999999976,
+        "hmrMs": 1068.7253000000055,
+        "hmrKeepsState": true
+      }
+    },
+    {
+      "id": "webpack",
+      "label": "webpack + SWC",
+      "version": "5.112.2",
+      "lang": "JS (+ SWC en Rust)",
+      "build": {
+        "ms": 29532.835900000005,
+        "size": {
+          "raw": 2558387,
+          "gzip": 162982
+        }
+      },
+      "dev": {
+        "readyMs": 11427.03839999999,
+        "firstPageMs": 14849.18650000001,
+        "reloadMs": 636.2767999999924,
+        "hmrMs": 1408.6932999999844,
+        "hmrKeepsState": true
+      }
+    },
+    {
+      "id": "parcel",
+      "label": "Parcel",
+      "version": "2.16.4",
+      "lang": "Rust + JS",
+      "build": {
+        "ms": 13958.858799999987,
+        "size": {
+          "raw": 2619274,
+          "gzip": 176277
+        }
+      },
+      "dev": {
+        "readyMs": 22990.51040000003,
+        "firstPageMs": 26591.286900000006,
+        "reloadMs": 163.03159999998752,
+        "hmrMs": 781.3797999999952,
+        "hmrKeepsState": true
+      }
+    },
+    {
+      "id": "esbuild",
+      "label": "esbuild",
+      "version": "0.28.2",
+      "lang": "Go",
+      "build": {
+        "ms": 1166.8948000000091,
+        "size": {
+          "raw": 2709372,
+          "gzip": 333318
+        }
+      }
+    },
+    {
+      "id": "next",
+      "label": "Next.js (Turbopack)",
+      "version": "16.4.6",
+      "lang": "Rust (Turbopack) + JS",
+      "build": {
+        "ms": 22959.790299999993,
+        "size": {
+          "raw": 2832919,
+          "gzip": 270957
+        }
+      },
+      "dev": {
+        "readyMs": 2868.582599999965,
+        "firstPageMs": 36422.57079999999,
+        "reloadMs": 1738.0724000000046,
+        "hmrMs": 815.8391999999876,
+        "hmrKeepsState": true
+      }
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "name": "noru-darwin-x64",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "noru.darwin-x64.node",
+  "files": [
+    "noru.darwin-x64.node"
+  ],
+  "description": "A fast, zero-config bundler for React + TypeScript apps, written in Rust.",
+  "keywords": [
+    "bundler",
+    "build",
+    "react",
+    "typescript",
+    "rust",
+    "vite",
+    "napi"
+  ],
+  "homepage": "https://github.com/Andtit4/noru#readme",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Andtit4/noru.git",
+    "directory": "packages/noru"
+  },
+  "bugs": {
+    "url": "https://github.com/Andtit4/noru/issues"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "os": [
+    "darwin"
+  ]
+}

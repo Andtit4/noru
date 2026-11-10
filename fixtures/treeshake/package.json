@@ -1,0 +1,12 @@
+{
+  "name": "fixture-treeshake",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "dependencies": {
+    "lodash-es": "^4.17.21",
+    "lucide-react": "^0.460.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  }
+}

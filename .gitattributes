@@ -1,0 +1,2 @@
+# Keep LF line endings everywhere (tests compare file contents across Windows, macOS and Linux)
+* text=auto eol=lf

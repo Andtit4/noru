@@ -1,0 +1,7 @@
+@import "./reset.css";
+:root {
+  --noru-global: yes;
+}
+body {
+  background-image: url("./assets/dot.svg");
+}

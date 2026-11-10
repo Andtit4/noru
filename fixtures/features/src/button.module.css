@@ -1,0 +1,7 @@
+.primary {
+  color: rgb(255, 0, 0);
+}
+.big {
+  composes: primary;
+  font-size: 2em;
+}

@@ -1,0 +1,83 @@
+{
+  "date": "2026-11-10T11:04:16.473Z",
+  "results": [
+    {
+      "id": "noru",
+      "label": "noru",
+      "version": "0.1.0",
+      "lang": "Rust",
+      "dev": {
+        "readyMs": 665.585,
+        "firstPageMs": 1264.0744,
+        "reloadMs": 1716.7641999999996,
+        "hmrMs": 187.57310000000052,
+        "hmrKeepsState": true
+      }
+    },
+    {
+      "id": "vite",
+      "label": "Vite",
+      "version": "8.3.7",
+      "lang": "Rust (Rolldown) + JS",
+      "dev": {
+        "readyMs": 1134.3899000000001,
+        "firstPageMs": 24611.6389,
+        "reloadMs": 26058.541000000005,
+        "hmrMs": 694.5218999999997,
+        "hmrKeepsState": true
+      }
+    },
+    {
+      "id": "rsbuild",
+      "label": "Rsbuild (Rspack)",
+      "version": "2.3.1",
+      "lang": "Rust + JS",
+      "dev": {
+        "readyMs": 478.23249999999825,
+        "firstPageMs": 5709.200199999992,
+        "reloadMs": 280.9612000000052,
+        "hmrMs": 586.4951000000001,
+        "hmrKeepsState": true
+      }
+    },
+    {
+      "id": "webpack",
+      "label": "webpack + SWC",
+      "version": "5.112.2",
+      "lang": "JS (+ SWC en Rust)",
+      "dev": {
+        "readyMs": 11890.180200000003,
+        "firstPageMs": 13883.140599999999,
+        "reloadMs": 762.9427999999898,
+        "hmrMs": 1131.7409999999945,
+        "hmrKeepsState": true
+      }
+    },
+    {
+      "id": "parcel",
+      "label": "Parcel",
+      "version": "2.16.4",
+      "lang": "Rust + JS",
+      "dev": {
+        "readyMs": 13672.344200000007,
+        "firstPageMs": 17311.9599,
+        "reloadMs": 221.82829999999376,
+        "hmrMs": 940.0578999999852,
+        "hmrKeepsState": true
+      }
+    },
+    {
+      "id": "next",
+      "label": "Next.js (Turbopack)",
+      "version": "16.4.6",
+      "lang": "Rust (Turbopack) + JS",
+      "dev": {
+        "readyMs": 3181.6259999999893,
+        "firstPageMs": 32869.466600000014,
+        "reloadMs": 338.35250000000815,
+        "hmrMs": 1688.9937999999966,
+        "hmrKeepsState": false
+      }
+    }
+  ]
+}

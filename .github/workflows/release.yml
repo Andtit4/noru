@@ -1,0 +1,111 @@
+name: Release
+
+# Pushing a tag like v0.1.0 builds noru for 8 platforms and publishes it to npm:
+# `noru` (JS + CLI) and the native binaries `noru-<platform>` (optional dependencies).
+#
+# Requires the repository secret NPM_TOKEN (npm granular access token, read and write).
+#
+# "Run workflow" in the Actions tab (workflow_dispatch) only builds and checks the binaries,
+# it never publishes: use it to test the release before pushing a tag.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-pc-windows-msvc, os: windows-latest, test: true }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest, test: true }
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, flags: --use-napi-cross, test: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, flags: --use-napi-cross }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, flags: --cross-compile, zig: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, flags: --cross-compile, zig: true }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+        if: ${{ matrix.zig }}
+        with:
+          version: 0.14.1
+      - uses: taiki-e/install-action@v2
+        if: ${{ matrix.zig }}
+        with:
+          tool: cargo-zigbuild
+      - name: Build native binding
+        working-directory: packages/noru
+        shell: bash
+        run: |
+          npm ci
+          npx napi build --platform --release --target ${{ matrix.target }} ${{ matrix.flags }} --js binding.js --dts binding.d.ts
+      - name: Check that the binary loads
+        if: ${{ matrix.test }}
+        working-directory: packages/noru
+        shell: bash
+        run: |
+          node -e "const n = require('./'); console.log('noru', n.version, 'core', n.coreVersion)"
+          mkdir -p check-app/src
+          echo '<!doctype html><html><head></head><body><div id="root"></div><script type="module" src="/src/main.ts"></script></body></html>' > check-app/index.html
+          echo 'const n: number = 42; document.getElementById("root")!.textContent = `ok ${n}`' > check-app/src/main.ts
+          node bin/noru.js build check-app
+          test -f check-app/dist/index.html
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: packages/noru/*.node
+          if-no-files-found: error
+
+  publish:
+    name: Publish to npm
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Check that the tag matches package.json
+        working-directory: packages/noru
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version $version"
+            exit 1
+          fi
+      - name: Install
+        working-directory: packages/noru
+        run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages/noru/artifacts
+          pattern: bindings-*
+      - name: Move binaries into platform packages
+        working-directory: packages/noru
+        run: npx napi artifacts
+      - name: Publish
+        working-directory: packages/noru
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_ACCESS: public
