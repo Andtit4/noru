@@ -530,12 +530,34 @@ fn relevant_paths(events: Vec<notify::Result<notify::Event>>, project: &ProjectR
                     s == "node_modules" || s == ".git"
                 })
                 && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| !n.ends_with('~') && !n.ends_with(".swp"))
-                && !p.is_dir()
         })
+        // A new folder: files created in it right away may have no event of their own (on Linux,
+        // the folder is watched only once it exists), so its content counts as changed.
+        .flat_map(|p| if p.is_dir() { files_in(&p) } else { vec![p] })
         .collect();
     paths.sort();
     paths.dedup();
     paths
+}
+
+/// Files of a folder and its subfolders (a few levels deep).
+fn files_in(dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 4 && !entry.file_name().to_string_lossy().starts_with('.') {
+                    walk(&path, depth + 1, out);
+                }
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, 0, &mut out);
+    out
 }
 
 fn handle(mut stream: TcpStream, shared: &Shared) -> std::io::Result<()> {
@@ -690,6 +712,20 @@ mod tests {
             project.to_real(&root.join("src/App.tsx")),
             Some(PathBuf::from("/private/var/folders/app/src/App.tsx"))
         );
+    }
+
+    #[test]
+    fn a_new_folder_counts_its_files_as_changed() {
+        let root = std::env::temp_dir().join(format!("noru-dev-test-{}", std::process::id()));
+        let page = root.join("app").join("contact").join("page.tsx");
+        std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+        std::fs::write(&page, "export default function Contact() {}").unwrap();
+        let project = ProjectRoot { root: root.clone(), real: None };
+        // Only the folder creation was reported (the file event was missed).
+        let events =
+            vec![event(EventKind::Create(CreateKind::Folder), root.join("app").join("contact").to_str().unwrap())];
+        assert_eq!(relevant_paths(events, &project, &root.join("dist")), vec![page]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
