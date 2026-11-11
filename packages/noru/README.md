@@ -3,8 +3,10 @@
 **A fast, zero-config bundler for React + TypeScript apps, written in Rust.**
 
 ```bash
-npm install -D noru
+npm install -D noru-bundler
 ```
+
+The npm package is `noru-bundler` (npm does not allow the name `noru`); the command is `noru`:
 
 ```jsonc
 // package.json
@@ -134,7 +136,7 @@ noru follows the Vite conventions, so most Vite React apps work as-is:
 ## JavaScript API
 
 ```js
-const { build, startDevServer, preview } = require('noru')
+const { build, startDevServer, preview } = require('noru-bundler')
 
 const result = await build({ root: './my-app', outDir: 'dist', minify: true })
 console.log(result.files, `${result.durationMs} ms`)

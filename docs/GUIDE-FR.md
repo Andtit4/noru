@@ -144,7 +144,8 @@ git push && git push --tags
 
 Le workflow **Release** compile noru pour Windows, macOS et Linux (8 binaires), vérifie que le tag
 correspond à la version du `package.json`, puis publie le tout sur npm. Ensuite n'importe qui peut
-faire `npm install -D noru`.
+faire `npm install -D noru-bundler` (npm refuse le nom `noru`, trop proche de `node`, `nopt`,
+`ora`... ; la commande, elle, reste `noru`).
 
 > Une version publiée sur npm ne peut plus être republiée ni vraiment supprimée : en cas de
 > problème, on corrige et on publie la version suivante.

@@ -1,5 +1,5 @@
 {
-  "name": "noru",
+  "name": "noru-bundler",
   "version": "0.1.0",
   "description": "A fast, zero-config bundler for React + TypeScript apps, written in Rust.",
   "keywords": [
