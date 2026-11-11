@@ -13,8 +13,9 @@ dist-*/
 *.node
 packages/noru/artifacts/
 
-# Generated benchmark app
+# Generated benchmark apps
 bench/large-app/
+bench/next-app/
 
 # OS / editors
 .DS_Store

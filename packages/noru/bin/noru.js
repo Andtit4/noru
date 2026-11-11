@@ -4,7 +4,7 @@
 const path = require('node:path')
 
 const HELP = `
-  noru — a fast bundler for React + TypeScript apps, written in Rust
+  noru — a fast bundler for React + TypeScript and Next.js App Router apps, written in Rust
 
   Usage
     $ noru dev [root]        Start the dev server (instant reloads, no per-page compilation)

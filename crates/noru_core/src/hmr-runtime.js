@@ -13,12 +13,31 @@ var __noru_refresh = (function () {
 })();
 __noru_refresh.injectIntoGlobalHook(window);
 
+// Next.js route segment exports (metadata, config...) that may sit next to the page component.
+var __noru_route_exports = {
+  metadata: 1,
+  generateMetadata: 1,
+  viewport: 1,
+  generateViewport: 1,
+  generateStaticParams: 1,
+  dynamic: 1,
+  dynamicParams: 1,
+  revalidate: 1,
+  fetchCache: 1,
+  runtime: 1,
+  preferredRegion: 1,
+  maxDuration: 1,
+  experimental_ppr: 1,
+};
+
 function __noru_is_boundary(id) {
   var cached = __noru_cache[id];
   if (!cached) return false;
   var exports = cached.exports;
   if (exports == null || (typeof exports !== "object" && typeof exports !== "function")) return false;
-  var names = Object.keys(exports);
+  var names = Object.keys(exports).filter(function (name) {
+    return !__noru_route_exports[name];
+  });
   if (names.length === 0) return false;
   for (var i = 0; i < names.length; i++) {
     var value;

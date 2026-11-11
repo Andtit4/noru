@@ -11,12 +11,14 @@ use std::time::SystemTime;
 
 use rayon::prelude::*;
 
-use crate::asset::{is_asset_extension, process_asset, AssetOptions};
+use crate::asset::{is_asset_extension, is_image_extension, process_asset, AssetOptions};
 use crate::css::process_css;
 use crate::env::Defines;
 use crate::js::{process_js, EsmInfo, JsContext, Segment};
 use crate::module::{EmittedFile, ModuleKey};
+use crate::next::NextApp;
 use crate::pkg::PackageCache;
+use crate::postcss::PostCss;
 use crate::resolve::{NoruResolver, ResolveKind};
 
 pub struct Context {
@@ -29,6 +31,10 @@ pub struct Context {
     pub jsx_import_source: String,
     pub packages: PackageCache,
     pub react_refresh: bool,
+    /// Next.js App Router project: generated modules and `next/*` replacements.
+    pub next: Option<NextApp>,
+    /// Project with a PostCSS config (Tailwind CSS...).
+    pub postcss: Option<PostCss>,
 }
 
 /// Query marker for imports of files in the public directory (`import logo from '/vite.svg'`).
@@ -53,6 +59,17 @@ impl JsContext for Context {
         specifier: &str,
         kind: ResolveKind,
     ) -> Result<(ModuleKey, Option<String>), String> {
+        let virtual_importer;
+        let mut importer = importer;
+        if let Some(next) = &self.next {
+            if let Some((path, warning)) = next.resolve(specifier) {
+                return Ok((ModuleKey::new(path, None), warning));
+            }
+            if next.is_virtual(importer) {
+                virtual_importer = next.virtual_importer();
+                importer = &virtual_importer;
+            }
+        }
         // `/file` that exists in public/ is served as-is: importing it gives its URL.
         if let Some(rest) = specifier.strip_prefix('/').filter(|r| !r.starts_with('/')) {
             let clean = rest.split(['?', '#']).next().unwrap_or(rest);
@@ -61,7 +78,23 @@ impl JsContext for Context {
                 return Ok((ModuleKey::new(candidate, Some(PUBLIC_QUERY.to_string())), None));
             }
         }
-        self.resolver.resolve(importer, specifier, kind).map(|r| (r.key, r.warning))
+        match self.resolver.resolve(importer, specifier, kind) {
+            Ok(resolved) => {
+                // Node.js built-in in a Next.js app: use the browser version shipped by Next.js.
+                if let (true, Some(next), Some(polyfill)) =
+                    (resolved.key.is_empty_module(), &self.next, crate::next::node_polyfill(specifier))
+                {
+                    if let Ok(found) = self.resolver.resolve(&next.virtual_importer(), polyfill, kind) {
+                        return Ok((found.key, None));
+                    }
+                }
+                Ok((resolved.key, resolved.warning))
+            }
+            Err(error) => match self.next.as_ref().and_then(|next| next.missing_module(&error, importer)) {
+                Some((path, query, warning)) => Ok((ModuleKey::new(path, Some(query)), Some(warning))),
+                None => Err(error),
+            },
+        }
     }
 }
 
@@ -153,9 +186,36 @@ fn read_text(path: &Path) -> Result<String, String> {
     })
 }
 
+fn process_js_module(
+    key: &ModuleKey,
+    source: &str,
+    ctx: &Context,
+    side_effects_hint: Option<bool>,
+) -> Result<Processed, String> {
+    let out = process_js(key, source, ctx)?;
+    let module = JsModule { segments: out.segments, esm: out.esm, side_effects_hint, refresh: out.refresh };
+    Ok(Processed { output: ModuleOutput::Js(module), deps: out.deps, emitted: vec![], warnings: out.warnings })
+}
+
+/// Project stylesheets that go through PostCSS (Tailwind...).
+fn uses_postcss(key: &ModuleKey, ctx: &Context) -> bool {
+    ctx.postcss.is_some() && key.extension() == "css" && !key.is_in_node_modules() && !key.is_empty_module()
+}
+
+/// Source of a generated (in-memory) module.
+fn virtual_source<'c>(key: &ModuleKey, ctx: &'c Context) -> Option<&'c str> {
+    ctx.next.as_ref().and_then(|next| next.source(&key.path))
+}
+
 fn process_module(key: &ModuleKey, ctx: &Context) -> Result<Processed, String> {
     if key.is_empty_module() {
         return Ok(Processed::simple("function() {}".to_string()));
+    }
+    if let Some(source) = virtual_source(key, ctx) {
+        return process_js_module(key, source, ctx, None);
+    }
+    if let Some(source) = ctx.next.as_ref().and_then(|next| next.missing_source(&key.path, key.query.as_deref())) {
+        return process_js_module(key, &source, ctx, None);
     }
     let path = key.path.as_path();
     let assets = AssetOptions { base: &ctx.base, inline_limit: ctx.inline_limit };
@@ -179,19 +239,17 @@ fn process_module(key: &ModuleKey, ctx: &Context) -> Result<Processed, String> {
     match ext.as_str() {
         "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "mts" | "cts" => {
             let source = read_text(path)?;
-            let out = process_js(key, &source, ctx)?;
-            let module = JsModule {
-                segments: out.segments,
-                esm: out.esm,
-                side_effects_hint: ctx.packages.side_effects(path),
-                refresh: out.refresh,
-            };
-            Ok(Processed { output: ModuleOutput::Js(module), deps: out.deps, emitted: vec![], warnings: out.warnings })
+            process_js_module(key, &source, ctx, ctx.packages.side_effects(path))
         }
         "css" => {
-            let source = read_text(path)?;
+            let mut source = read_text(path)?;
+            let mut postcss_warnings = Vec::new();
+            if let Some(postcss) = ctx.postcss.as_ref().filter(|_| !key.is_in_node_modules()) {
+                (source, postcss_warnings) = postcss.process(path, &source)?;
+            }
             let resolve = |specifier: &str| ctx.resolver.resolve(path, specifier, ResolveKind::Css).map(|r| r.key);
-            let out = process_css(path, &source, ctx.minify, &assets, &resolve)?;
+            let mut out = process_css(path, &source, ctx.minify, &assets, &resolve)?;
+            out.warnings.extend(postcss_warnings);
             if key.has_query("inline") {
                 let mut p = Processed::simple(exports_factory(&serde_json::to_string(&out.code).unwrap_or_default()));
                 p.emitted = out.emitted;
@@ -221,7 +279,13 @@ fn process_module(key: &ModuleKey, ctx: &Context) -> Result<Processed, String> {
         )),
         _ if is_asset_extension(&ext) => {
             let (url, file) = process_asset(path, &assets)?;
-            let mut p = Processed::simple(exports_factory(&serde_json::to_string(&url).unwrap_or_default()));
+            // Next.js: `import logo from "./logo.png"` gives { src, width, height } (used by next/image).
+            let value = if ctx.next.is_some() && is_image_extension(&ext) {
+                serde_json::json!({ "src": url, "width": null, "height": null })
+            } else {
+                serde_json::Value::String(url)
+            };
+            let mut p = Processed::simple(exports_factory(&value.to_string()));
             p.emitted.extend(file);
             Ok(p)
         }
@@ -236,9 +300,12 @@ struct FileStamp {
     len: u64,
 }
 
-fn file_stamp(key: &ModuleKey) -> Option<FileStamp> {
+fn file_stamp(key: &ModuleKey, ctx: &Context) -> Option<FileStamp> {
     if key.is_empty_module() {
         return Some(FileStamp { modified: None, len: 0 });
+    }
+    if let Some(source) = virtual_source(key, ctx) {
+        return Some(FileStamp { modified: None, len: xxhash_rust::xxh3::xxh3_64(source.as_bytes()) });
     }
     let meta = std::fs::metadata(&key.path).ok()?;
     Some(FileStamp { modified: meta.modified().ok(), len: meta.len() })
@@ -284,66 +351,101 @@ pub fn build_graph(
         }
     }
 
+    let entry_count = keys.len();
     let mut cache = cache;
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
     let mut processed_count = 0;
 
-    while !frontier.is_empty() {
-        let cache_ref = cache.as_deref();
-        let results: Vec<LevelResult> = frontier
-            .par_iter()
-            .map(|&id| {
+    std::thread::scope(|scope| {
+        // Stylesheets that go through PostCSS can take seconds (Tailwind scans the whole project):
+        // they are processed on their own thread, the rest of the graph does not wait for them.
+        let mut slow: Vec<std::thread::ScopedJoinHandle<LevelResult>> = Vec::new();
+        while !frontier.is_empty() || !slow.is_empty() {
+            let cache_ref = cache.as_deref();
+            let cached = |id: usize| -> (Option<FileStamp>, Option<Arc<Processed>>) {
                 let key = &keys[id];
-                let stamp = file_stamp(key);
+                let stamp = file_stamp(key, ctx);
                 if let (Some(cache), Some(stamp)) = (cache_ref, stamp) {
                     if let Some((cached_stamp, processed)) = cache.entries.get(key) {
                         if *cached_stamp == stamp {
-                            return (id, Some(stamp), true, Ok(Arc::clone(processed)));
+                            return (Some(stamp), Some(Arc::clone(processed)));
                         }
                     }
                 }
-                (id, stamp, false, process_module(key, ctx).map(Arc::new))
-            })
-            .collect();
-        let mut next = Vec::new();
-        for (id, stamp, from_cache, result) in results {
-            match result {
-                Ok(processed) => {
-                    if !from_cache {
-                        processed_count += 1;
-                        if let (Some(cache), Some(stamp)) = (cache.as_deref_mut(), stamp) {
-                            cache.entries.insert(keys[id].clone(), (stamp, Arc::clone(&processed)));
-                        }
+                (stamp, None)
+            };
+            let (postcss, fast): (Vec<usize>, Vec<usize>) =
+                frontier.iter().partition(|&&id| uses_postcss(&keys[id], ctx));
+            let mut results: Vec<LevelResult> = Vec::new();
+            for id in postcss {
+                match cached(id) {
+                    (stamp, Some(processed)) => results.push((id, stamp, true, Ok(processed))),
+                    (stamp, None) => {
+                        let key = keys[id].clone();
+                        slow.push(scope.spawn(move || (id, stamp, false, process_module(&key, ctx).map(Arc::new))));
                     }
-                    let mut dep_ids = Vec::with_capacity(processed.deps.len());
-                    for dep in &processed.deps {
-                        let dep_id = match index.get(dep) {
-                            Some(&existing) => existing,
-                            None => {
-                                let new_id = keys.len();
-                                index.insert(dep.clone(), new_id);
-                                keys.push(dep.clone());
-                                slots.push(None);
-                                next.push(new_id);
-                                new_id
-                            }
-                        };
-                        dep_ids.push(dep_id);
-                    }
-                    warnings.extend(processed.warnings.iter().cloned());
-                    slots[id] = Some(Module { key: keys[id].clone(), processed, deps: dep_ids });
-                }
-                Err(e) => {
-                    if let Some(cache) = cache.as_deref_mut() {
-                        cache.entries.remove(&keys[id]);
-                    }
-                    errors.push(e)
                 }
             }
+            results.extend(
+                fast.par_iter()
+                    .map(|&id| match cached(id) {
+                        (stamp, Some(processed)) => (id, stamp, true, Ok(processed)),
+                        (stamp, None) => (id, stamp, false, process_module(&keys[id], ctx).map(Arc::new)),
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            // Stylesheets that are done; when nothing else is left to do, wait for one.
+            let mut i = 0;
+            while i < slow.len() {
+                if slow[i].is_finished() {
+                    results.push(slow.swap_remove(i).join().expect("PostCSS thread panicked"));
+                } else {
+                    i += 1;
+                }
+            }
+            if results.is_empty() && !slow.is_empty() {
+                results.push(slow.remove(0).join().expect("PostCSS thread panicked"));
+            }
+            let mut next = Vec::new();
+            for (id, stamp, from_cache, result) in results {
+                match result {
+                    Ok(processed) => {
+                        if !from_cache {
+                            processed_count += 1;
+                            if let (Some(cache), Some(stamp)) = (cache.as_deref_mut(), stamp) {
+                                cache.entries.insert(keys[id].clone(), (stamp, Arc::clone(&processed)));
+                            }
+                        }
+                        let mut dep_ids = Vec::with_capacity(processed.deps.len());
+                        for dep in &processed.deps {
+                            let dep_id = match index.get(dep) {
+                                Some(&existing) => existing,
+                                None => {
+                                    let new_id = keys.len();
+                                    index.insert(dep.clone(), new_id);
+                                    keys.push(dep.clone());
+                                    slots.push(None);
+                                    next.push(new_id);
+                                    new_id
+                                }
+                            };
+                            dep_ids.push(dep_id);
+                        }
+                        warnings.extend(processed.warnings.iter().cloned());
+                        slots[id] = Some(Module { key: keys[id].clone(), processed, deps: dep_ids });
+                    }
+                    Err(e) => {
+                        if let Some(cache) = cache.as_deref_mut() {
+                            cache.entries.remove(&keys[id]);
+                        }
+                        errors.push(e)
+                    }
+                }
+            }
+            frontier = next;
         }
-        frontier = next;
-    }
+    });
 
     if !errors.is_empty() {
         return Err(errors);
@@ -355,7 +457,43 @@ pub fn build_graph(
     let modules = slots.into_iter().map(|m| m.expect("every discovered module is processed")).collect();
     warnings.sort();
     warnings.dedup();
-    Ok(Graph { modules, warnings, processed_count })
+    Ok(Graph { modules: canonical_order(modules, entry_count), warnings, processed_count })
+}
+
+/// Renumbers the modules in breadth-first order from the entries, so that ids (and the output)
+/// do not depend on which thread finished first. Without PostCSS this is the discovery order.
+fn canonical_order(modules: Vec<Module>, entry_count: usize) -> Vec<Module> {
+    let n = modules.len();
+    let mut order: Vec<usize> = (0..entry_count.min(n)).collect();
+    let mut seen = vec![false; n];
+    order.iter().for_each(|&id| seen[id] = true);
+    let mut i = 0;
+    while i < order.len() {
+        for &dep in &modules[order[i]].deps {
+            if !seen[dep] {
+                seen[dep] = true;
+                order.push(dep);
+            }
+        }
+        i += 1;
+    }
+    order.extend((0..n).filter(|&id| !seen[id]));
+    if order.iter().enumerate().all(|(new, &old)| new == old) {
+        return modules;
+    }
+    let mut new_id = vec![0; n];
+    for (new, &old) in order.iter().enumerate() {
+        new_id[old] = new;
+    }
+    let mut slots: Vec<Option<Module>> = modules.into_iter().map(Some).collect();
+    order
+        .iter()
+        .map(|&old| {
+            let mut module = slots[old].take().expect("each module is placed once");
+            module.deps.iter_mut().for_each(|dep| *dep = new_id[*dep]);
+            module
+        })
+        .collect()
 }
 
 /// Stylesheets of the included modules, in the order the browser would apply them

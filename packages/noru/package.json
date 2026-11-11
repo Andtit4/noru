@@ -1,11 +1,14 @@
 {
   "name": "noru-bundler",
-  "version": "0.1.0",
-  "description": "A fast, zero-config bundler for React + TypeScript apps, written in Rust.",
+  "version": "0.2.0",
+  "description": "A fast, zero-config bundler for React + TypeScript apps and Next.js App Router apps, written in Rust.",
   "keywords": [
     "bundler",
     "build",
     "react",
+    "nextjs",
+    "next",
+    "tailwindcss",
     "typescript",
     "rust",
     "vite",

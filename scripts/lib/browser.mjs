@@ -74,11 +74,18 @@ export async function launchBrowser(path = findBrowser()) {
   await new Promise((resolve) => ws.addEventListener('open', resolve, { once: true }))
   let nextId = 1
   const pending = new Map()
+  // Uncaught exceptions and console.error() calls of the page, for test diagnostics.
+  const pageErrors = []
   ws.addEventListener('message', (event) => {
     const msg = JSON.parse(event.data)
     if (msg.id && pending.has(msg.id)) {
       pending.get(msg.id)(msg)
       pending.delete(msg.id)
+    } else if (msg.method === 'Runtime.exceptionThrown') {
+      const d = msg.params.exceptionDetails
+      pageErrors.push(d.exception?.description || d.text)
+    } else if (msg.method === 'Runtime.consoleAPICalled' && msg.params.type === 'error') {
+      pageErrors.push(msg.params.args.map((a) => a.value ?? a.description ?? '').join(' '))
     }
   })
   const send = (method, params = {}) =>
@@ -88,6 +95,7 @@ export async function launchBrowser(path = findBrowser()) {
       ws.send(JSON.stringify({ id, method, params }))
     })
   await send('Page.enable')
+  await send('Runtime.enable')
   const evaluate = async (expression) => {
     const res = await send('Runtime.evaluate', { expression, returnByValue: true })
     return res.result?.result?.value
@@ -95,6 +103,10 @@ export async function launchBrowser(path = findBrowser()) {
   return {
     navigate: (url) => send('Page.navigate', { url }),
     evaluate,
+    /** Errors reported by the page since the last call. */
+    takeErrors() {
+      return pageErrors.splice(0)
+    },
     /** Polls `expression` until it is truthy; returns false on timeout. */
     async waitFor(expression, timeout = 10000) {
       const start = Date.now()

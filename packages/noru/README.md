@@ -1,6 +1,6 @@
 # noru
 
-**A fast, zero-config bundler for React + TypeScript apps, written in Rust.**
+**A fast, zero-config bundler for React + TypeScript apps — and Next.js App Router apps — written in Rust.**
 
 ```bash
 npm install -D noru-bundler
@@ -22,8 +22,8 @@ The npm package is `noru-bundler` (npm does not allow the name `noru`); the comm
 Then `npm run dev`, `npm run build`, `npm start`.
 
 > **Status: experimental (0.x).** noru builds the standard Vite React + TypeScript template and
-> passes a suite of real-browser tests, but it is young: expect rough edges and read
-> [what is not supported yet](#not-supported-yet).
+> Next.js App Router apps, and passes a suite of real-browser tests, but it is young: expect rough
+> edges and read [what is not supported yet](#not-supported-yet).
 
 ## Why noru?
 
@@ -66,6 +66,27 @@ in the repo to reproduce them. In this synthetic app every line of code is used,
 bundle comes from wrapping each module in a function (Vite/Rolldown and Rspack hoist them into one
 scope) — the next optimization on the roadmap.
 
+**Next.js apps** — a generated App Router app with 50 pages and 3,000 client components using
+Tailwind CSS v4 ([`scripts/gen-next.mjs`](scripts/gen-next.mjs), measured by
+[`scripts/bench-next.mjs`](scripts/bench-next.mjs)):
+
+|                                           | noru 0.2     | Next.js 16.4 (Turbopack) |
+| ----------------------------------------- | ------------ | ------------------------ |
+| Dev: command → first page displayed       | **6.6 s**    | 17.9 s                   |
+| Dev: opening another page the first time  | **0.1 s**    | 1.1 – 3.6 s              |
+| Dev: link click to a page never opened    | **0.06 s**   | 1.0 s                    |
+| Dev: hot update                           | **0.15 s**   | 3.1 s                    |
+| Production build                          | **5.3 s**    | 54 – 71 s                |
+| JavaScript downloaded for a page (gzip)   | 229 kB       | **141 kB**               |
+
+On a real Next.js 16 project (35 pages, Tailwind v4): first page in dev **2.9 s** vs 22 s, other
+pages **0.2–0.3 s** vs 1.7–6.1 s, production build **1.4 s** vs 150 s.
+
+Most of noru's time on these apps is Tailwind itself (the same app without Tailwind builds in
+0.8 s). `next build` also type-checks and pre-renders pages on the server, which noru does not do.
+Next.js splits the JavaScript per page, while noru sends the whole app at once (code splitting is
+on the roadmap).
+
 **Tree-shaking** on a React app importing `lodash-es` and `lucide-react` (2,211 modules,
 [`fixtures/treeshake`](fixtures/treeshake)):
 
@@ -74,6 +95,37 @@ scope) — the next optimization on the roadmap.
 | Modules in bundle   | 2,211                 | 52       | —        |
 | JS bundle           | 1,134 kB              | 231 kB   | 225 kB   |
 | JS bundle (gzip)    | 258 kB                | 71.6 kB  | 70.3 kB  |
+
+## Next.js apps
+
+noru runs **Next.js App Router projects** (an `app/` directory) without the Next.js server:
+the whole app is bundled up-front and runs in the browser, so opening a page never waits for a
+compilation. Replace the scripts, nothing else changes:
+
+```jsonc
+"scripts": {
+  "dev": "noru dev",      // instead of next dev
+  "build": "noru build",  // instead of next build: a static site in dist/
+  "start": "noru start"   // instead of next start
+}
+```
+
+**Supported:** `app/` routing (layouts, nested layouts, route groups `(group)`, dynamic segments
+`[id]`, catch-all `[...slug]` and `[[...slug]]`, `loading`, `error`, `global-error`, `not-found`,
+`template`), `metadata` / `generateMetadata` (title, description), `next/link`, `next/navigation`
+(`useRouter`, `usePathname`, `useSearchParams`, `useParams`, `useSelectedLayoutSegment(s)`,
+`redirect`, `notFound`), `next/image`, `next/font/google`, `next/dynamic`, `next/script`,
+`next/head`, `params` / `searchParams` (plain objects and promises), **async server components**
+(they run in the browser), `NEXT_PUBLIC_*` variables, Tailwind CSS v3 / v4, `app/favicon.ico`, and
+the browser versions of Node.js modules that Next.js provides (`buffer`, `https`, `crypto`...).
+In `noru dev`, a broken import only breaks the page that uses it, like `next dev`.
+
+**Not supported (they need a server):** route handlers (`route.ts`, API routes), middleware /
+proxy, server actions (`'use server'`), server-side rendering (pages are rendered in the browser,
+which matters for SEO), ISR, `cookies()` / `headers()` from the request. Also not yet:
+`next/font/local`, parallel and intercepting routes, the Pages Router (`pages/`), `next.config`
+options. Async server components run in the browser: the APIs they call must be reachable from the
+browser, and server-only secrets are not available.
 
 ## Commands
 
@@ -113,6 +165,9 @@ noru follows the Vite conventions, so most Vite React apps work as-is:
 - npm packages: ESM, CommonJS and UMD, `package.json` `exports` / `browser` fields, `__esModule` interop
 - `tsconfig.json` `paths` aliases
 - CSS imports, `@import`, `url()` assets, **CSS Modules** (`*.module.css`), minification (Lightning CSS)
+- **Tailwind CSS** and other PostCSS plugins, when the project has a `postcss.config.*` file (run by
+  a long-lived Node.js process, so Tailwind regenerates the CSS in milliseconds after an edit)
+- **Next.js App Router apps** (see [Next.js apps](#nextjs-apps))
 - Assets (images, fonts, media): hashed file names, small files inlined as data URLs
 - `import data from './data.json'`, `?raw`, `?url`, `?inline` imports, `import logo from '/logo.svg'` (public/)
 - `import.meta.env.*`, `process.env.NODE_ENV` and dead-code removal of `if (import.meta.env.DEV) {...}`
@@ -131,7 +186,8 @@ noru follows the Vite conventions, so most Vite React apps work as-is:
 - An `import.meta.hot` API for non-React code (non-component modules propagate the update to
   their importers, up to the closest React component)
 - Plugins and a config file
-- Server-side rendering (noru builds client-side apps, not Next.js apps)
+- Server-side rendering, and the server parts of Next.js (route handlers, middleware, server
+  actions): Next.js apps run in the browser, see [Next.js apps](#nextjs-apps)
 
 ## JavaScript API
 
@@ -164,7 +220,9 @@ cargo build --release                        # build the Rust CLI (target/releas
 cargo test --workspace                       # unit tests
 node scripts/e2e.mjs                         # build the fixtures and check them in a real browser
 node scripts/e2e-dev.mjs                     # dev server: hot updates keep React state, CSS, overlay
+node scripts/e2e-next.mjs                    # Next.js app: routing, server components, Tailwind, hot updates
 node scripts/gen-large.mjs && node scripts/bench-all.mjs   # benchmark vs other tools (install them in bench/large-app)
+node scripts/gen-next.mjs && node scripts/bench-next.mjs   # benchmark vs Next.js on a Next.js app
 cd packages/noru && npm run build && npm test  # native Node addon + npm package smoke test
 ```
 

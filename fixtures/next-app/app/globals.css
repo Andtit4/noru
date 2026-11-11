@@ -1,0 +1,9 @@
+@import "tailwindcss";
+
+:root {
+  --brand: rgb(16, 185, 129);
+}
+
+.brand-border {
+  border: 2px solid var(--brand);
+}

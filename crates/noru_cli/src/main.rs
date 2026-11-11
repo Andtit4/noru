@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use noru_core::{BuildOptions, BuildResult, DevOptions, DevServer, PreviewServer};
 
 #[derive(Parser)]
-#[command(name = "noru", version, about = "A fast bundler for web apps, written in Rust")]
+#[command(name = "noru", version, about = "A fast bundler for React and Next.js apps, written in Rust")]
 struct Cli {
     #[command(subcommand)]
     command: Command,

@@ -50,6 +50,7 @@ pub fn process_css(
 
     let mut code = result.code;
     let mut imports = Vec::new();
+    let mut external_imports = String::new();
     let mut emitted = Vec::new();
     let mut warnings = Vec::new();
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -64,7 +65,9 @@ pub fn process_css(
                     ));
                 }
                 if is_external_url(&import.url) {
-                    warnings.push(format!("external @import \"{}\" was removed ({filename})", import.url));
+                    // Kept (e.g. Google Fonts): generate_css moves these rules to the top of the bundle.
+                    let url = serde_json::to_string(&import.url).unwrap_or_default();
+                    external_imports.push_str(&format!("@import url({url});\n"));
                     continue;
                 }
                 match resolve(&import.url) {
@@ -124,5 +127,8 @@ pub fn process_css(
         serde_json::Value::Object(object).to_string()
     });
 
+    if !external_imports.is_empty() {
+        code = external_imports + &code;
+    }
     Ok(CssOutput { code, imports, module_exports, emitted, warnings })
 }

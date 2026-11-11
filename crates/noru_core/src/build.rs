@@ -12,8 +12,10 @@ use crate::env::{load_env, Defines};
 use crate::graph::{build_graph, Context, ModuleCache};
 use crate::html::{find_entries, rewrite_html, url_to_path, HtmlEntries};
 use crate::module::{content_hash, EmittedFile, ModuleKey};
+use crate::next::NextApp;
 use crate::options::BuildOptions;
 use crate::pkg::PackageCache;
+use crate::postcss::PostCss;
 use crate::resolve::NoruResolver;
 use crate::treeshake::shake;
 
@@ -65,6 +67,10 @@ pub(crate) struct Project {
     pub treeshake: bool,
     pub html: String,
     pub entries: HtmlEntries,
+    /// Project kind, shown when the dev server starts (e.g. "Next.js app, 12 pages").
+    pub summary: Option<String>,
+    /// Things noru ignores in this project, to tell the user once.
+    pub notices: Vec<String>,
     entry_keys: Vec<ModuleKey>,
     style_count: usize,
     ctx: Context,
@@ -140,38 +146,65 @@ impl Project {
         let base = options.normalized_base();
 
         let html_path = root.join("index.html");
-        let html = std::fs::read_to_string(&html_path)
-            .map_err(|_| BuildError::one(format!("no index.html found in {}", root.display())))?;
-        let entries = find_entries(&html, &root, &public_dir);
-        if entries.scripts.is_empty() {
-            return Err(BuildError::one(
-                "index.html has no <script type=\"module\" src=\"...\"> entry (e.g. <script type=\"module\" src=\"/src/main.tsx\"></script>)",
-            ));
-        }
-
+        let next_app_dir = if html_path.is_file() { None } else { crate::next::detect(&root) };
+        let mut next = None;
         let mut entry_keys = Vec::new();
-        for url in entries.styles.iter().chain(entries.scripts.iter()) {
-            let path = url_to_path(&root, url);
-            if !path.is_file() {
-                return Err(BuildError::one(format!(
-                    "entry \"{url}\" referenced in index.html does not exist ({})",
-                    path.display()
-                )));
+        let (html, entries) = if let Some(app_dir) = next_app_dir {
+            // Next.js App Router project: the page and the entry module are generated.
+            let app = NextApp::load(&root, &app_dir, options.hmr);
+            entry_keys.push(ModuleKey::new(app.entry(), None));
+            next = Some(app);
+            (crate::next::HTML.to_string(), HtmlEntries { scripts: vec![], styles: vec![] })
+        } else {
+            let html = std::fs::read_to_string(&html_path).map_err(|_| {
+                if crate::next::is_pages_router_project(&root) {
+                    BuildError::one(
+                        "this Next.js project uses the Pages Router (pages/), which noru does not support yet: noru runs Next.js App Router projects (app/)",
+                    )
+                } else {
+                    BuildError::one(format!(
+                        "no index.html found in {} (noru builds Vite-style apps with an index.html, and Next.js App Router apps)",
+                        root.display()
+                    ))
+                }
+            })?;
+            let entries = find_entries(&html, &root, &public_dir);
+            if entries.scripts.is_empty() {
+                return Err(BuildError::one(
+                    "index.html has no <script type=\"module\" src=\"...\"> entry (e.g. <script type=\"module\" src=\"/src/main.tsx\"></script>)",
+                ));
             }
-            entry_keys.push(ModuleKey::new(path, None));
-        }
+            for url in entries.styles.iter().chain(entries.scripts.iter()) {
+                let path = url_to_path(&root, url);
+                if !path.is_file() {
+                    return Err(BuildError::one(format!(
+                        "entry \"{url}\" referenced in index.html does not exist ({})",
+                        path.display()
+                    )));
+                }
+                entry_keys.push(ModuleKey::new(path, None));
+            }
+            (html, entries)
+        };
 
+        let summary = next.as_ref().map(|app| {
+            let dir = app.app_dir().strip_prefix(&root).unwrap_or(app.app_dir()).to_string_lossy().replace('\\', "/");
+            format!("Next.js app ({dir}/, {} pages), running in the browser", app.page_count())
+        });
+        let notices = next.as_ref().map(|app| app.notices().to_vec()).unwrap_or_default();
         let env = load_env(&root, &options.mode);
         let ctx = Context {
             base: base.clone(),
             public_dir: public_dir.clone(),
             minify: options.minify,
             inline_limit: options.asset_inline_limit,
-            defines: Defines::build(&options.mode, &base, &env),
+            defines: Defines::build(&options.mode, &base, &env, next.is_some()),
             resolver: NoruResolver::new(&root, options.mode == "production"),
-            jsx_import_source: "react".to_string(),
+            jsx_import_source: if next.is_some() { crate::next::JSX_IMPORT_SOURCE } else { "react" }.to_string(),
             packages: PackageCache::default(),
             react_refresh: options.hmr,
+            next,
+            postcss: PostCss::detect(&root),
         };
 
         Ok(Self {
@@ -184,9 +217,23 @@ impl Project {
             treeshake: options.treeshake,
             html,
             entries,
+            summary,
+            notices,
             entry_keys,
             ctx,
         })
+    }
+
+    /// Next.js projects: picks up added / removed pages before a rebuild.
+    pub fn refresh_routes(&mut self) {
+        if let Some(next) = self.ctx.next.as_mut() {
+            next.refresh();
+        }
+    }
+
+    /// CSS files whose output depends on the other source files (Tailwind scans them for classes).
+    pub fn postcss_outputs(&self) -> Vec<PathBuf> {
+        self.ctx.postcss.as_ref().map(PostCss::processed_files).unwrap_or_default()
     }
 
     pub fn bundle(&self, cache: Option<&mut ModuleCache>) -> Result<Bundle, BuildError> {
@@ -253,10 +300,12 @@ pub fn build(options: &BuildOptions) -> Result<BuildResult, BuildError> {
         });
     }
 
+    let mut warnings = project.notices.clone();
+    warnings.extend(bundle.warnings);
     Ok(BuildResult {
         out_dir: project.out_dir.clone(),
         files: outputs,
-        warnings: bundle.warnings,
+        warnings,
         module_count: bundle.module_count,
         removed_modules: bundle.removed_count,
         duration: start.elapsed(),

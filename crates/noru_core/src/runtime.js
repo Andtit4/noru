@@ -9,7 +9,13 @@ function __noru_require(id) {
     throw error;
   }
   var module = (__noru_cache[id] = { exports: {} });
-  factory.call(module.exports, module, module.exports, __noru_require);
+  try {
+    factory.call(module.exports, module, module.exports, __noru_require);
+  } catch (error) {
+    // Like Node.js: a module that failed is not cached, the next require() runs it again.
+    delete __noru_cache[id];
+    throw error;
+  }
   return module.exports;
 }
 function __noru_esm(exports) {

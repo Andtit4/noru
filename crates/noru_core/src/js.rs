@@ -885,6 +885,14 @@ impl<'s> Analyzer<'s> {
         }
     }
 
+    /// A global variable replaced at compile time (e.g. `__dirname` or `global` in Next.js apps).
+    fn identifier_define(&self, ident: &IdentifierReference) -> Option<&'s crate::env::Define> {
+        if !self.is_global(ident) {
+            return None;
+        }
+        self.ctx.defines().get(ident.name.as_str())
+    }
+
     fn define_for(&self, expr: &Expression) -> Option<&'s crate::env::Define> {
         if !matches!(expr, Expression::StaticMemberExpression(_) | Expression::ComputedMemberExpression(_)) {
             return None;
@@ -1159,6 +1167,11 @@ impl<'a> Visit<'a> for Analyzer<'_> {
     fn visit_object_property(&mut self, it: &ObjectProperty<'a>) {
         if it.shorthand {
             if let Expression::Identifier(ident) = &it.value {
+                if let Some(define) = self.identifier_define(ident) {
+                    let text = format!("{}: {}", ident.name, define.code);
+                    self.edits.push(Edit::replace(it.span.start, it.span.end, text));
+                    return;
+                }
                 if let Some(replacement) = self.import_replacement(ident) {
                     self.note_reference(ident);
                     let text = format!("{}: {replacement}", ident.name);
@@ -1171,6 +1184,10 @@ impl<'a> Visit<'a> for Analyzer<'_> {
     }
 
     fn visit_identifier_reference(&mut self, it: &IdentifierReference<'a>) {
+        if let Some(define) = self.identifier_define(it) {
+            self.edits.push(Edit::replace(it.span.start, it.span.end, define.code.clone()));
+            return;
+        }
         self.note_reference(it);
         if let Some(replacement) = self.import_replacement(it) {
             self.edits.push(Edit::replace(it.span.start, it.span.end, replacement));

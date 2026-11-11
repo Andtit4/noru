@@ -85,6 +85,7 @@ cargo build --release                   # compile noru (2-5 min la première foi
 cargo test --workspace                  # tests unitaires
 node scripts/e2e.mjs                    # builde les projets de test et les ouvre dans Edge/Chrome
 node scripts/e2e-dev.mjs                # teste le serveur de dev (hot reload, état conservé, CSS, erreurs)
+node scripts/e2e-next.mjs               # teste un projet Next.js (routes, pages async, Tailwind, hot reload)
 ```
 
 Tout doit afficher des ✓. Le test du package npm :
@@ -107,8 +108,31 @@ cargo build --release
 ./target/release/noru.exe start chemin/vers/ton-projet
 ```
 
-Le projet doit avoir un `index.html` à la racine avec `<script type="module" src="/src/main.tsx">`
-(comme un projet Vite).
+Deux sortes de projets marchent :
+
+- un projet **React de type Vite** : un `index.html` à la racine avec
+  `<script type="module" src="/src/main.tsx">` ;
+- un projet **Next.js App Router** (un dossier `app/` ou `src/app/`) : rien à changer, il suffit de
+  remplacer `next dev` / `next build` / `next start` par `noru dev` / `noru build` / `noru start`.
+
+### Projets Next.js : comment ça marche
+
+noru n'utilise pas le serveur de Next.js : il lit le dossier `app/` et fabrique un petit routeur qui
+tourne **dans le navigateur**. Tout le projet est compilé au démarrage, donc ouvrir une page est
+instantané (pas de « Compiling… » à chaque nouvelle page comme avec `next dev`).
+
+Ce qui marche : layouts, groupes `(groupe)`, routes dynamiques `[id]` et `[...slug]`, `loading`,
+`error`, `not-found`, `metadata`, `next/link`, `next/navigation`, `next/image`, `next/font/google`,
+`next/dynamic`, les pages `async` (elles s'exécutent dans le navigateur), `NEXT_PUBLIC_*`, Tailwind
+v3 et v4. En dev, un import cassé ne casse que la page qui l'utilise.
+
+Ce qui ne marche pas encore (il faudrait un serveur) : les routes API (`route.ts`), le middleware,
+les server actions (`'use server'`), le rendu côté serveur (le référencement Google voit une page
+construite en JavaScript), `cookies()` / `headers()` de la requête. Les pages `async` appellent leurs
+API depuis le navigateur : ces API doivent l'accepter (CORS) et les secrets serveur ne sont pas
+disponibles. `noru build` produit un site statique dans `dist/`.
+
+Testé sur 5 vrais projets Next (Next 14 et 16, Tailwind v3 et v4, jusqu'à 2 400 modules).
 
 ## 5. Publier sur npm
 
@@ -173,9 +197,11 @@ source maps, plugins, fichier de config.
 
 Pistes, par ordre d'intérêt :
 
-1. **Scope hoisting** : supprimer l'enveloppe de chaque module (le reste de l'écart de taille avec
+1. **Next.js côté serveur** : routes API (`route.ts`) et middleware, puis rendu côté serveur.
+2. **Code splitting** : un fichier par page / par `import()` dynamique (le JavaScript d'un gros
+   projet Next serait téléchargé page par page, comme avec Next).
+3. **Scope hoisting** : supprimer l'enveloppe de chaque module (le reste de l'écart de taille avec
    Vite sur les très gros projets).
-2. **Source maps** : voir son vrai code TypeScript dans les outils du navigateur.
-3. **Code splitting** : un fichier par `import()` dynamique.
-4. **Cache sur disque** : démarrage encore plus rapide des gros projets.
-5. **Vue** (via `@vue/compiler-sfc`) et **Sass**.
+4. **Source maps** : voir son vrai code TypeScript dans les outils du navigateur.
+5. **Cache sur disque** : démarrage encore plus rapide des gros projets.
+6. **Vue** (via `@vue/compiler-sfc`) et **Sass**.

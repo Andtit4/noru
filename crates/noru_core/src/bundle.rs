@@ -243,14 +243,31 @@ fn render_js(
 
 pub fn generate_css(graph: &Graph, entries: &[usize], minify: bool, included: &[bool]) -> String {
     let separator = if minify { "" } else { "\n" };
-    css_in_order(graph, entries, included)
-        .into_iter()
-        .filter_map(|id| match graph.modules[id].output() {
-            ModuleOutput::Css { code, .. } if !code.trim().is_empty() => Some(code.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(separator)
+    // External `@import url(...)` rules (put first in each stylesheet by process_css) must come
+    // before any other rule: they are moved to the top of the bundle.
+    let mut external: Vec<&str> = Vec::new();
+    let mut bodies: Vec<&str> = Vec::new();
+    for id in css_in_order(graph, entries, included) {
+        let ModuleOutput::Css { code, .. } = graph.modules[id].output() else { continue };
+        let mut rest = code.as_str();
+        while rest.starts_with("@import url(") {
+            let end = rest.find(";\n").map_or(rest.len(), |i| i + 2);
+            let rule = rest[..end].trim_end();
+            if !external.contains(&rule) {
+                external.push(rule);
+            }
+            rest = &rest[end..];
+        }
+        if !rest.trim().is_empty() {
+            bodies.push(rest);
+        }
+    }
+    let mut css = external.join("\n");
+    if !css.is_empty() {
+        css.push('\n');
+    }
+    css.push_str(&bodies.join(separator));
+    css
 }
 
 pub fn minify_js(code: &str) -> Result<String, String> {

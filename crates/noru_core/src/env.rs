@@ -76,10 +76,39 @@ impl Defines {
         self.map.insert(key.to_string(), Define { code, value: static_value });
     }
 
-    pub fn build(mode: &str, base: &str, env: &BTreeMap<String, String>) -> Self {
+    /// Replacement given as JavaScript source (no statically known value).
+    fn insert_code(&mut self, key: &str, code: &str) {
+        self.map.insert(key.to_string(), Define { code: code.to_string(), value: None });
+    }
+
+    pub fn build(mode: &str, base: &str, env: &BTreeMap<String, String>, next: bool) -> Self {
         let mut defines = Defines::default();
         let node_env = if mode == "production" { "production" } else { "development" };
         defines.insert_json("process.env.NODE_ENV", node_env.into());
+
+        if next {
+            // Next.js inlines `process.env.NEXT_PUBLIC_*`; any other `process.env.X` is undefined in
+            // the browser (instead of a "process is not defined" crash).
+            let mut process_env = serde_json::Map::new();
+            process_env.insert("NODE_ENV".into(), node_env.into());
+            for (key, value) in env.iter().filter(|(key, _)| key.starts_with("NEXT_PUBLIC_")) {
+                defines.insert_json(&format!("process.env.{key}"), value.clone().into());
+                process_env.insert(key.clone(), value.clone().into());
+            }
+            let process_env = serde_json::Value::Object(process_env).to_string();
+            defines.insert_code("process.env", &format!("({process_env})"));
+            defines.insert_json("process.browser", true.into());
+            // Node.js globals, replaced like webpack (Next.js) does for the browser.
+            defines.insert_json("__dirname", "/".into());
+            defines.insert_json("__filename", "/index.js".into());
+            defines.insert_code("global", "globalThis");
+            defines.insert_code(
+                "process",
+                &format!(
+                    "({{ env: {process_env}, browser: true, version: \"\", versions: {{}}, platform: \"browser\", argv: [], cwd: function () {{ return \"/\"; }}, nextTick: function (fn) {{ var args = [].slice.call(arguments, 1); Promise.resolve().then(function () {{ fn.apply(null, args); }}); }} }})"
+                ),
+            );
+        }
 
         let is_prod = mode == "production";
         let mut env_object = serde_json::Map::new();
@@ -100,24 +129,25 @@ impl Defines {
 }
 
 /// Prefixes of `.env` variables that are exposed to client code.
-const ENV_PREFIXES: [&str; 2] = ["NORU_", "VITE_"];
+const ENV_PREFIXES: [&str; 3] = ["NORU_", "VITE_", "NEXT_PUBLIC_"];
 
 /// Loads `.env`, `.env.local`, `.env.[mode]`, `.env.[mode].local` (later files win),
 /// keeping only variables with a public prefix.
 pub fn load_env(root: &Path, mode: &str) -> BTreeMap<String, String> {
+    let is_public = |key: &str| ENV_PREFIXES.iter().any(|p| key.starts_with(p));
     let mut vars = BTreeMap::new();
     let files = [".env".to_string(), ".env.local".to_string(), format!(".env.{mode}"), format!(".env.{mode}.local")];
     for file in files {
         let Ok(text) = std::fs::read_to_string(root.join(&file)) else { continue };
         for (key, value) in parse_dotenv(&text) {
-            if ENV_PREFIXES.iter().any(|p| key.starts_with(p)) {
+            if is_public(&key) {
                 vars.insert(key, value);
             }
         }
     }
     // Real environment variables override files.
     for (key, value) in std::env::vars() {
-        if ENV_PREFIXES.iter().any(|p| key.starts_with(p)) {
+        if is_public(&key) {
             vars.insert(key, value);
         }
     }
@@ -171,9 +201,21 @@ mod tests {
 
     #[test]
     fn builds_defines() {
-        let d = Defines::build("production", "/", &BTreeMap::new());
+        let d = Defines::build("production", "/", &BTreeMap::new(), false);
         assert_eq!(d.get("process.env.NODE_ENV").unwrap().code, "\"production\"");
         assert_eq!(d.get("import.meta.env.PROD").unwrap().value, Some(StaticValue::Bool(true)));
         assert!(d.get("import.meta.env").unwrap().code.starts_with("({"));
+        assert!(d.get("process.env").is_none());
+    }
+
+    #[test]
+    fn builds_next_defines() {
+        let env = BTreeMap::from([("NEXT_PUBLIC_API".to_string(), "https://api".to_string())]);
+        let d = Defines::build("development", "/", &env, true);
+        assert_eq!(d.get("process.env.NEXT_PUBLIC_API").unwrap().code, "\"https://api\"");
+        assert_eq!(
+            d.get("process.env").unwrap().code,
+            r#"({"NODE_ENV":"development","NEXT_PUBLIC_API":"https://api"})"#
+        );
     }
 }

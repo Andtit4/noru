@@ -105,8 +105,11 @@ const fixtures = [
   },
   {
     name: 'features',
-    check(dom, bundle) {
+    check(dom, bundle, css) {
       const errors = []
+      if (!css.startsWith('@import url("https://127.0.0.1:1/noru-external.css");')) {
+        errors.push(`external @import is not at the top of the CSS bundle: ${css.slice(0, 80)}`)
+      }
       if (!dom.includes('<title>PASS</title>')) {
         const match = dom.match(/<pre id="results">([\s\S]*?)<\/pre>/)
         errors.push(`self-checks failed: ${match ? match[1].trim() : 'no results (page crashed?)'}`)

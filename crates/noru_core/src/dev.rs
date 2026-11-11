@@ -112,6 +112,8 @@ impl Builder {
         if reload_project || self.project.is_none() {
             self.project = None;
             self.project = Some(Project::load(&self.options)?);
+        } else if let Some(project) = self.project.as_mut() {
+            project.refresh_routes();
         }
         let project = self.project.as_ref().expect("project loaded above");
         let bundle = project.bundle_dev(&mut self.cache, &mut self.ids)?;
@@ -187,13 +189,22 @@ impl DevServer {
             let host =
                 if options.host == "127.0.0.1" || options.host == "0.0.0.0" { "localhost" } else { &options.host };
             println!(
-                "\n  {} {}  dev server ready in {} ms ({module_count} modules)\n\n  {}  Local:   {}\n",
+                "\n  {} {}  dev server ready in {} ms ({module_count} modules)\n\n  {}  Local:   {}",
                 paint("36;1", "noru"),
                 paint("2", &format!("v{}", crate::VERSION)),
                 started.elapsed().as_millis(),
                 paint("32", "➜"),
                 paint("36", &format!("http://{host}:{}{}", addr.port(), shared.base)),
             );
+            if let Some(project) = builder.project.as_ref() {
+                if let Some(summary) = &project.summary {
+                    println!("  {}  {summary}", paint("32", "➜"));
+                }
+                println!();
+                print_warnings(true, &project.notices);
+            } else {
+                println!();
+            }
         }
 
         // File watcher -> rebuild thread.
@@ -207,8 +218,18 @@ impl DevServer {
         let rebuild_shared = Arc::clone(&shared);
         let project = ProjectRoot::new(&root);
         std::thread::spawn(move || {
-            while let Ok(first) = rx.recv() {
-                let mut events = vec![first];
+            // Events received while deciding whether to refresh the Tailwind CSS.
+            let mut carried: Vec<notify::Result<notify::Event>> = Vec::new();
+            // A JS change was published but the PostCSS (Tailwind) stylesheets were not regenerated yet.
+            let mut css_stale = false;
+            loop {
+                let mut events = std::mem::take(&mut carried);
+                if events.is_empty() {
+                    match rx.recv() {
+                        Ok(event) => events.push(event),
+                        Err(_) => return,
+                    }
+                }
                 // Debounce: editors often write a file several times in a row.
                 let deadline = Instant::now() + Duration::from_millis(30);
                 loop {
@@ -218,11 +239,24 @@ impl DevServer {
                         Err(RecvTimeoutError::Disconnected) => return,
                     }
                 }
-                let changed = relevant_paths(events, &project, &out_dir);
-                if changed.is_empty() || rebuild_shared.shutdown.load(Ordering::Relaxed) {
+                if rebuild_shared.shutdown.load(Ordering::Relaxed) {
                     continue;
                 }
-                rebuild(&mut builder, &rebuild_shared, &project, &changed, log);
+                let changed = relevant_paths(events, &project, &out_dir);
+                if !changed.is_empty() {
+                    css_stale |= rebuild(&mut builder, &rebuild_shared, &project, &changed, log);
+                }
+                if css_stale {
+                    // Several saves in a row: the JS updates go out at once, the Tailwind CSS
+                    // (which can take a second or more) is regenerated after the last one.
+                    while let Ok(event) = rx.try_recv() {
+                        carried.push(event);
+                    }
+                    if carried.is_empty() {
+                        refresh_postcss(&mut builder, &rebuild_shared, &project, log);
+                        css_stale = false;
+                    }
+                }
             }
         });
 
@@ -281,20 +315,31 @@ impl DevServer {
     }
 }
 
-fn rebuild(builder: &mut Builder, shared: &Shared, project: &ProjectRoot, changed: &[PathBuf], log: bool) {
+/// Rebuilds after a change and updates the browsers. Returns true when the PostCSS (Tailwind)
+/// stylesheets must be regenerated too (see [`refresh_postcss`]).
+fn rebuild(builder: &mut Builder, shared: &Shared, project: &ProjectRoot, changed: &[PathBuf], log: bool) -> bool {
     let started = Instant::now();
     let root = &project.root;
     let is_env = |p: &PathBuf| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(".env"));
     let env_changed = changed.iter().any(is_env);
     let html_changed = changed.iter().any(|p| p == &root.join("index.html"));
-    if env_changed {
-        // Compile-time constants changed: every module must be processed again.
+    // A PostCSS config was added, removed or edited: start a new PostCSS worker.
+    let postcss_changed = changed.iter().any(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("postcss.config.") || n.starts_with(".postcssrc"))
+    });
+    // Tailwind generates CSS from the classes used in the other files: after a JS change, its
+    // stylesheets are regenerated too, in a second step so that the JS update is not delayed.
+    let mut postcss_refresh = false;
+    if env_changed || postcss_changed {
+        // Compile-time constants or CSS plugins changed: every module must be processed again.
         builder.cache.clear();
     } else {
-        // Modules found by the resolver are keyed by their real path (symlinks resolved).
-        let mut stale = changed.to_vec();
-        stale.extend(changed.iter().filter_map(|p| project.to_real(p)));
-        builder.cache.invalidate(&stale);
+        let is_css = |p: &PathBuf| p.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("css"));
+        postcss_refresh =
+            !changed.iter().all(is_css) && builder.project.as_ref().is_some_and(|p| !p.postcss_outputs().is_empty());
+        builder.cache.invalidate(&with_real_paths(changed.to_vec(), project));
     }
     let names: Vec<String> = changed
         .iter()
@@ -307,7 +352,37 @@ fn rebuild(builder: &mut Builder, shared: &Shared, project: &ProjectRoot, change
         names.join(", ")
     };
 
-    match builder.build(env_changed || html_changed) {
+    let result = builder.build(env_changed || html_changed || postcss_changed);
+    publish(shared, &what, started, env_changed, result, log) && postcss_refresh
+}
+
+/// Regenerates the PostCSS (Tailwind) stylesheets after JS changes, and swaps them in the page.
+fn refresh_postcss(builder: &mut Builder, shared: &Shared, project: &ProjectRoot, log: bool) {
+    let outputs = builder.project.as_ref().map(Project::postcss_outputs).unwrap_or_default();
+    builder.cache.invalidate(&with_real_paths(outputs, project));
+    let started = Instant::now();
+    let result = builder.build(false);
+    publish(shared, "Tailwind CSS", started, false, result, log);
+}
+
+/// Modules found by the resolver are keyed by their real path (symlinks resolved): both are invalidated.
+fn with_real_paths(mut paths: Vec<PathBuf>, project: &ProjectRoot) -> Vec<PathBuf> {
+    let real: Vec<PathBuf> = paths.iter().filter_map(|p| project.to_real(p)).collect();
+    paths.extend(real);
+    paths
+}
+
+/// Sends the result of a rebuild to the browsers (hot update, CSS update, reload or error).
+/// Returns false if the build failed.
+fn publish(
+    shared: &Shared,
+    what: &str,
+    started: Instant,
+    env_changed: bool,
+    result: Result<Built, BuildError>,
+    log: bool,
+) -> bool {
+    match result {
         Ok(built) => {
             let elapsed = started.elapsed().as_millis();
             let mut out = match shared.output.write() {
@@ -357,7 +432,7 @@ fn rebuild(builder: &mut Builder, shared: &Shared, project: &ProjectRoot, change
                 }
                 if actions.is_empty() {
                     // Saved without any effective change: nothing to tell.
-                    return;
+                    return true;
                 }
                 actions.join(" + ")
             };
@@ -370,6 +445,7 @@ fn rebuild(builder: &mut Builder, shared: &Shared, project: &ProjectRoot, change
                     built.module_count,
                 );
             }
+            true
         }
         Err(err) => {
             let message = strip_ansi(&err.to_string());
@@ -380,6 +456,7 @@ fn rebuild(builder: &mut Builder, shared: &Shared, project: &ProjectRoot, change
                 out.error = Some(message.clone());
             }
             shared.broadcast(&serde_json::json!({ "type": "error", "message": message }));
+            false
         }
     }
 }

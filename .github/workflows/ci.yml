@@ -49,6 +49,9 @@ jobs:
       - name: Dev server tests (live reload, CSS update, error overlay)
         run: node scripts/e2e-dev.mjs target/debug/noru${{ runner.os == 'Windows' && '.exe' || '' }}
 
+      - name: Next.js app tests (routing, server components, Tailwind, hot updates)
+        run: node scripts/e2e-next.mjs target/debug/noru${{ runner.os == 'Windows' && '.exe' || '' }}
+
       - name: npm package smoke test
         working-directory: packages/noru
         run: |

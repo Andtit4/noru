@@ -47,6 +47,13 @@ pub fn is_asset_extension(ext: &str) -> bool {
     ASSET_EXTENSIONS.contains(&ext)
 }
 
+pub fn is_image_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "png" | "jpg" | "jpeg" | "jfif" | "pjpeg" | "pjp" | "gif" | "svg" | "ico" | "webp" | "avif" | "bmp" | "apng"
+    )
+}
+
 pub fn mime_type(ext: &str) -> &'static str {
     match ext {
         "png" | "apng" => "image/png",
