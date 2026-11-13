@@ -25,6 +25,9 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
           <Link href={{ pathname: '/search', query: { q: 'noru' } }} id="link-search">
             Search
           </Link>
+          <Link href="/suspend" id="link-suspend">
+            Suspends
+          </Link>
           <Link href="/dashboard" id="link-dashboard">
             Dashboard
           </Link>

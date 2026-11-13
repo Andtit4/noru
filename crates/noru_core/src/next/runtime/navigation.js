@@ -1,8 +1,8 @@
 // noru: browser version of `next/navigation`.
 import * as React from "react";
 import {
-  subscribe,
   getSnapshot,
+  LocationContext,
   navigate,
   refresh,
   ParamsContext,
@@ -39,22 +39,18 @@ export function useRouter() {
   return router;
 }
 
-function getPathname() {
-  return getSnapshot().pathname;
-}
-
-function getSearch() {
-  return getSnapshot().search;
+function useLocation() {
+  return React.useContext(LocationContext) || getSnapshot();
 }
 
 export function usePathname() {
-  return React.useSyncExternalStore(subscribe, getPathname, getPathname);
+  return useLocation().pathname;
 }
 
 export class ReadonlyURLSearchParams extends URLSearchParams {}
 
 export function useSearchParams() {
-  const search = React.useSyncExternalStore(subscribe, getSearch, getSearch);
+  const search = useLocation().search;
   return React.useMemo(
     function () {
       return new ReadonlyURLSearchParams(search);

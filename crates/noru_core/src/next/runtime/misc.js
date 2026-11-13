@@ -149,23 +149,23 @@ export function draftMode() {
 
 // @module pages-router.js
 import * as React from "react";
-import { subscribe, getSnapshot, navigate } from "noru-next/router";
+import { getSnapshot, LocationContext, navigate } from "noru-next/router";
 
-function query() {
+function query(snap) {
   const out = {};
-  new URLSearchParams(getSnapshot().search).forEach(function (value, key) {
+  new URLSearchParams(snap.search).forEach(function (value, key) {
     out[key] = key in out ? [].concat(out[key], value) : value;
   });
   return out;
 }
 
-function makeRouter() {
-  const snap = getSnapshot();
+function makeRouter(current) {
+  const snap = current || getSnapshot();
   return {
     pathname: snap.pathname,
     route: snap.pathname,
     asPath: snap.pathname + snap.search + snap.hash,
-    query: query(),
+    query: query(snap),
     isReady: true,
     isFallback: false,
     basePath: "",
@@ -191,8 +191,7 @@ function makeRouter() {
 }
 
 export function useRouter() {
-  React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
-  return makeRouter();
+  return makeRouter(React.useContext(LocationContext));
 }
 
 export function withRouter(Component) {

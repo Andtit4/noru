@@ -105,6 +105,14 @@ async function testApp(page, base, label) {
   await page.navigate(`${base}/lazy`)
   check('next/dynamic', await page.waitFor(`${text('heavy')} === 'dynamic works'`))
 
+  await page.navigate(`${base}/`)
+  await page.waitFor(`${title} === 'Home page'`)
+  await page.evaluate(click('link-suspend'))
+  check(
+    'client-side navigation to a page that suspends (no loading.tsx)',
+    await page.waitFor(`${text('heavy')} === 'lazy page without suspense' && !document.querySelector('[data-noru-app-error]')`),
+  )
+
   // Middleware and route handlers, run by Node.js.
   const hello = await (await fetch(`${base}/api/hello?name=noru`, { headers: { cookie: 'mw-visited=yes' } })).json()
   check('route handler GET (searchParams)', hello.hello === 'noru', JSON.stringify(hello))
@@ -218,6 +226,41 @@ async function testDev(browserPath) {
   return dev.logs
 }
 
+/** Next.js 14 apps use React 18, which fails when a navigation that suspends is not a transition. */
+async function testReact18(browserPath) {
+  console.log('\n— React 18')
+  const project = mkdtempSync(join(tmpdir(), 'noru-next-react18-'))
+  cpSync(fixture, project, { recursive: true, filter: (src) => !/[\\/](dist|node_modules)$/.test(src) })
+  const pkg = JSON.parse(readFileSync(join(project, 'package.json'), 'utf8'))
+  pkg.dependencies.react = '^18.3.1'
+  pkg.dependencies['react-dom'] = '^18.3.1'
+  writeFileSync(join(project, 'package.json'), JSON.stringify(pkg, null, 2))
+  spawnSync('npm install --no-audit --no-fund --loglevel=error', { cwd: project, stdio: 'inherit', shell: true })
+  const port = 4300 + Math.floor(Math.random() * 300)
+  const dev = startServer(['dev', project, '--port', String(port)])
+  let page
+  try {
+    await waitForLog(dev, 'Local')
+    page = await launchBrowser(browserPath)
+    const base = `http://127.0.0.1:${port}`
+    await page.navigate(`${base}/`)
+    check('React 18: home page renders', await page.waitFor(`${title} === 'Home page'`))
+    await page.evaluate(click('link-suspend'))
+    check(
+      'React 18: client-side navigation to a page that suspends',
+      await page.waitFor(`${text('heavy')} === 'lazy page without suspense' && !document.querySelector('[data-noru-app-error]')`),
+      await page.evaluate(`document.querySelector('[data-noru-app-error] pre')?.textContent.split('\\n')[0]`),
+    )
+    await page.evaluate(click('link-about'))
+    check('React 18: usePathname() after a client-side navigation', await page.waitFor(`${text('pathname')} === '/about'`))
+  } finally {
+    page?.close()
+    killTree(dev.server)
+    await sleep(300)
+    rmSync(project, { recursive: true, force: true })
+  }
+}
+
 async function main() {
   const browserPath = findBrowser()
   if (!existsSync(noru) || !browserPath) {
@@ -229,6 +272,7 @@ async function main() {
   }
   await testBuild(browserPath)
   const devLogs = await testDev(browserPath)
+  await testReact18(browserPath)
 
   if (failures.length) {
     console.log(`\n${failures.length} Next.js check(s) failed\n--- dev server logs ---\n${devLogs}`)

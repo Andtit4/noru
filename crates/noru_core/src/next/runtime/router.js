@@ -9,7 +9,7 @@ import { createRoot } from "react-dom/client";
 const h = React.createElement;
 
 // ------------------------------------------------------------------------------------------
-// Location store (used by next/navigation hooks through useSyncExternalStore)
+// Location store (the App renders it in a transition, see LocationContext)
 
 // The middleware rewrote the first page to another path (the URL in the address bar stays).
 if (window.__NORU_REWRITE__) {
@@ -309,7 +309,13 @@ class RootBoundary extends React.Component {
 /** An error that no error.tsx caught (Next.js shows "Application error" too). */
 function ApplicationError(props) {
   const error = props.error;
-  const details = process.env.NODE_ENV === "production" ? null : String((error && (error.stack || error.message)) || error);
+  let details = null;
+  if (process.env.NODE_ENV !== "production") {
+    const message = error && error.message ? String(error.message) : String(error);
+    const stack = error && error.stack ? String(error.stack) : "";
+    // Firefox stacks do not start with the message.
+    details = stack.indexOf(message) === -1 ? message + (stack ? "\n\n" + stack : "") : stack;
+  }
   return h(
     "div",
     {
@@ -578,9 +584,26 @@ async function applyMetadata(found, paramsProp, searchProp, key) {
 // ------------------------------------------------------------------------------------------
 // App
 
+/** The location being rendered (read by usePathname, useSearchParams...). */
+export const LocationContext = React.createContext(null);
+
 function App(props) {
   const routes = props.routes;
-  const loc = React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  // The location is React state updated in a transition, like Next.js navigations: while the new
+  // page is not ready (lazy components, async server components), the current one stays on screen
+  // (a synchronous update would make React 18 fail with "A component suspended while responding
+  // to synchronous input").
+  const [loc, setLoc] = React.useState(getSnapshot);
+  React.useEffect(function () {
+    const update = function () {
+      React.startTransition(function () {
+        setLoc(getSnapshot());
+      });
+    };
+    const unsubscribe = subscribe(update);
+    update(); // the location may have changed before this effect ran
+    return unsubscribe;
+  }, []);
   // A path rewritten by the middleware renders another page under the same URL.
   const renderedPath = loc.rewrite ? loc.rewrite.split("?")[0] : loc.pathname;
   const found = React.useMemo(
@@ -615,7 +638,7 @@ function App(props) {
   if (routes.globalError) {
     el = h(ErrorBoundary, { resetKey: loc.pathname, load: routes.globalError, file: "global-error" }, el);
   }
-  return el;
+  return h(LocationContext.Provider, { value: loc }, el);
 }
 
 export function start(routes) {
