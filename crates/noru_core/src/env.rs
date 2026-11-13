@@ -135,23 +135,39 @@ const ENV_PREFIXES: [&str; 3] = ["NORU_", "VITE_", "NEXT_PUBLIC_"];
 /// keeping only variables with a public prefix.
 pub fn load_env(root: &Path, mode: &str) -> BTreeMap<String, String> {
     let is_public = |key: &str| ENV_PREFIXES.iter().any(|p| key.starts_with(p));
-    let mut vars = BTreeMap::new();
+    let mut from_files = BTreeMap::new();
     let files = [".env".to_string(), ".env.local".to_string(), format!(".env.{mode}"), format!(".env.{mode}.local")];
     for file in files {
         let Ok(text) = std::fs::read_to_string(root.join(&file)) else { continue };
-        for (key, value) in parse_dotenv(&text) {
-            if is_public(&key) {
-                vars.insert(key, value);
-            }
+        from_files.extend(parse_dotenv(&text));
+    }
+    // Real environment variables override files; `${VAR}` refers to either (like Next.js / dotenv-expand).
+    let lookup = |name: &str| std::env::var(name).ok().or_else(|| from_files.get(name).cloned());
+    let mut vars = BTreeMap::new();
+    for (key, value) in &from_files {
+        if is_public(key) && std::env::var_os(key).is_none() {
+            vars.insert(key.clone(), expand(value, &lookup));
         }
     }
-    // Real environment variables override files.
     for (key, value) in std::env::vars() {
         if is_public(&key) {
             vars.insert(key, value);
         }
     }
     vars
+}
+
+/// `${VAR}` / `$VAR` -> value of VAR (empty when undefined); `\$` stays a dollar sign.
+fn expand(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
+    static VARIABLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\\\$|\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)").expect("valid regex")
+    });
+    VARIABLE
+        .replace_all(value, |caps: &regex::Captures| match caps.get(1).or(caps.get(2)) {
+            Some(name) => lookup(name.as_str()).unwrap_or_default(),
+            None => "$".to_string(),
+        })
+        .into_owned()
 }
 
 fn parse_dotenv(text: &str) -> Vec<(String, String)> {
@@ -206,6 +222,13 @@ mod tests {
         assert_eq!(d.get("import.meta.env.PROD").unwrap().value, Some(StaticValue::Bool(true)));
         assert!(d.get("import.meta.env").unwrap().code.starts_with("({"));
         assert!(d.get("process.env").is_none());
+    }
+
+    #[test]
+    fn expands_variables() {
+        let lookup = |name: &str| (name == "HOST").then(|| "example.com".to_string());
+        assert_eq!(expand("https://${HOST}${basepath}/api", &lookup), "https://example.com/api");
+        assert_eq!(expand("$HOST:80 costs \\$5", &lookup), "example.com:80 costs $5");
     }
 
     #[test]

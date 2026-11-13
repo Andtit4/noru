@@ -105,6 +105,34 @@ async function testApp(page, base, label) {
   await page.navigate(`${base}/lazy`)
   check('next/dynamic', await page.waitFor(`${text('heavy')} === 'dynamic works'`))
 
+  // Middleware and route handlers, run by Node.js.
+  const hello = await (await fetch(`${base}/api/hello?name=noru`, { headers: { cookie: 'mw-visited=yes' } })).json()
+  check('route handler GET (searchParams)', hello.hello === 'noru', JSON.stringify(hello))
+  check('  … sees server-side .env variables', hello.secret === 'do-not-leak')
+  check('  … cookies() and headers() from next/headers', hello.visited === 'yes' && hello.agent === true)
+  const posted = await fetch(`${base}/api/hello`, { method: 'POST', body: JSON.stringify({ a: 1 }), headers: { 'content-type': 'application/json' } })
+  const postedBody = await posted.json().catch(() => ({}))
+  check('route handler POST with a JSON body', posted.status === 201 && postedBody.received?.a === 1, `${posted.status} ${JSON.stringify(postedBody)}`)
+  const postedCookies = posted.headers.getSetCookie()
+  check('  … response cookies (NextResponse and cookies().set)', postedCookies.some((c) => c.startsWith('posted=yes')) && postedCookies.some((c) => c.startsWith('via-headers=yes')), postedCookies.join(' | '))
+  check('dynamic route handler params', (await (await fetch(`${base}/api/items/42`)).json()).id === '42')
+  check('method without a handler: 405', (await fetch(`${base}/api/items/42`, { method: 'DELETE' })).status === 405)
+  const redirected = await fetch(`${base}/mw-redirect`, { redirect: 'manual' })
+  check('middleware redirect', redirected.status === 307 && (redirected.headers.get('location') || '').endsWith('/about'), `${redirected.status} ${redirected.headers.get('location')}`)
+  const blocked = await fetch(`${base}/mw-blocked`)
+  check('middleware response', blocked.status === 403 && (await blocked.text()) === 'blocked by middleware')
+  const homeResponse = await fetch(`${base}/`)
+  check(
+    'NextResponse.next() with headers and cookies',
+    homeResponse.headers.get('x-noru-middleware') === 'ran' && homeResponse.headers.getSetCookie().some((c) => c.startsWith('mw-visited=yes')),
+  )
+  await page.navigate(`${base}/mw-rewrite`)
+  check('middleware rewrite: another page under the same URL', await page.waitFor(`${title} === 'Dashboard' && location.pathname === '/mw-rewrite'`))
+  await page.navigate(`${base}/`)
+  await page.waitFor(`${title} === 'Home page'`)
+  await page.evaluate(click('link-mw-redirect'))
+  check('client-side navigation goes through the middleware', await page.waitFor(`location.pathname === '/about' && ${title} === 'About page'`))
+
   const errors = page.takeErrors().filter((e) => !/boom|The above error occurred|React will try to recreate|fonts\.googleapis/i.test(e))
   check('no unexpected errors in the browser console', errors.length === 0, errors.slice(0, 3).join(' | '))
 }

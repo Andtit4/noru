@@ -118,7 +118,7 @@ Deux sortes de projets marchent :
 ### Projets Next.js : comment ça marche
 
 noru n'utilise pas le serveur de Next.js : il lit le dossier `app/` et fabrique un petit routeur qui
-tourne **dans le navigateur**. Tout le projet est compilé au démarrage, donc ouvrir une page est
+fait tourner les pages **dans le navigateur**. Tout le projet est compilé au démarrage, donc ouvrir une page est
 instantané (pas de « Compiling… » à chaque nouvelle page comme avec `next dev`).
 
 Ce qui marche : layouts, groupes `(groupe)`, routes dynamiques `[id]` et `[...slug]`, `loading`,
@@ -126,13 +126,20 @@ Ce qui marche : layouts, groupes `(groupe)`, routes dynamiques `[id]` et `[...sl
 `next/dynamic`, les pages `async` (elles s'exécutent dans le navigateur), `NEXT_PUBLIC_*`, Tailwind
 v3 et v4. En dev, un import cassé ne casse que la page qui l'utilise.
 
-Ce qui ne marche pas encore (il faudrait un serveur) : les routes API (`route.ts`), le middleware,
-les server actions (`'use server'`), le rendu côté serveur (le référencement Google voit une page
-construite en JavaScript), `cookies()` / `headers()` de la requête. Les pages `async` appellent leurs
-API depuis le navigateur : ces API doivent l'accepter (CORS) et les secrets serveur ne sont pas
-disponibles. `noru build` produit un site statique dans `dist/`.
+**Le middleware et les routes API** (`middleware.ts` / `proxy.ts`, `route.ts`) tournent dans un
+processus Node.js lancé par noru à côté du serveur : redirections, réécritures, cookies, `matcher`,
+`next/server`, `next/headers` (`cookies()`, `headers()`), et toutes les variables du `.env` (secrets
+compris, uniquement côté serveur). Le middleware s'exécute aussi avant les navigations dans
+l'application, comme avec Next. Les paquets npm (next-auth...) sont chargés depuis `node_modules`.
+`noru build` met ce code serveur dans `dist/server/` (jamais envoyé au navigateur) et `noru start`
+l'exécute : le serveur de production a donc besoin du `node_modules` et des fichiers `.env`.
 
-Testé sur 5 vrais projets Next (Next 14 et 16, Tailwind v3 et v4, jusqu'à 2 400 modules).
+Ce qui ne marche pas encore : les server actions (`'use server'`), le rendu côté serveur (le
+référencement Google voit une page construite en JavaScript). Les pages `async` appellent leurs API
+depuis le navigateur : ces API doivent l'accepter (CORS) et les secrets serveur ne leur sont pas
+disponibles.
+
+Testé sur 5 vrais projets Next (Next 14 et 16, Tailwind v3 et v4, jusqu'à 4 100 modules, next-auth).
 
 ## 5. Publier sur npm
 
@@ -197,7 +204,8 @@ source maps, plugins, fichier de config.
 
 Pistes, par ordre d'intérêt :
 
-1. **Next.js côté serveur** : routes API (`route.ts`) et middleware, puis rendu côté serveur.
+1. **Next.js côté serveur** : server actions, puis rendu côté serveur (les routes API et le
+   middleware sont faits depuis la v0.3).
 2. **Code splitting** : un fichier par page / par `import()` dynamique (le JavaScript d'un gros
    projet Next serait téléchargé page par page, comme avec Next).
 3. **Scope hoisting** : supprimer l'enveloppe de chaque module (le reste de l'écart de taille avec

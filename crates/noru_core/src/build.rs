@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 
 use std::collections::HashMap;
 
-use crate::bundle::{generate_css, generate_dev_js, generate_js, render_modules, RenderedModule};
+use crate::bundle::{generate_css, generate_dev_js, generate_js, generate_server_js, render_modules, RenderedModule};
 use crate::env::{load_env, Defines};
 use crate::graph::{build_graph, Context, ModuleCache};
 use crate::html::{find_entries, rewrite_html, url_to_path, HtmlEntries};
 use crate::module::{content_hash, EmittedFile, ModuleKey};
+use crate::next::server::ServerTarget;
 use crate::next::NextApp;
 use crate::options::BuildOptions;
 use crate::pkg::PackageCache;
@@ -74,6 +75,8 @@ pub(crate) struct Project {
     entry_keys: Vec<ModuleKey>,
     style_count: usize,
     ctx: Context,
+    /// Next.js middleware and route handlers, bundled for Node.js.
+    server_ctx: Option<Context>,
 }
 
 /// The result of bundling, in memory.
@@ -117,6 +120,15 @@ pub(crate) struct DevBundle {
 }
 
 impl Project {
+    /// The server bundle (Next.js middleware + route handlers), or `None` if the app has none.
+    pub fn bundle_server(&self, cache: Option<&mut ModuleCache>) -> Result<Option<String>, BuildError> {
+        let Some(ctx) = &self.server_ctx else { return Ok(None) };
+        let Some(server) = &ctx.server else { return Ok(None) };
+        let entry = [ModuleKey::new(server.entry.clone(), None)];
+        let graph = build_graph(&entry, ctx, cache).map_err(|messages| BuildError { messages })?;
+        Ok(Some(generate_server_js(&graph, &self.root)))
+    }
+
     /// Development bundle: no tree-shaking, stable ids, HMR runtime and React Fast Refresh.
     pub fn bundle_dev(&self, cache: &mut ModuleCache, ids: &mut StableIds) -> Result<DevBundle, BuildError> {
         let graph =
@@ -153,8 +165,9 @@ impl Project {
             // Next.js App Router project: the page and the entry module are generated.
             let app = NextApp::load(&root, &app_dir, options.hmr);
             entry_keys.push(ModuleKey::new(app.entry(), None));
+            let html = app.html();
             next = Some(app);
-            (crate::next::HTML.to_string(), HtmlEntries { scripts: vec![], styles: vec![] })
+            (html, HtmlEntries { scripts: vec![], styles: vec![] })
         } else {
             let html = std::fs::read_to_string(&html_path).map_err(|_| {
                 if crate::next::is_pages_router_project(&root) {
@@ -189,9 +202,36 @@ impl Project {
 
         let summary = next.as_ref().map(|app| {
             let dir = app.app_dir().strip_prefix(&root).unwrap_or(app.app_dir()).to_string_lossy().replace('\\', "/");
-            format!("Next.js app ({dir}/, {} pages), running in the browser", app.page_count())
+            let mut server = Vec::new();
+            if app.has_middleware() {
+                server.push("middleware".to_string());
+            }
+            if app.route_handler_count() > 0 {
+                server.push(format!("{} API route(s)", app.route_handler_count()));
+            }
+            let server =
+                if server.is_empty() { String::new() } else { format!(" + {} on Node.js", server.join(" and ")) };
+            format!("Next.js app ({dir}/, {} pages){server}", app.page_count())
         });
         let notices = next.as_ref().map(|app| app.notices().to_vec()).unwrap_or_default();
+        // Middleware and route handlers: bundled for Node.js with their own context.
+        let server_ctx = next.as_ref().and_then(|app| {
+            let source = app.server_entry_source()?;
+            Some(Context {
+                base: base.clone(),
+                public_dir: public_dir.clone(),
+                minify: false,
+                inline_limit: options.asset_inline_limit,
+                defines: Defines::build(&options.mode, &base, &Default::default(), false),
+                resolver: NoruResolver::new(&root, options.mode == "production"),
+                jsx_import_source: "react".to_string(),
+                packages: PackageCache::default(),
+                react_refresh: false,
+                next: None,
+                postcss: None,
+                server: Some(ServerTarget::new(&root, app.virtual_dir(), source)),
+            })
+        });
         let env = load_env(&root, &options.mode);
         let ctx = Context {
             base: base.clone(),
@@ -205,6 +245,7 @@ impl Project {
             react_refresh: options.hmr,
             next,
             postcss: PostCss::detect(&root),
+            server: None,
         };
 
         Ok(Self {
@@ -221,13 +262,27 @@ impl Project {
             notices,
             entry_keys,
             ctx,
+            server_ctx,
         })
     }
 
-    /// Next.js projects: picks up added / removed pages before a rebuild.
-    pub fn refresh_routes(&mut self) {
-        if let Some(next) = self.ctx.next.as_mut() {
-            next.refresh();
+    /// Next.js projects: picks up added / removed pages and route handlers before a rebuild.
+    /// Returns true when the project must be loaded again (a middleware appeared or disappeared...).
+    pub fn refresh_routes(&mut self) -> bool {
+        let Some(next) = self.ctx.next.as_mut() else { return false };
+        let had_middleware = next.has_middleware();
+        next.refresh();
+        let source = next.server_entry_source();
+        if next.has_middleware() != had_middleware {
+            return true;
+        }
+        match (source, self.server_ctx.as_mut().and_then(|ctx| ctx.server.as_mut())) {
+            (Some(source), Some(server)) => {
+                server.entry_source = source;
+                false
+            }
+            (None, None) => false,
+            _ => true,
         }
     }
 
@@ -258,6 +313,7 @@ pub fn build(options: &BuildOptions) -> Result<BuildResult, BuildError> {
     let start = Instant::now();
     let project = Project::load(options)?;
     let bundle = project.bundle(None)?;
+    let server = project.bundle_server(None)?;
     let base = &project.base;
 
     let js_name = format!("assets/index-{}.js", content_hash(bundle.js.as_bytes()));
@@ -283,6 +339,14 @@ pub fn build(options: &BuildOptions) -> Result<BuildResult, BuildError> {
         files.push(EmittedFile { file_name: name, contents: bundle.css.into_bytes() });
     }
     files.push(EmittedFile { file_name: js_name, contents: bundle.js.into_bytes() });
+    if let Some(code) = server {
+        // Next.js middleware and route handlers, run by `noru start` with Node.js.
+        files.push(EmittedFile { file_name: "server/app.js".into(), contents: code.into_bytes() });
+        files.push(EmittedFile {
+            file_name: "server/runtime.js".into(),
+            contents: crate::next::server::RUNTIME.as_bytes().to_vec(),
+        });
+    }
 
     let mut outputs = Vec::new();
     for file in &files {

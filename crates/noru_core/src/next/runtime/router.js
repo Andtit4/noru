@@ -11,12 +11,25 @@ const h = React.createElement;
 // ------------------------------------------------------------------------------------------
 // Location store (used by next/navigation hooks through useSyncExternalStore)
 
+// The middleware rewrote the first page to another path (the URL in the address bar stays).
+if (window.__NORU_REWRITE__) {
+  history.replaceState(Object.assign({}, history.state, { __noruRewrite: window.__NORU_REWRITE__ }), "");
+}
+
 let navigations = 0;
 let snapshot = readLocation(0);
 const listeners = new Set();
 
 function readLocation(key) {
-  return { pathname: location.pathname, search: location.search, hash: location.hash, key: key };
+  const state = history.state;
+  return {
+    pathname: location.pathname,
+    search: location.search,
+    hash: location.hash,
+    key: key,
+    // Path actually rendered when the middleware rewrote this URL.
+    rewrite: (state && state.__noruRewrite) || null,
+  };
 }
 
 function emit() {
@@ -46,8 +59,37 @@ export function navigate(href, options) {
     else location.assign(url.href);
     return;
   }
-  if (opts.replace) history.replaceState(history.state, "", url.href);
-  else history.pushState(null, "", url.href);
+  if (!window.__NORU_MIDDLEWARE__) {
+    commit(url, opts, null);
+    return;
+  }
+  // Like Next.js, the middleware also runs for client-side navigations.
+  const depth = opts.depth || 0;
+  fetch("/@noru/middleware?url=" + encodeURIComponent(url.pathname + url.search), { credentials: "same-origin" })
+    .then(function (response) {
+      return response.json();
+    })
+    .then(function (result) {
+      if (result.action === "redirect" && result.location && depth < 5) {
+        const target = new URL(result.location, location.href);
+        if (target.origin !== location.origin) location.assign(target.href);
+        else navigate(target.href, Object.assign({}, opts, { depth: depth + 1 }));
+      } else if (result.action === "response") {
+        // The middleware answers this URL itself: let the browser show its response.
+        location.assign(url.href);
+      } else {
+        commit(url, opts, result.rewrite || null);
+      }
+    })
+    .catch(function () {
+      commit(url, opts, null);
+    });
+}
+
+function commit(url, opts, rewrite) {
+  const state = rewrite ? { __noruRewrite: rewrite } : null;
+  if (opts.replace) history.replaceState(state, "", url.href);
+  else history.pushState(state, "", url.href);
   emit();
   if (opts.scroll !== false) {
     if (url.hash) {
@@ -539,11 +581,13 @@ async function applyMetadata(found, paramsProp, searchProp, key) {
 function App(props) {
   const routes = props.routes;
   const loc = React.useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  // A path rewritten by the middleware renders another page under the same URL.
+  const renderedPath = loc.rewrite ? loc.rewrite.split("?")[0] : loc.pathname;
   const found = React.useMemo(
     function () {
-      return match(routes.tree, splitPath(loc.pathname), 0, {}, [routes.tree]);
+      return match(routes.tree, splitPath(renderedPath), 0, {}, [routes.tree]);
     },
-    [routes.tree, loc.pathname],
+    [routes.tree, renderedPath],
   );
   const paramsProp = React.useMemo(
     function () {

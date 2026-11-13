@@ -24,9 +24,57 @@ const CONFIG_FILES: &[&str] = &[
     ".postcssrc",
 ];
 
+/// Tailwind syntax (v3 and v4).
+const TAILWIND_MARKERS: &[&str] = &[
+    "@tailwind",
+    "@apply",
+    "@layer",
+    "@config",
+    "@plugin",
+    "@theme",
+    "@variant",
+    "@custom-variant",
+    "@utility",
+    "@source",
+    "@reference",
+    "@screen",
+    "theme(",
+    "--theme(",
+    "tailwindcss",
+];
+
+/// PostCSS plugins whose only job, outside Tailwind syntax, is done by Lightning CSS or not needed.
+const TAILWIND_COMPANIONS: &[&str] = &[
+    "tailwindcss",
+    "@tailwindcss/postcss",
+    "tailwindcss/nesting",
+    "autoprefixer",
+    "postcss-import",
+    "postcss-nesting",
+];
+
+/// The config only uses Tailwind and its usual companions.
+fn is_tailwind_only(config: &str) -> bool {
+    if !config.contains("tailwind") {
+        return false;
+    }
+    // Every quoted name or object key in the config that looks like a plugin must be a known one.
+    let names = regex::Regex::new(r#"["']([@a-zA-Z0-9/_.-]+)["']|([A-Za-z_$][\w$]*)\s*:"#).expect("valid regex");
+    let known = names.captures_iter(config).all(|c| {
+        let name = c.get(1).or(c.get(2)).map_or("", |m| m.as_str());
+        !(name.contains("postcss") || name.contains("tailwind") || name.contains("prefixer") || name.contains('/'))
+            || TAILWIND_COMPANIONS.contains(&name)
+            || name.starts_with("./")
+    });
+    known
+}
+
 pub struct PostCss {
     root: PathBuf,
     config: PathBuf,
+    /// The config only has Tailwind and plugins that are not needed by stylesheets without Tailwind
+    /// syntax (autoprefixer, nesting...): those stylesheets skip PostCSS.
+    tailwind_only: bool,
     worker: Arc<Mutex<Option<Worker>>>,
     /// CSS files that went through PostCSS (Tailwind output depends on the other source files).
     processed: Mutex<HashSet<PathBuf>>,
@@ -92,14 +140,22 @@ impl PostCss {
     /// Finds the PostCSS config of a project.
     pub fn detect(root: &Path) -> Option<Self> {
         let config = CONFIG_FILES.iter().map(|name| root.join(name)).find(|p| p.is_file())?;
+        let text = std::fs::read_to_string(&config).unwrap_or_default();
         let postcss = Self {
             root: root.to_path_buf(),
+            tailwind_only: is_tailwind_only(&text),
             config,
             worker: Arc::new(Mutex::new(None)),
             processed: Mutex::new(HashSet::new()),
         };
         postcss.warm_up();
         Some(postcss)
+    }
+
+    /// Whether a stylesheet must go through PostCSS. In Tailwind projects, Tailwind only matters for
+    /// stylesheets that use its syntax: the others (often big generated files) skip the round-trip.
+    pub fn wants(&self, css: &str) -> bool {
+        !self.tailwind_only || TAILWIND_MARKERS.iter().any(|marker| css.contains(marker))
     }
 
     /// Starts Node.js and loads the PostCSS plugins in the background, while the JavaScript of the
@@ -151,5 +207,23 @@ impl PostCss {
             .map(|list| list.iter().filter_map(|w| w.as_str()).map(|w| format!("PostCSS: {w}")).collect())
             .unwrap_or_default();
         Ok((code, warnings))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_tailwind_only_configs() {
+        assert!(is_tailwind_only("export default { plugins: { '@tailwindcss/postcss': {} } }"));
+        assert!(is_tailwind_only(
+            "module.exports = { plugins: { 'tailwindcss/nesting': {}, tailwindcss: {}, autoprefixer: {} } }"
+        ));
+        assert!(is_tailwind_only(
+            "const config = { plugins: [\"tailwindcss\", \"autoprefixer\"] }; export default config"
+        ));
+        assert!(!is_tailwind_only("module.exports = { plugins: { tailwindcss: {}, 'postcss-preset-env': {} } }"));
+        assert!(!is_tailwind_only("module.exports = { plugins: { autoprefixer: {} } }"));
     }
 }

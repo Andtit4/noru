@@ -98,34 +98,42 @@ on the roadmap).
 
 ## Next.js apps
 
-noru runs **Next.js App Router projects** (an `app/` directory) without the Next.js server:
-the whole app is bundled up-front and runs in the browser, so opening a page never waits for a
-compilation. Replace the scripts, nothing else changes:
+noru runs **Next.js App Router projects** (an `app/` directory). Pages are bundled up-front and run
+in the browser, so opening a page never waits for a compilation; the **middleware** and the **route
+handlers** (API routes) run in a Node.js process next to it. Replace the scripts, nothing else
+changes:
 
 ```jsonc
 "scripts": {
   "dev": "noru dev",      // instead of next dev
-  "build": "noru build",  // instead of next build: a static site in dist/
+  "build": "noru build",  // instead of next build
   "start": "noru start"   // instead of next start
 }
 ```
 
-**Supported:** `app/` routing (layouts, nested layouts, route groups `(group)`, dynamic segments
+**Pages:** `app/` routing (layouts, nested layouts, route groups `(group)`, dynamic segments
 `[id]`, catch-all `[...slug]` and `[[...slug]]`, `loading`, `error`, `global-error`, `not-found`,
 `template`), `metadata` / `generateMetadata` (title, description), `next/link`, `next/navigation`
 (`useRouter`, `usePathname`, `useSearchParams`, `useParams`, `useSelectedLayoutSegment(s)`,
 `redirect`, `notFound`), `next/image`, `next/font/google`, `next/dynamic`, `next/script`,
 `next/head`, `params` / `searchParams` (plain objects and promises), **async server components**
 (they run in the browser), `NEXT_PUBLIC_*` variables, Tailwind CSS v3 / v4, `app/favicon.ico`, and
-the browser versions of Node.js modules that Next.js provides (`buffer`, `https`, `crypto`...).
+the browser versions of Node.js modules that Next.js provides (`buffer`, `https`, `url`...).
 In `noru dev`, a broken import only breaks the page that uses it, like `next dev`.
 
-**Not supported (they need a server):** route handlers (`route.ts`, API routes), middleware /
-proxy, server actions (`'use server'`), server-side rendering (pages are rendered in the browser,
-which matters for SEO), ISR, `cookies()` / `headers()` from the request. Also not yet:
-`next/font/local`, parallel and intercepting routes, the Pages Router (`pages/`), `next.config`
-options. Async server components run in the browser: the APIs they call must be reachable from the
-browser, and server-only secrets are not available.
+**Server:** `middleware.ts` / `proxy.ts` (redirects, rewrites, responses, cookies and headers,
+`config.matcher`; it also runs before client-side navigations, like Next.js) and route handlers
+(`route.ts`: `GET` / `POST` / ... with `params`), with `next/server` (`NextRequest`,
+`NextResponse`), `next/headers` (`cookies()`, `headers()`) and every `.env` variable (server side
+only, `${VAR}` references are expanded). npm packages such as `next-auth` are loaded by Node.js from
+`node_modules`. `noru build` writes this server code to `dist/server/` (never sent to browsers) and
+`noru start` runs it, so the server needs the project's `node_modules` and `.env` files.
+
+**Not supported yet:** server actions (`'use server'`), server-side rendering (pages are rendered
+in the browser, which matters for SEO), ISR, `next/font/local`, parallel and intercepting routes,
+the Pages Router (`pages/`), `next.config` options, ESM-only packages that import `next/*` in
+server code. Async server components run in the browser: the APIs they call must be reachable from
+the browser, and server-only secrets are not available to them.
 
 ## Commands
 
@@ -186,8 +194,8 @@ noru follows the Vite conventions, so most Vite React apps work as-is:
 - An `import.meta.hot` API for non-React code (non-component modules propagate the update to
   their importers, up to the closest React component)
 - Plugins and a config file
-- Server-side rendering, and the server parts of Next.js (route handlers, middleware, server
-  actions): Next.js apps run in the browser, see [Next.js apps](#nextjs-apps)
+- Server-side rendering and server actions (Next.js pages run in the browser; middleware and route
+  handlers are supported, see [Next.js apps](#nextjs-apps))
 
 ## JavaScript API
 

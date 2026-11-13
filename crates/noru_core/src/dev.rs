@@ -22,6 +22,7 @@ use crate::build::{BuildError, Project, StableIds};
 use crate::bundle::{generate_hot_update, RenderedModule};
 use crate::graph::ModuleCache;
 use crate::html::rewrite_html;
+use crate::next::server::{dispatch, middleware_endpoint, send_page, Dispatch, ServerRuntime};
 use crate::options::BuildOptions;
 use crate::serve::{extension_of, read_request, safe_join, send, Response};
 
@@ -70,9 +71,12 @@ struct Output {
 struct Shared {
     output: RwLock<Output>,
     clients: Mutex<Vec<Sender<String>>>,
+    root: PathBuf,
     public_dir: PathBuf,
     base: String,
     shutdown: AtomicBool,
+    /// Node.js process running the Next.js middleware and route handlers.
+    server: RwLock<Option<Arc<ServerRuntime>>>,
 }
 
 impl Shared {
@@ -82,6 +86,39 @@ impl Shared {
             clients.retain(|client| client.send(text.clone()).is_ok());
         }
     }
+
+    fn server_runtime(&self) -> Option<Arc<ServerRuntime>> {
+        self.server.read().ok().and_then(|server| server.clone())
+    }
+
+    /// Starts / reloads / stops the Node.js process of the middleware and route handlers.
+    fn update_server(&self, code: Option<&str>, restart: bool, log: bool) {
+        let mut slot = match self.server.write() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(code) = code else {
+            *slot = None;
+            return;
+        };
+        if restart || slot.is_none() {
+            *slot = None;
+            match ServerRuntime::start(&self.root, "development") {
+                Ok(runtime) => *slot = Some(Arc::new(runtime)),
+                Err(error) => {
+                    if log {
+                        eprintln!("{} {error}", paint("31;1", "[noru]"));
+                    }
+                    return;
+                }
+            }
+        }
+        if let Some(Err(error)) = slot.as_ref().map(|runtime| runtime.load(code)) {
+            if log {
+                eprintln!("{} cannot load the middleware / API routes:\n{error}", paint("31;1", "[noru]"));
+            }
+        }
+    }
 }
 
 /// Owns the project, the module cache and the stable module ids; lives on the rebuild thread.
@@ -89,6 +126,8 @@ struct Builder {
     options: BuildOptions,
     project: Option<Project>,
     cache: ModuleCache,
+    /// Cache of the server bundle (Next.js middleware and route handlers).
+    server_cache: ModuleCache,
     ids: StableIds,
 }
 
@@ -101,21 +140,29 @@ struct Built {
     module_count: usize,
     processed_count: usize,
     warnings: Vec<String>,
+    /// Server bundle for Node.js (Next.js middleware and route handlers).
+    server_code: Option<String>,
 }
 
 impl Builder {
     fn new(options: BuildOptions) -> Self {
-        Self { options, project: None, cache: ModuleCache::default(), ids: StableIds::default() }
+        Self {
+            options,
+            project: None,
+            cache: ModuleCache::default(),
+            server_cache: ModuleCache::default(),
+            ids: StableIds::default(),
+        }
     }
 
     fn build(&mut self, reload_project: bool) -> Result<Built, BuildError> {
-        if reload_project || self.project.is_none() {
+        let reload = reload_project || self.project.as_mut().is_none_or(Project::refresh_routes);
+        if reload {
             self.project = None;
             self.project = Some(Project::load(&self.options)?);
-        } else if let Some(project) = self.project.as_mut() {
-            project.refresh_routes();
         }
         let project = self.project.as_ref().expect("project loaded above");
+        let server_code = project.bundle_server(Some(&mut self.server_cache))?;
         let bundle = project.bundle_dev(&mut self.cache, &mut self.ids)?;
         let base = &project.base;
         let tags = format!(
@@ -130,6 +177,7 @@ impl Builder {
             module_count: bundle.module_count,
             processed_count: bundle.processed_count,
             warnings: bundle.warnings,
+            server_code,
         })
     }
 }
@@ -157,9 +205,11 @@ impl DevServer {
         let mut builder = Builder::new(options.build.clone());
         let mut output = Output { version: 1, ..Output::default() };
         let mut module_count = 0;
+        let mut server_code = None;
         match builder.build(false) {
             Ok(built) => {
                 print_warnings(log, &built.warnings);
+                server_code = built.server_code;
                 module_count = built.module_count;
                 output.html = built.html;
                 output.js = built.js;
@@ -180,10 +230,13 @@ impl DevServer {
         let shared = Arc::new(Shared {
             output: RwLock::new(output),
             clients: Mutex::new(Vec::new()),
+            root: root.clone(),
             public_dir: options.build.resolved_public_dir(&root),
             base: options.build.normalized_base(),
             shutdown: AtomicBool::new(false),
+            server: RwLock::new(None),
         });
+        shared.update_server(server_code.as_deref(), false, log);
 
         if log {
             let host =
@@ -299,6 +352,8 @@ impl DevServer {
         if let Ok(mut clients) = self.shared.clients.lock() {
             clients.clear();
         }
+        // Stops the Node.js process of the middleware / route handlers.
+        self.shared.update_server(None, false, false);
         // Unblock the accept loop.
         let _ = TcpStream::connect(self.addr);
         if let Some(handle) = self.accept_thread.lock().ok().and_then(|mut h| h.take()) {
@@ -384,6 +439,8 @@ fn publish(
 ) -> bool {
     match result {
         Ok(built) => {
+            // Middleware / route handlers: reloaded (restarted when the .env files changed).
+            shared.update_server(built.server_code.as_deref(), env_changed, log);
             let elapsed = started.elapsed().as_millis();
             let mut out = match shared.output.write() {
                 Ok(out) => out,
@@ -574,6 +631,12 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> std::io::Result<()> {
         "/@noru/client.js" => {
             return send(&mut stream, &req, dev_ok("text/javascript; charset=utf-8", CLIENT.as_bytes()));
         }
+        "/@noru/middleware" => {
+            return match shared.server_runtime() {
+                Some(runtime) => middleware_endpoint(&runtime, &mut stream, &req),
+                None => send(&mut stream, &req, dev_ok("application/json", br#"{"action":"next"}"#)),
+            };
+        }
         _ => {}
     }
 
@@ -612,9 +675,22 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> std::io::Result<()> {
             let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
             return send(&mut stream, &req, dev_ok(mime_type(&ext), &body));
         }
-        if !extension_of(&path).is_empty() {
-            return send(&mut stream, &req, Response::not_found());
-        }
+    }
+    // Next.js middleware and route handlers (API routes) decide first.
+    if let Some(runtime) = shared.server_runtime() {
+        return match dispatch(&runtime, &mut stream, &req)? {
+            Dispatch::Done => Ok(()),
+            Dispatch::Page { rewrite, headers } => {
+                let target = rewrite.as_deref().map_or(path.as_str(), |r| r.split('?').next().unwrap_or(r));
+                if target != "/" && !extension_of(target).is_empty() {
+                    return send(&mut stream, &req, Response::not_found());
+                }
+                send_page(&mut stream, &req, &html, rewrite.as_deref(), &headers)
+            }
+        };
+    }
+    if path != "/" && path != "/index.html" && !extension_of(&path).is_empty() {
+        return send(&mut stream, &req, Response::not_found());
     }
     // index.html, and SPA fallback for client-side routes.
     send(&mut stream, &req, dev_ok("text/html; charset=utf-8", html.as_bytes()))

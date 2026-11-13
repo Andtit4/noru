@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::SystemTime;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use rayon::prelude::*;
 
@@ -16,6 +16,7 @@ use crate::css::process_css;
 use crate::env::Defines;
 use crate::js::{process_js, EsmInfo, JsContext, Segment};
 use crate::module::{EmittedFile, ModuleKey};
+use crate::next::server::ServerTarget;
 use crate::next::NextApp;
 use crate::pkg::PackageCache;
 use crate::postcss::PostCss;
@@ -35,6 +36,8 @@ pub struct Context {
     pub next: Option<NextApp>,
     /// Project with a PostCSS config (Tailwind CSS...).
     pub postcss: Option<PostCss>,
+    /// Bundle for Node.js (Next.js middleware and route handlers): npm packages stay external.
+    pub server: Option<ServerTarget>,
 }
 
 /// Query marker for imports of files in the public directory (`import logo from '/vite.svg'`).
@@ -59,6 +62,9 @@ impl JsContext for Context {
         specifier: &str,
         kind: ResolveKind,
     ) -> Result<(ModuleKey, Option<String>), String> {
+        if let Some(server) = &self.server {
+            return self.resolve_server(server, importer, specifier, kind);
+        }
         let virtual_importer;
         let mut importer = importer;
         if let Some(next) = &self.next {
@@ -99,6 +105,37 @@ impl JsContext for Context {
 }
 
 impl Context {
+    /// Server bundle: project files are bundled, npm packages and Node.js built-ins are required
+    /// at runtime by Node.js, and `next/*` gets noru's server versions (see server-runtime.js).
+    fn resolve_server(
+        &self,
+        server: &ServerTarget,
+        importer: &Path,
+        specifier: &str,
+        kind: ResolveKind,
+    ) -> Result<(ModuleKey, Option<String>), String> {
+        if specifier == "next"
+            || specifier.starts_with("next/")
+            || specifier == "server-only"
+            || specifier == "client-only"
+        {
+            return Ok((server.external(specifier), None));
+        }
+        let bare = !specifier.starts_with('.') && !specifier.starts_with('/') && !Path::new(specifier).is_absolute();
+        match self.resolver.resolve(&server.importer(importer), specifier, kind) {
+            Ok(resolved) if resolved.key.is_empty_module() || resolved.key.is_in_node_modules() => {
+                Ok((server.external(specifier), None))
+            }
+            // Stylesheets do nothing on the server.
+            Ok(resolved) if matches!(resolved.key.extension().as_str(), "css" | "scss" | "sass" | "less") => {
+                Ok((ModuleKey::empty(), None))
+            }
+            Ok(resolved) => Ok((resolved.key, resolved.warning)),
+            Err(_) if bare => Ok((server.external(specifier), None)),
+            Err(error) => Err(error),
+        }
+    }
+
     fn public_url(&self, path: &Path) -> String {
         let rel = path.strip_prefix(&self.public_dir).unwrap_or(path);
         format!("{}{}", self.base, rel.to_string_lossy().replace('\\', "/"))
@@ -197,6 +234,33 @@ fn process_js_module(
     Ok(Processed { output: ModuleOutput::Js(module), deps: out.deps, emitted: vec![], warnings: out.warnings })
 }
 
+/// `NORU_PROFILE=1`: prints the modules that took the longest to process.
+type Timings = Mutex<Vec<(Duration, String)>>;
+static PROFILE: LazyLock<Option<Timings>> =
+    LazyLock::new(|| std::env::var_os("NORU_PROFILE").map(|_| Mutex::new(Vec::new())));
+
+fn profiled(key: &ModuleKey, ctx: &Context) -> Result<Processed, String> {
+    let Some(profile) = PROFILE.as_ref() else { return process_module(key, ctx) };
+    let started = Instant::now();
+    let result = process_module(key, ctx);
+    if let Ok(mut list) = profile.lock() {
+        list.push((started.elapsed(), key.path.to_string_lossy().to_string()));
+    }
+    result
+}
+
+fn print_profile() {
+    let Some(profile) = PROFILE.as_ref() else { return };
+    let Ok(mut list) = profile.lock() else { return };
+    let total: Duration = list.iter().map(|(d, _)| *d).sum();
+    list.sort_by_key(|(duration, _)| std::cmp::Reverse(*duration));
+    eprintln!("[noru profile] {} modules processed, {total:?} of processing time (all threads); slowest:", list.len());
+    for (duration, path) in list.iter().take(15) {
+        eprintln!("  {duration:>10.1?}  {path}");
+    }
+    list.clear();
+}
+
 /// Project stylesheets that go through PostCSS (Tailwind...).
 fn uses_postcss(key: &ModuleKey, ctx: &Context) -> bool {
     ctx.postcss.is_some() && key.extension() == "css" && !key.is_in_node_modules() && !key.is_empty_module()
@@ -210,6 +274,14 @@ fn virtual_source<'c>(key: &ModuleKey, ctx: &'c Context) -> Option<&'c str> {
 fn process_module(key: &ModuleKey, ctx: &Context) -> Result<Processed, String> {
     if key.is_empty_module() {
         return Ok(Processed::simple("function() {}".to_string()));
+    }
+    if let Some(server) = &ctx.server {
+        if key.path == server.entry {
+            return process_js_module(key, &server.entry_source, ctx, None);
+        }
+        if let Some(factory) = server.external_factory(key) {
+            return Ok(Processed::simple(factory));
+        }
     }
     if let Some(source) = virtual_source(key, ctx) {
         return process_js_module(key, source, ctx, None);
@@ -244,7 +316,7 @@ fn process_module(key: &ModuleKey, ctx: &Context) -> Result<Processed, String> {
         "css" => {
             let mut source = read_text(path)?;
             let mut postcss_warnings = Vec::new();
-            if let Some(postcss) = ctx.postcss.as_ref().filter(|_| !key.is_in_node_modules()) {
+            if let Some(postcss) = ctx.postcss.as_ref().filter(|p| !key.is_in_node_modules() && p.wants(&source)) {
                 (source, postcss_warnings) = postcss.process(path, &source)?;
             }
             let resolve = |specifier: &str| ctx.resolver.resolve(path, specifier, ResolveKind::Css).map(|r| r.key);
@@ -306,6 +378,9 @@ fn file_stamp(key: &ModuleKey, ctx: &Context) -> Option<FileStamp> {
     }
     if let Some(source) = virtual_source(key, ctx) {
         return Some(FileStamp { modified: None, len: xxhash_rust::xxh3::xxh3_64(source.as_bytes()) });
+    }
+    if let Some(server) = ctx.server.as_ref().filter(|s| key.path == s.entry) {
+        return Some(FileStamp { modified: None, len: xxhash_rust::xxh3::xxh3_64(server.entry_source.as_bytes()) });
     }
     let meta = std::fs::metadata(&key.path).ok()?;
     Some(FileStamp { modified: meta.modified().ok(), len: meta.len() })
@@ -383,7 +458,7 @@ pub fn build_graph(
                     (stamp, Some(processed)) => results.push((id, stamp, true, Ok(processed))),
                     (stamp, None) => {
                         let key = keys[id].clone();
-                        slow.push(scope.spawn(move || (id, stamp, false, process_module(&key, ctx).map(Arc::new))));
+                        slow.push(scope.spawn(move || (id, stamp, false, profiled(&key, ctx).map(Arc::new))));
                     }
                 }
             }
@@ -391,7 +466,7 @@ pub fn build_graph(
                 fast.par_iter()
                     .map(|&id| match cached(id) {
                         (stamp, Some(processed)) => (id, stamp, true, Ok(processed)),
-                        (stamp, None) => (id, stamp, false, process_module(&keys[id], ctx).map(Arc::new)),
+                        (stamp, None) => (id, stamp, false, profiled(&keys[id], ctx).map(Arc::new)),
                     })
                     .collect::<Vec<_>>(),
             );
@@ -447,6 +522,7 @@ pub fn build_graph(
         }
     });
 
+    print_profile();
     if !errors.is_empty() {
         return Err(errors);
     }

@@ -2,7 +2,10 @@
 //! `@import`s become graph dependencies (inlined in order), `url()`s are emitted as assets,
 //! and `*.module.css` files get scoped class names exported to JavaScript.
 
+use std::collections::HashMap;
 use std::path::Path;
+
+use regex::RegexBuilder;
 
 use lightningcss::css_modules::{Config as CssModulesConfig, CssModuleReference};
 use lightningcss::dependencies::{Dependency, DependencyOptions};
@@ -20,6 +23,27 @@ pub struct CssOutput {
     pub module_exports: Option<String>,
     pub emitted: Vec<EmittedFile>,
     pub warnings: Vec<String>,
+}
+
+/// Replaces Lightning CSS url() placeholders, printed either quoted (`url("ph")`) or bare
+/// (`url(ph)`), with their quoted URL, in a single pass over the stylesheet.
+fn replace_placeholders(code: &str, urls: &HashMap<String, String>) -> Result<String, String> {
+    if urls.is_empty() {
+        return Ok(code.to_string());
+    }
+    let mut names: Vec<&str> = urls.keys().map(String::as_str).collect();
+    // Longest first, so that a placeholder that is a prefix of another one cannot win.
+    names.sort_by_key(|name| std::cmp::Reverse(name.len()));
+    let alternatives = names.iter().map(|name| regex::escape(name)).collect::<Vec<_>>().join("|");
+    let pattern = RegexBuilder::new(&format!("\"({alternatives})\"|({alternatives})"))
+        .size_limit(1 << 28)
+        .build()
+        .map_err(|e| format!("internal error while rewriting CSS url(): {e}"))?;
+    let replaced = pattern.replace_all(code, |caps: &regex::Captures| {
+        let name = caps.get(1).or(caps.get(2)).map_or("", |m| m.as_str());
+        urls.get(name).cloned().unwrap_or_else(|| caps[0].to_string())
+    });
+    Ok(replaced.into_owned())
 }
 
 pub fn is_css_module(path: &Path) -> bool {
@@ -53,6 +77,9 @@ pub fn process_css(
     let mut external_imports = String::new();
     let mut emitted = Vec::new();
     let mut warnings = Vec::new();
+    // url() placeholder -> quoted URL, replaced in one pass at the end (a stylesheet can have
+    // thousands of url(), e.g. icon sets as data: URLs).
+    let mut urls: HashMap<String, String> = HashMap::new();
     let dir = path.parent().unwrap_or(Path::new("."));
 
     for dep in result.dependencies.unwrap_or_default() {
@@ -99,13 +126,11 @@ pub fn process_css(
                         }
                     }
                 };
-                // Lightning CSS prints the placeholder either quoted (`url("ph")`) or bare (`url(ph)`).
-                let quoted = serde_json::to_string(&replacement).unwrap_or_default();
-                code = code.replace(&format!("\"{}\"", url.placeholder), &quoted);
-                code = code.replace(&url.placeholder, &quoted);
+                urls.insert(url.placeholder.clone(), serde_json::to_string(&replacement).unwrap_or_default());
             }
         }
     }
+    code = replace_placeholders(&code, &urls)?;
 
     let module_exports = result.exports.map(|exports| {
         let mut entries: Vec<_> = exports.into_iter().collect();

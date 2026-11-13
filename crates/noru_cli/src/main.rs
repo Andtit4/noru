@@ -140,7 +140,12 @@ fn serve_build(root: PathBuf, out_dir: PathBuf, port: u16, host: String) -> Exit
         return ExitCode::FAILURE;
     }
     match PreviewServer::bind(&dir, &host, port) {
-        Ok(server) => {
+        Ok(mut server) => {
+            // Next.js middleware and API routes of the build run in a Node.js process.
+            if let Err(error) = server.start_server_code(&root) {
+                eprintln!("{} {error}", color("31;1", "x"));
+                return ExitCode::FAILURE;
+            }
             let port = server.local_addr().map(|a| a.port()).unwrap_or(port);
             let shown = if host == "0.0.0.0" || host == "127.0.0.1" { "localhost" } else { host.as_str() };
             println!(

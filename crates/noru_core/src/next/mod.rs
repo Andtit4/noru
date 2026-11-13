@@ -7,6 +7,8 @@
 //! `next/image`, `next/font/google`...). All generated modules are virtual: they only exist in
 //! memory, under `node_modules/.noru-next/`, nothing is written to the project.
 
+pub mod server;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -105,6 +107,7 @@ const NODE_POLYFILLS: &[(&str, &str)] = &[
     ("sys", "next/dist/compiled/util/"),
     ("timers", "next/dist/compiled/timers-browserify"),
     ("tty", "next/dist/compiled/tty-browserify"),
+    ("url", "next/dist/compiled/native-url"),
     ("util", "next/dist/compiled/util/"),
     ("vm", "next/dist/compiled/vm-browserify"),
     ("zlib", "next/dist/compiled/browserify-zlib"),
@@ -163,6 +166,10 @@ pub struct NextApp {
     notices: Vec<String>,
     /// Dev server: a missing import only breaks the page that uses it (like `next dev`).
     lenient: bool,
+    /// `middleware.ts` / `proxy.ts`, run on the server.
+    middleware: Option<PathBuf>,
+    /// Route handlers (`route.ts`): (URL pattern like `/api/items/[id]`, file).
+    routes: Vec<(String, PathBuf)>,
 }
 
 const MISSING_QUERY: &str = "?noru-missing=";
@@ -187,9 +194,56 @@ impl NextApp {
             page_count: 0,
             notices: Vec::new(),
             lenient,
+            middleware: None,
+            routes: Vec::new(),
         };
         app.refresh();
         app
+    }
+
+    /// The page served for every route (it tells the router when there is a middleware to ask).
+    pub fn html(&self) -> String {
+        if self.middleware.is_some() {
+            HTML.replace("  </head>", "    <script>window.__NORU_MIDDLEWARE__ = true</script>\n  </head>")
+        } else {
+            HTML.to_string()
+        }
+    }
+
+    pub fn has_middleware(&self) -> bool {
+        self.middleware.is_some()
+    }
+
+    pub fn route_handler_count(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// Source of the server bundle's entry (CommonJS): the middleware and the route handlers,
+    /// loaded on demand. `None` when the app has no server code.
+    pub fn server_entry_source(&self) -> Option<String> {
+        if self.middleware.is_none() && self.routes.is_empty() {
+            return None;
+        }
+        let middleware = self
+            .middleware
+            .as_ref()
+            .map_or("null".to_string(), |path| format!("function () {{ return {}; }}", require_js(&self.root, path)));
+        let routes: Vec<String> = self
+            .routes
+            .iter()
+            .map(|(pattern, path)| {
+                format!(
+                    "  {{ pattern: {}, load: function () {{ return {}; }} }}",
+                    serde_json::to_string(pattern).unwrap_or_default(),
+                    require_js(&self.root, path)
+                )
+            })
+            .collect();
+        Some(format!("exports.middleware = {middleware};\nexports.routes = [\n{}\n];\n", routes.join(",\n")))
+    }
+
+    pub fn virtual_dir(&self) -> &Path {
+        &self.virtual_dir
     }
 
     /// In the dev server, an import that cannot be resolved becomes a module that throws when it
@@ -222,7 +276,19 @@ impl NextApp {
         let code = generate_routes(&self.root, &tree, report.global_error.as_deref(), &icons);
         self.files.insert(self.virtual_dir.join("routes.js"), code);
         self.page_count = count_pages(&tree);
-        self.notices = report.notices(&self.root, &self.app_dir);
+        self.notices = report.notices(&self.root);
+        let app_dir = &self.app_dir;
+        self.routes = report.route_handlers.iter().map(|file| (route_pattern(app_dir, file), file.clone())).collect();
+        // Most specific first is not needed: the server runtime picks the best match.
+        self.routes.sort();
+        let project_dir = app_dir.parent().unwrap_or(&self.root);
+        self.middleware = [project_dir, self.root.as_path()]
+            .iter()
+            .flat_map(|dir| {
+                ["middleware.ts", "middleware.js", "proxy.ts", "proxy.js", "middleware.mjs", "proxy.mjs"]
+                    .map(|n| dir.join(n))
+            })
+            .find(|path| path.is_file());
     }
 
     pub fn entry(&self) -> PathBuf {
@@ -262,7 +328,8 @@ impl NextApp {
         if let Some((_, file)) = ALIASES.iter().find(|(alias, _)| *alias == name) {
             return Some((self.virtual_dir.join(file), None));
         }
-        if name.starts_with("next/") {
+        // `next/dist/...` are files of the next package (used by its browser polyfills): resolved normally.
+        if name.starts_with("next/") && !name.starts_with("next/dist/") {
             let warning = format!(
                 "\"{specifier}\" is not supported by noru yet (Next.js apps run in the browser): it was replaced by a module that throws when used"
             );
@@ -272,11 +339,23 @@ impl NextApp {
     }
 }
 
-fn escape_query(text: &str) -> String {
+pub(crate) fn escape_query(text: &str) -> String {
     text.replace('%', "%25").replace('&', "%26").replace('#', "%23").replace('?', "%3F")
 }
 
-fn unescape_query(text: &str) -> String {
+/// `app/api/(group)/items/[id]/route.ts` -> `/api/items/[id]`.
+fn route_pattern(app_dir: &Path, file: &Path) -> String {
+    let dir = file.parent().unwrap_or(app_dir);
+    let rel = dir.strip_prefix(app_dir).unwrap_or(dir);
+    let segments: Vec<String> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .filter(|s| !(s.starts_with('(') && s.ends_with(')')))
+        .collect();
+    format!("/{}", segments.join("/"))
+}
+
+pub(crate) fn unescape_query(text: &str) -> String {
     text.replace("%3F", "?").replace("%23", "#").replace("%26", "&").replace("%25", "%")
 }
 
@@ -309,25 +388,9 @@ struct ScanReport {
 }
 
 impl ScanReport {
-    fn notices(&self, root: &Path, app_dir: &Path) -> Vec<String> {
+    fn notices(&self, root: &Path) -> Vec<String> {
         let rel = |p: &Path| p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/");
         let mut notices = Vec::new();
-        if !self.route_handlers.is_empty() {
-            let names: Vec<String> = self.route_handlers.iter().take(3).map(|p| rel(p)).collect();
-            let more = self.route_handlers.len().saturating_sub(3);
-            notices.push(format!(
-                "{} API route(s) ignored ({}{}): route handlers need a server, which noru does not run yet",
-                self.route_handlers.len(),
-                names.join(", "),
-                if more > 0 { format!(", +{more} more") } else { String::new() }
-            ));
-        }
-        let project_dir = app_dir.parent().unwrap_or(root);
-        for name in ["middleware.ts", "middleware.js", "proxy.ts", "proxy.js"] {
-            if project_dir.join(name).is_file() || root.join(name).is_file() {
-                notices.push(format!("{name} ignored: middleware needs a server, which noru does not run yet"));
-            }
-        }
         for dir in &self.skipped_dirs {
             notices.push(format!("{} ignored: parallel and intercepting routes are not supported yet", rel(dir)));
         }
@@ -498,7 +561,16 @@ mod tests {
         assert!(routes.contains("exports.globalError = function () { return require(\"./app/global-error.tsx\"); }"));
         assert!(routes.contains("{ rel: \"icon\", href: require(\"./app/favicon.ico\") }"), "{routes}");
         assert_eq!(next.page_count(), 3);
-        assert!(next.notices().iter().any(|n| n.contains("API route")), "{:?}", next.notices());
+        assert_eq!(next.route_handler_count(), 1);
+        let server = next.server_entry_source().unwrap();
+        assert!(
+            server.contains(
+                "{ pattern: \"/api/hello\", load: function () { return require(\"./app/api/hello/route.ts\"); } }"
+            ),
+            "{server}"
+        );
+        assert!(server.contains("exports.middleware = null;"), "{server}");
+        assert!(!next.html().contains("__NORU_MIDDLEWARE__"));
         assert!(next.notices().iter().any(|n| n.contains("@modal")), "{:?}", next.notices());
 
         assert_eq!(next.resolve("next/link").unwrap().0, next.virtual_dir.join("link.js"));

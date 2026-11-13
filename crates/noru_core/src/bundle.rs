@@ -110,6 +110,23 @@ pub fn generate_js(
     }
 }
 
+/// Generates the server bundle (Next.js middleware and route handlers) for Node.js: a CommonJS
+/// script whose `module.exports` is the generated server entry. Run by server-runtime.js, which
+/// provides `__noru_node_require` (the project's `require`, for npm packages).
+pub fn generate_server_js(graph: &Graph, root: &Path) -> String {
+    let shake = crate::treeshake::shake(graph, &[0], false);
+    let modules = render_modules(graph, root, &shake, &|id| Some(id), false);
+    let mut out = String::with_capacity(64 * 1024);
+    out.push_str("var __noru_modules = [\n");
+    for module in &modules {
+        out.push_str(&format!("// {}\n{},\n", module.name, module.factory));
+    }
+    out.push_str("];\n");
+    out.push_str(RUNTIME);
+    out.push_str("module.exports = __noru_require(0);\n");
+    out
+}
+
 /// Generates the development bundle: like the production one, plus the hot module replacement
 /// runtime and React Fast Refresh. Module ids are stable across rebuilds (holes are allowed).
 pub fn generate_dev_js(modules: &[RenderedModule], entries: &[usize]) -> String {

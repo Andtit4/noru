@@ -28,6 +28,9 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
           <Link href="/dashboard" id="link-dashboard">
             Dashboard
           </Link>
+          <Link href="/mw-redirect" id="link-mw-redirect">
+            Redirected by the middleware
+          </Link>
         </nav>
         <main id="main">{children}</main>
       </body>
