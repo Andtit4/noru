@@ -91,6 +91,8 @@ export function createHost(iframe, options = {}) {
       case 'firstFrameReady':
         if (!firstFrame) {
           firstFrame = true
+          // Keyboard games: the keys go to the game without clicking it first.
+          if (callbacks.autoFocus) iframe.focus({ preventScroll: true })
           call('onFirstFrame')
         }
         break

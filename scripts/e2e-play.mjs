@@ -78,6 +78,7 @@ export default function FarmPage() {
       <Playable
         src="/games/cloud-acres/"
         title="Cloud Acres"
+        autoFocus
         player={{ name: 'Ama', avatar: '/logo.svg' }}
         aspectRatio="16 / 9"
         style={{ maxWidth: 800 }}
@@ -156,6 +157,7 @@ async function main() {
     console.log('\n— Cloud Acres example')
     await page.navigate(`${base}/farm`)
     check('Cloud Acres loads in <Playable> and calls gameReady', await page.waitFor(`window.__farmReady === true`))
+    check('autoFocus: the game has the keyboard focus', await page.waitFor(`document.activeElement === document.querySelector('iframe[title="Cloud Acres"]')`))
     await sleep(500)
     const pixel = await page.evaluate(`(() => {
       const canvas = document.querySelector('iframe[title="Cloud Acres"]').contentDocument.querySelector('canvas')

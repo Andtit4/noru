@@ -26,6 +26,8 @@ export interface HostOptions extends HostCallbacks {
   audioEnabled?: boolean
   /** The logged-in user, shown by the game: name and picture URL (same website, or a data: URL). */
   player?: { name: string; avatar?: string | null } | null
+  /** Give the keyboard focus to the game once its first frame is shown (keyboard games). */
+  autoFocus?: boolean
   /** Start paused. */
   paused?: boolean
   /** Pause when the tab is hidden or the game is scrolled out of view (default: true). */

@@ -10,6 +10,8 @@ export interface PlayableProps extends HostCallbacks {
   language?: string
   /** The logged-in user ({ name, avatar }), shown in the game. */
   player?: { name: string; avatar?: string | null } | null
+  /** Give the keyboard focus to the game once it is shown, for keyboard games (default: false). */
+  autoFocus?: boolean
   /** Pause when the tab is hidden or the game is scrolled out of view (default: true). */
   autoPause?: boolean
   /** Shown until the game's first frame (default: a spinner). */

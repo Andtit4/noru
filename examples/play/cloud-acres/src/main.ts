@@ -100,6 +100,67 @@ function goTo(x: number, y: number) {
   farmer.ty = y
   farmer.idle = 0
 }
+
+// Keyboard: the farmer walks with the arrow keys (or WASD / ZQSD), the camera follows them.
+const held = new Set<string>()
+const KEYS: Record<string, [number, number]> = {
+  ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1],
+  a: [-1, 0], q: [-1, 0], d: [1, 0], w: [0, -1], z: [0, -1], s: [0, 1],
+}
+let keyboard = !!(window.matchMedia && window.matchMedia('(pointer: fine)').matches)
+let followCamera = false
+let walkPlot = '' // plot under the farmer's feet (plants / harvests once per plot entered)
+
+/** Things the farmer cannot walk through. */
+function solidAt(x: number, y: number) {
+  if (x < 12 || y < 30 || x > WORLD_PX_W - 12 || y > WORLD_PX_H - 6) return true
+  for (const p of PLACES) {
+    if (p.kind === 'field') continue
+    if (p.zone && !farm.owns(p.zone)) continue
+    if (!farm.owns(p.id)) continue
+    const top = p.kind === 'pen' ? p.y * TILE + 14 : p.y * TILE + p.h * TILE * 0.35
+    if (x > p.x * TILE + 6 && x < (p.x + p.w) * TILE - 6 && y > top && y < (p.y + p.h) * TILE - 2) return true
+  }
+  for (const z of ZONES) if (!farm.owns(z.id) && x > z.x * TILE && y > z.y * TILE && y < (z.y + z.h) * TILE) return true
+  if (x > POND.x * TILE && x < (POND.x + POND.w) * TILE && y > POND.y * TILE + 8 && y < (POND.y + POND.h) * TILE - 4) return true
+  if (farm.s.silo > 0 && x > 0.35 * TILE && x < 1.6 * TILE && y > 1.6 * TILE && y < 3.7 * TILE) return true
+  return false
+}
+
+/** The building / pen / sign the farmer stands next to (for Space). */
+function nearPlace() {
+  let best: Place | null = null
+  let bestD = 70
+  for (const p of PLACES) {
+    if (p.kind === 'field' || (p.zone && !farm.owns(p.zone))) continue
+    const cx = Math.min(Math.max(farmer.x, p.x * TILE), (p.x + p.w) * TILE)
+    const cy = Math.min(Math.max(farmer.y, p.y * TILE), (p.y + p.h) * TILE)
+    const d = Math.hypot(cx - farmer.x, cy - farmer.y)
+    if (d < bestD) {
+      bestD = d
+      best = p
+    }
+  }
+  return best
+}
+
+function nearZone() {
+  return ZONES.find((z) => !farm.owns(z.id) && farmer.x > z.x * TILE - 60 && farmer.y > z.y * TILE && farmer.y < (z.y + z.h) * TILE)
+}
+
+function useNearby() {
+  const place = nearPlace()
+  if (place) {
+    const keep = { tx: farmer.tx, ty: farmer.ty }
+    tapPlace(place)
+    // Space does not make the farmer walk away.
+    farmer.tx = keep.tx
+    farmer.ty = keep.ty
+    return
+  }
+  const zone = nearZone()
+  if (zone) panel = { zone }
+}
 let barnBump = 0
 
 // --- effects ---------------------------------------------------------------------------------
@@ -515,6 +576,47 @@ function updateTractor(dt: number) {
 }
 
 function updateFarmer(dt: number) {
+  let kx = 0
+  let ky = 0
+  if (!panel && !paused && started) {
+    for (const key of held) {
+      const dir = KEYS[key]
+      if (dir) {
+        kx += dir[0]
+        ky += dir[1]
+      }
+    }
+  }
+  if (kx || ky) {
+    const len = Math.hypot(kx, ky)
+    const step = 190 * dt
+    const nx = farmer.x + (kx / len) * step
+    const ny = farmer.y + (ky / len) * step
+    // Slide along walls: try both axes, then each one.
+    if (!solidAt(nx, ny)) {
+      farmer.x = nx
+      farmer.y = ny
+    } else if (!solidAt(nx, farmer.y)) farmer.x = nx
+    else if (!solidAt(farmer.x, ny)) farmer.y = ny
+    if (kx) farmer.facing = kx > 0 ? 1 : -1
+    farmer.tx = farmer.x
+    farmer.ty = farmer.y
+    farmer.idle = 0
+    followCamera = true
+    // Walking over a field plants and harvests, one plot at a time (with a combo).
+    const hit = plotAt(farmer.x, farmer.y - 6)
+    const key = hit ? hit.place.id + ':' + hit.index : ''
+    if (key !== walkPlot) {
+      if (!hit && walkPlot) endSwipe(farmer.x, farmer.y)
+      walkPlot = key
+      if (hit) {
+        actOnPlot(hit)
+        // Same plot: planting right after harvesting it, like the tractor.
+        if (!farm.plots(hit.place)[hit.index].crop && tool === 'seed') actOnPlot(hit)
+      }
+    }
+    return
+  }
   const dx = farmer.tx - farmer.x
   const dy = farmer.ty - farmer.y
   const d = Math.hypot(dx, dy)
@@ -525,8 +627,8 @@ function updateFarmer(dt: number) {
     if (Math.abs(dx) > 1) farmer.facing = dx > 0 ? 1 : -1
   } else {
     farmer.idle += dt
-    // A little walk around the barn now and then.
-    if (farmer.idle > 7) goTo(HOME.x + rand(-1.5, 2.5) * TILE, HOME.y + rand(-0.2, 0.3) * TILE)
+    // A little walk around the barn now and then (not when the player drives the farmer).
+    if (farmer.idle > 7 && !keyboard) goTo(HOME.x + rand(-1.5, 2.5) * TILE, HOME.y + rand(-0.2, 0.3) * TILE)
   }
 }
 
@@ -597,6 +699,12 @@ function update(dt: number) {
   if (started && !paused) farm.advance(dt * speedUp)
   updateWalkers(dt)
   updateFarmer(dt)
+  if (followCamera) {
+    const k = Math.min(1, dt * 4)
+    cam.x += (farmer.x - cam.x) * k
+    cam.y += (farmer.y - 40 - cam.y) * k
+    clampCamera()
+  }
   updateTractor(dt)
   handleFarmEvents()
   coinBump = Math.max(0, coinBump - dt * 4)
@@ -886,6 +994,25 @@ function drawWorld() {
   if (farm.s.silo > 0) tall.push({ y: 3.7 * TILE, draw: () => drawSilo(ctx, 0.35 * TILE, 0.7 * TILE, 1.25 * TILE, 3 * TILE, farm.s.silo) })
   const farmerWalking = Math.hypot(farmer.tx - farmer.x, farmer.ty - farmer.y) > 2
   tall.push({ y: farmer.y, draw: () => drawFarmer(ctx, look(), farmer.x, farmer.y, 46, clock, farmer.facing, farmerWalking) })
+  if (keyboard && started && !panel) {
+    const near = nearPlace() || null
+    const zone = near ? null : nearZone()
+    if (near || zone) {
+      const hx = farmer.x
+      const hy = farmer.y - 74 - Math.abs(Math.sin(clock * 4)) * 4
+      tall.push({
+        y: 1e9,
+        draw: () => {
+          ctx.font = '900 13px ' + FONT
+          const w = ctx.measureText(t.use).width + 18
+          ctx.fillStyle = 'rgba(40, 30, 60, 0.75)'
+          roundRect(ctx, hx - w / 2, hy - 12, w, 24, 12)
+          ctx.fill()
+          text(t.use, hx, hy, 13, '#fff', 'center', 900, null)
+        },
+      })
+    }
+  }
   if (farm.s.machines.tractor) {
     const moving = !!tractor.job || Math.hypot(tractor.x - TRACTOR_HOME.x, tractor.y - TRACTOR_HOME.y) > 3
     tall.push({ y: tractor.y, draw: () => drawTractor(ctx, tractor.x, tractor.y, 54, tractor.facing, clock, moving) })
@@ -1496,9 +1623,10 @@ function drawTitle() {
   text('ACRES', width / 2, height * 0.3 + 70 * s, 72 * s, '#ffe08a', 'center', 900, 'rgba(150, 80, 20, 0.95)')
   text(t.tagline, width / 2, height * 0.3 + 124 * s, 22 * s, '#fff', 'center', 800)
   ctx.globalAlpha = 0.6 + 0.4 * Math.sin(clock * 4)
-  text(t.tapToStart, width / 2, height * 0.78, 30 * s, '#fff', 'center', 900)
+  text(keyboard ? t.pressToStart : t.tapToStart, width / 2, height * 0.78, 30 * s, '#fff', 'center', 900)
   ctx.globalAlpha = 1
-  text(t.howTo, width / 2, height * 0.78 + 40 * s, Math.min(15 * s, (width / t.howTo.length) * 1.7), '#fff', 'center', 700)
+  const help = keyboard ? t.howToKeys : t.howTo
+  text(help, width / 2, height * 0.78 + 40 * s, Math.min(15 * s, (width / help.length) * 1.7), '#fff', 'center', 700)
 }
 
 function draw() {
@@ -1546,9 +1674,16 @@ function swipeFarm(x0: number, y0: number, x1: number, y1: number) {
   for (let i = 1; i <= steps; i++) touchPlot(plotAt(a.x + ((b.x - a.x) * i) / steps, a.y + ((b.y - a.y) * i) / steps))
 }
 
+function startGame() {
+  started = true
+  const ready = farm.readyThings()
+  if (farm.away > 60) toast = { title: t.welcomeBack, text: `${t.whileAway}${ready ? ` · ${ready} ${t.ready.toLowerCase()}` : ''}`, life: 4 }
+}
+
 canvas.addEventListener('pointerdown', (event) => {
   event.preventDefault()
   sound.unlock()
+  canvas.focus()
   canvas.setPointerCapture(event.pointerId)
   const p = position(event)
   pointers.set(event.pointerId, p)
@@ -1561,9 +1696,7 @@ canvas.addEventListener('pointerdown', (event) => {
     return
   }
   if (!started) {
-    started = true
-    const ready = farm.readyThings()
-    if (farm.away > 60) toast = { title: t.welcomeBack, text: `${t.whileAway}${ready ? ` · ${ready} ${t.ready.toLowerCase()}` : ''}`, life: 4 }
+    startGame()
     return
   }
   if (paused) return
@@ -1612,6 +1745,7 @@ canvas.addEventListener('pointermove', (event) => {
   if (!gesture) return
   if (gesture.mode === 'pending' && Math.hypot(p.x - gesture.startX, p.y - gesture.startY) > 8 * ui) gesture.mode = 'pan'
   if (gesture.mode === 'pan') {
+    followCamera = false
     cam.x -= (p.x - gesture.lastX) / cam.zoom
     cam.y -= (p.y - gesture.lastY) / cam.zoom
     clampCamera()
@@ -1656,14 +1790,40 @@ canvas.addEventListener(
   { passive: false },
 )
 window.addEventListener('keydown', (event) => {
-  const n = Number(event.key)
+  const key = event.key.length === 1 ? event.key.toLowerCase() : event.key
+  if (KEYS[key] || key === ' ') event.preventDefault() // no page scrolling
+  keyboard = true
+  sound.unlock()
+  if (!started) {
+    if (key === ' ' || key === 'Enter') startGame()
+    return
+  }
+  if (paused) return
+  if (KEYS[key]) held.add(key)
+  const n = Number(key)
   const crops = farm.crops()
-  if (n >= 1 && n <= crops.length) selected = crops[n - 1].id
-  if (event.key === 'Escape') {
+  if (n >= 1 && n <= crops.length) {
+    selected = crops[n - 1].id
+    tool = 'seed'
+  }
+  if (key === 'Escape') {
     panel = null
     placing = null
   }
+  if (event.repeat) return
+  if ((key === ' ' || key === 'Enter' || key === 'e') && !panel) {
+    if (placing) placeDecorAt(farmer.x, farmer.y + 30)
+    else useNearby()
+  }
+  if (key === 't' && farm.s.machines.tractor && !panel) {
+    const hit = plotAt(farmer.x, farmer.y - 6)
+    if (hit) sendTractor(hit.place)
+  }
 })
+window.addEventListener('keyup', (event) => {
+  held.delete(event.key.length === 1 ? event.key.toLowerCase() : event.key)
+})
+window.addEventListener('blur', () => held.clear())
 
 // --- loop and noru play ----------------------------------------------------------------------
 

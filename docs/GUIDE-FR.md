@@ -297,8 +297,11 @@ Le premier jeu, **Cloud Acres** (`examples/play/cloud-acres/`), est une ferme vu
   plus rapide), silos (grange plus grande, elle a maintenant une limite) et décorations à placer où
   l'on veut (fleurs, botte de foin, banc, lampadaire, épouvantail, fontaine).
 
-Tout est dessiné par le code (aucune image). On se déplace en glissant hors des
-champs, on zoome avec deux doigts ou la molette. Pour essayer vite : `?speed=10` accélère le temps.
+Tout est dessiné par le code (aucune image). **Au clavier** : les flèches (ou ZQSD / WASD)
+font marcher le fermier, qui plante et récolte en passant sur les champs ; Espace utilise ce qui
+est à côté (animaux, atelier, grange, commandes, panneau) ; 1 à 5 choisit la graine ; T envoie le
+tracteur sur le champ où l'on est. **Au doigt ou à la souris** : on glisse sur les champs, on se
+déplace en glissant ailleurs, on zoome avec deux doigts ou la molette. Pour essayer vite : `?speed=10` accélère le temps.
 Le jeu s'inspire des mécaniques classiques des jeux de ferme, avec son propre nom, ses personnages
 et ses graphismes.
 
