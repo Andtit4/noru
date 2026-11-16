@@ -180,6 +180,33 @@ Everything is on by default; each feature has a flag to turn it off.
 For static hosting, serve `dist/`: pages that have their own `index.html` are served as-is, and
 other URLs should fall back to `shell.html` (the empty app shell, also used offline).
 
+## noru play: games in your website
+
+[`noru-play`](packages/noru-play) embeds web games in a website (Next.js, React or plain HTML): a
+tiny SDK for the game (≈2 kB compressed) and a `<Playable>` component for the page, which handles
+the loading screen, pauses the game when it cannot be seen, turns the sound on and off, and passes
+saves and scores between the game and the site.
+
+```tsx
+// In the game
+import { play } from 'noru-play'
+play.gameReady()
+play.onPause(() => game.pause())
+await play.save({ best: 1200 })
+await play.sendScore(1200)
+
+// In a Next.js page
+import { Playable } from 'noru-play/react'
+<Playable src="/games/cloud-acres/" player={{ name: user.name, avatar: user.image }} onScore={(score) => saveScore(score)} />
+```
+
+Build a game with `noru build my-game --base /games/my-game/ --no-offline` and copy its `dist/` to
+`public/games/my-game/` in the site (a `noru play build` command that does both is planned).
+[`examples/play/cloud-acres`](examples/play/cloud-acres) is a complete farm game made this way
+(no image files): fields planted and harvested with a swipe, animals, workshops, villagers' orders,
+levels, a farmer to customize, the website user's picture, a shop (land, tractor, delivery truck,
+sprinklers, silos, decorations), and a farm that keeps working while the game is closed.
+
 ## Commands
 
 ```
@@ -280,6 +307,7 @@ cargo test --workspace                       # unit tests
 node scripts/e2e.mjs                         # build the fixtures and check them in a real browser
 node scripts/e2e-dev.mjs                     # dev server: hot updates keep React state, CSS, overlay
 node scripts/e2e-next.mjs                    # Next.js app: routing, server components, Tailwind, hot updates
+node scripts/e2e-play.mjs                    # noru play: a game in <Playable> in a Next.js page
 node scripts/gen-large.mjs && node scripts/bench-all.mjs   # benchmark vs other tools (install them in bench/large-app)
 node scripts/gen-next.mjs && node scripts/bench-next.mjs   # benchmark vs Next.js on a Next.js app
 cd packages/noru && npm run build && npm test  # native Node addon + npm package smoke test

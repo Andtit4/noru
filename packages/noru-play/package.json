@@ -1,0 +1,30 @@
+{
+  "name": "noru-play",
+  "version": "0.1.0",
+  "description": "Embed web games in your website (Next.js, React or plain HTML): a tiny SDK for games and a host for pages. Pause, sound, saves, scores.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Andtit4/noru.git",
+    "directory": "packages/noru-play"
+  },
+  "keywords": ["games", "html5", "iframe", "sdk", "nextjs", "react", "playable", "noru"],
+  "sideEffects": ["./index.js"],
+  "exports": {
+    ".": { "types": "./index.d.ts", "default": "./index.js" },
+    "./host": { "types": "./host.d.ts", "default": "./host.js" },
+    "./react": { "types": "./react.d.ts", "default": "./react.js" },
+    "./package.json": "./package.json"
+  },
+  "files": ["index.js", "index.d.ts", "host.js", "host.d.ts", "react.js", "react.d.ts", "protocol.js", "README.md"],
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": { "optional": true }
+  },
+  "scripts": {
+    "test": "node test/protocol.test.js"
+  }
+}

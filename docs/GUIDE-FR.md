@@ -248,7 +248,64 @@ l'appli, aussi utilisée hors ligne).
 
 Pour voir où passe le temps du build : `NORU_PROFILE=1 noru build`.
 
-## 8. Limites actuelles et prochaines étapes
+## 8. noru play : des jeux dans tes sites
+
+Le paquet `noru-play` (`packages/noru-play/`) permet de mettre des jeux web dans un site Next.js.
+Il a deux côtés :
+
+- **dans le jeu**, le SDK `play` (environ 2 Ko compressé) : `play.firstFrameReady()` et
+  `play.gameReady()` (fin du chargement), `play.onPause` / `play.onResume`,
+  `play.onAudioChange`, `play.save()` / `play.load()` (la progression), `play.sendScore()`,
+  `play.language`, `play.player` (le nom et la photo de l'utilisateur connecté au site) ;
+- **dans la page**, le composant `<Playable src="/games/cloud-acres/" />` : il affiche un écran de
+  chargement jusqu'à la première image, met le jeu en pause quand l'onglet est caché ou que le jeu
+  sort de l'écran, coupe le son si on le demande, et reçoit les scores et les sauvegardes. Par
+  défaut les sauvegardes vont dans le navigateur (`localStorage`) ; pour les garder sur ton
+  serveur, passe `storage={{ load, save }}` qui appellent ton API. Pour montrer l'utilisateur
+  connecté dans le jeu : `player={{ name: user.name, avatar: user.image }}` (la photo doit venir du
+  même site ou être une image `data:`).
+
+Ouvert tout seul (pendant que tu le développes avec `noru dev`), un jeu marche aussi : les
+sauvegardes vont dans le navigateur et les scores dans la console.
+
+Faire un jeu et le mettre dans un site :
+
+```bash
+noru dev examples/play/cloud-acres                                       # développer le jeu
+noru build examples/play/cloud-acres --base /games/cloud-acres/ --no-offline
+# puis copier examples/play/cloud-acres/dist/ vers <ton-site>/public/games/cloud-acres/
+```
+
+Le premier jeu, **Cloud Acres** (`examples/play/cloud-acres/`), est une ferme vue de dessus :
+
+- **les champs** : on glisse le doigt dessus pour planter la graine choisie et récolter ce qui est
+  mûr (blé, carotte, maïs, tomate, citrouille), avec un combo quand on récolte beaucoup d'un coup ;
+- **les animaux** : poules, vaches, cochons, moutons, à nourrir avec les récoltes (œufs, lait,
+  truffes, laine) ;
+- **les ateliers** : moulin, fromagerie, atelier de laine, boulangerie, avec une file de 3
+  productions (farine, fromage, pull, gâteau) ;
+- **les commandes** des villageois (le tableau), qui rapportent pièces et expérience ;
+- **les niveaux** débloquent cultures, champs, enclos et ateliers à acheter ;
+- **la ferme continue de travailler pendant l'absence** (jusqu'à 12 heures) ; au retour, un message
+  dit ce qui est prêt ;
+- **le fermier** marche sur la carte jusqu'à ce que le joueur touche ; on le personnalise (peau,
+  chapeau, chemise, salopette) en touchant le portrait en haut à gauche, qui montre la photo de
+  l'utilisateur du site quand le site la donne ;
+- **la boutique** : terrains à défricher (nord, sud) avec de nouveaux champs, **tracteur** (on
+  choisit l'outil tracteur puis un champ : il le récolte et le replante tout seul), **camion de
+  livraison** (il livre les commandes prêtes tout seul, même pendant l'absence), arrosage (pousse
+  plus rapide), silos (grange plus grande, elle a maintenant une limite) et décorations à placer où
+  l'on veut (fleurs, botte de foin, banc, lampadaire, épouvantail, fontaine).
+
+Tout est dessiné par le code (aucune image). On se déplace en glissant hors des
+champs, on zoome avec deux doigts ou la molette. Pour essayer vite : `?speed=10` accélère le temps.
+Le jeu s'inspire des mécaniques classiques des jeux de ferme, avec son propre nom, ses personnages
+et ses graphismes.
+
+Test automatique : `node scripts/e2e-play.mjs target/debug/noru.exe` (le SDK, `<Playable>` dans une
+page Next et Cloud Acres, dans un vrai navigateur).
+
+## 9. Limites actuelles et prochaines étapes
 
 Pas encore supporté : Vue/Svelte, Sass/Less, scope hoisting, source maps, plugins, fichier de
 config.
