@@ -39,10 +39,22 @@ async function waitForLog(state, needle) {
   return state.logs.includes(needle)
 }
 
+/** The app has taken over the page (React rendered it, not only the pre-rendered HTML). */
+const appReady = `(() => { const el = document.getElementById('__next')?.firstElementChild; return !!el && Object.keys(el).some((k) => k.startsWith('__reactFiber')) })()`
+
+/**
+ * Opens a page and waits for the app: production pages are pre-rendered, so their content shows
+ * before the JavaScript runs, and a click at that moment would hit plain HTML (slow CI machines).
+ */
+async function open(page, url) {
+  await page.navigate(url)
+  await page.waitFor(appReady, 20000)
+}
+
 /** The app itself: routing, layouts, server components, boundaries, next/* modules. */
 async function testApp(page, base, label) {
   console.log(`\n— ${label}`)
-  await page.navigate(`${base}/`)
+  await open(page, `${base}/`)
   check('home page renders inside the root layout', await page.waitFor(`${title} === 'Home page' && !!document.getElementById('nav')`))
   check('<html lang> and attributes come from the root layout', await page.evaluate(`document.documentElement.lang === 'fr' && document.documentElement.dataset.rootLayout === 'yes'`))
   check('metadata: default title', await page.waitFor(`document.title === 'Fixture'`), await page.evaluate('document.title'))
@@ -91,26 +103,26 @@ async function testApp(page, base, label) {
   check('  … and on a child page', await page.waitFor(`${title} === 'Settings' && ${text('segment')} === 'settings'`))
   check('  … still no page reload', await page.evaluate(`window.__noruMarker === 'kept'`))
 
-  await page.navigate(`${base}/docs/getting/started/install`)
+  await open(page, `${base}/docs/getting/started/install`)
   check('catch-all route + useParams()', await page.waitFor(`${title} === 'Docs: getting/started/install'`))
 
-  await page.navigate(`${base}/broken`)
+  await open(page, `${base}/broken`)
   check('error.tsx catches render errors', await page.waitFor(`${text('error')} === 'Something went wrong: boom'`))
   await page.evaluate(click('retry'))
   check('  … and reset() renders the page again', await page.waitFor(`${title} === 'Recovered'`))
 
-  await page.navigate(`${base}/old`)
+  await open(page, `${base}/old`)
   check('redirect()', await page.waitFor(`location.pathname === '/about' && ${title} === 'About page'`))
 
-  await page.navigate(`${base}/does/not/exist`)
+  await open(page, `${base}/does/not/exist`)
   check('unknown URL: not-found.tsx inside the root layout', await page.waitFor(`${title} === 'Page introuvable' && !!document.getElementById('nav')`))
-  await page.navigate(`${base}/blog/missing`)
+  await open(page, `${base}/blog/missing`)
   check('notFound() from a server component', await page.waitFor(`${title} === 'Page introuvable'`))
 
-  await page.navigate(`${base}/lazy`)
+  await open(page, `${base}/lazy`)
   check('next/dynamic', await page.waitFor(`${text('heavy')} === 'dynamic works'`))
 
-  await page.navigate(`${base}/`)
+  await open(page, `${base}/`)
   await page.waitFor(`${title} === 'Home page'`)
   await page.evaluate(click('link-suspend'))
   check(
@@ -139,9 +151,9 @@ async function testApp(page, base, label) {
     'NextResponse.next() with headers and cookies',
     homeResponse.headers.get('x-noru-middleware') === 'ran' && homeResponse.headers.getSetCookie().some((c) => c.startsWith('mw-visited=yes')),
   )
-  await page.navigate(`${base}/mw-rewrite`)
+  await open(page, `${base}/mw-rewrite`)
   check('middleware rewrite: another page under the same URL', await page.waitFor(`${title} === 'Dashboard' && location.pathname === '/mw-rewrite'`))
-  await page.navigate(`${base}/`)
+  await open(page, `${base}/`)
   await page.waitFor(`${title} === 'Home page'`)
   await page.evaluate(click('link-mw-redirect'))
   check('client-side navigation goes through the middleware', await page.waitFor(`location.pathname === '/about' && ${title} === 'About page'`))
@@ -223,7 +235,7 @@ async function testDev(browserPath) {
     await testApp(page, base, 'dev server (noru dev)')
 
     console.log('\n— hot reload')
-    await page.navigate(`${base}/`)
+    await open(page, `${base}/`)
     await page.waitFor(`${title} === 'Home page'`)
     await page.evaluate(`${click('counter')}; ${click('counter')}; ${click('counter')}`)
     await page.waitFor(`${text('counter')} === 'count is 3'`)
@@ -276,7 +288,7 @@ async function testReact18(browserPath) {
     await waitForLog(dev, 'Local')
     page = await launchBrowser(browserPath)
     const base = `http://127.0.0.1:${port}`
-    await page.navigate(`${base}/`)
+    await open(page, `${base}/`)
     check('React 18: home page renders', await page.waitFor(`${title} === 'Home page'`))
     await page.evaluate(click('link-suspend'))
     check(
