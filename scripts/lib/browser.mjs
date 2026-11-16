@@ -96,6 +96,8 @@ export async function launchBrowser(path = findBrowser()) {
     })
   await send('Page.enable')
   await send('Runtime.enable')
+  // NORU_E2E_SLOW=6: a CPU 6 times slower, like a busy CI machine (to reproduce timing bugs).
+  if (process.env.NORU_E2E_SLOW) await send('Emulation.setCPUThrottlingRate', { rate: Number(process.env.NORU_E2E_SLOW) || 4 })
   const evaluate = async (expression) => {
     const res = await send('Runtime.evaluate', { expression, returnByValue: true })
     return res.result?.result?.value
