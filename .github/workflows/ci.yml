@@ -52,6 +52,11 @@ jobs:
       - name: Next.js app tests (routing, server components, Tailwind, hot updates)
         run: node scripts/e2e-next.mjs target/debug/noru${{ runner.os == 'Windows' && '.exe' || '' }}
 
+      - name: noru play tests (SDK, <Playable> in a Next.js page, Cloud Acres)
+        run: |
+          node packages/noru-play/test/protocol.test.js
+          node scripts/e2e-play.mjs target/debug/noru${{ runner.os == 'Windows' && '.exe' || '' }}
+
       - name: npm package smoke test
         working-directory: packages/noru
         run: |
