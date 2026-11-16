@@ -1,8 +1,8 @@
 // noru: browser version of `next/font/google`.
 //
 // `import { Inter, Geist_Mono } from "next/font/google"` gives a loader for any font name: it
-// adds the Google Fonts stylesheet to the page and returns { className, style, variable } like
-// Next.js does (Next.js downloads the fonts at build time; noru lets the browser load them).
+// returns { className, style, variable } like Next.js does. In production builds the fonts are
+// downloaded at build time and served with the app; in development the browser loads them from Google.
 "use strict";
 
 var loaded = {};
@@ -21,6 +21,9 @@ function slug(text) {
 
 function addStylesheet(href, fallbackHref) {
   if (loaded[href]) return;
+  // Production builds: the font was downloaded at build time and is in the app's CSS.
+  var hosted = typeof window !== "undefined" && window.__NORU_FONTS__;
+  if (hosted && (hosted[href] || (fallbackHref && hosted[fallbackHref]))) return;
   loaded[href] = true;
   var link = document.createElement("link");
   link.rel = "stylesheet";

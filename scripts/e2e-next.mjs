@@ -5,7 +5,7 @@
 // Usage: node scripts/e2e-next.mjs [path/to/noru-binary]
 
 import { spawn, spawnSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join, dirname, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -52,7 +52,12 @@ async function testApp(page, base, label) {
   check('Tailwind CSS classes are generated', await page.evaluate(`getComputedStyle(document.getElementById('title')).color === 'rgb(10, 20, 30)'`))
   check('global CSS from the layout is applied', await page.evaluate(`getComputedStyle(document.getElementById('brand')).borderTopWidth === '2px'`))
   check('next/font/google: variable class on <body>', await page.evaluate(`[...document.body.classList].some((c) => c.startsWith('__noru_font_var_geist')) && document.body.classList.contains('antialiased')`))
-  check('next/font/google: stylesheet requested', await page.evaluate(`!!document.querySelector('link[href^="https://fonts.googleapis.com/css2?family=Geist"]')`))
+  if (label.startsWith('production')) {
+    // Downloaded at build time and served with the app (unless the build had no network access).
+    check('next/font/google: font self-hosted (no request to Google)', await page.evaluate(`!!window.__NORU_FONTS__ && !document.querySelector('link[href^="https://fonts.googleapis.com"]') && !!document.querySelector('link[rel=preload][as=font]')`) || /could not download the Google fonts/.test(buildLogs))
+  } else {
+    check('next/font/google: stylesheet requested', await page.evaluate(`!!document.querySelector('link[href^="https://fonts.googleapis.com/css2?family=Geist"]')`))
+  }
   check('next/image renders an <img>', await page.evaluate(`document.getElementById('logo')?.tagName === 'IMG' && document.getElementById('logo').getAttribute('src') === '/logo.svg'`))
 
   await page.evaluate(`${click('counter')}; ${click('counter')}`)
@@ -145,12 +150,39 @@ async function testApp(page, base, label) {
   check('no unexpected errors in the browser console', errors.length === 0, errors.slice(0, 3).join(' | '))
 }
 
+let buildLogs = ''
+
+/** v1.1 production features: page chunks, precompression, pre-rendered pages, service worker. */
+async function testProduction(page, base, out) {
+  console.log('\n— production features')
+  const assets = readdirSync(join(out, 'assets'))
+  check('one chunk per page (code splitting)', assets.some((f) => /^page-[0-9a-f]{8}\.js$/.test(f)) && assets.some((f) => /^dashboard-page-[0-9a-f]{8}\.js$/.test(f)), assets.join(' '))
+  check('Brotli and gzip versions of the files', assets.some((f) => f.endsWith('.js.br')) && assets.some((f) => f.endsWith('.js.gz')))
+  check('page weights printed', /first visit \(JS \+ CSS\)/.test(buildLogs) && /\/dashboard\/settings\s+[\d.]+ kB/.test(buildLogs))
+  const about = await (await fetch(`${base}/about`)).text()
+  check('pre-rendered page: content, title and <html> attributes in the HTML', about.includes('<h1 id="title">About page</h1>') && about.includes('<title>About | Fixture</title>') && about.includes('<html lang="fr"'), about.slice(0, 300))
+  check('page that redirects is not pre-rendered', !existsSync(join(out, 'old', 'index.html')) && /\/old: NEXT_REDIRECT/.test(buildLogs))
+  const unknown = await (await fetch(`${base}/blog/not-prerendered`)).text()
+  check('other URLs get the empty app shell', unknown.includes('<div id="__next" style="display: contents"></div>'))
+  const response = await fetch(`${base}/`, { headers: { 'accept-encoding': 'br, gzip' } })
+  check('pages served precompressed with Brotli', response.headers.get('content-encoding') === 'br')
+  await page.navigate(`${base}/about`)
+  // React marks the DOM nodes it renders: the pre-rendered HTML has been replaced by the app.
+  const managedByReact = `Object.keys(document.getElementById('title') || {}).some((k) => k.startsWith('__reactFiber'))`
+  check('pre-rendered page: the app takes over without duplicating it', await page.waitFor(`${title} === 'About page' && document.querySelectorAll('#nav').length === 1 && ${managedByReact}`))
+  await page.evaluate(click('link-dashboard'))
+  check('  … then navigates on the client side', await page.waitFor(`location.pathname === '/dashboard' && !!document.getElementById('dashboard-layout')`), await page.evaluate('document.body.innerText.slice(0, 200)'))
+  await page.evaluate(`navigator.serviceWorker.ready.then(() => { window.__swReady = true }); 0`)
+  check('service worker registered', await page.waitFor(`window.__swReady === true`, 10000))
+}
+
 async function testBuild(browserPath) {
   const temp = mkdtempSync(join(tmpdir(), 'noru-next-dist-'))
   const out = join(temp, 'dist') // does not exist yet: noru only empties output dirs inside the project
   try {
     const build = spawnSync(noru, ['build', fixture, '--out-dir', out], { encoding: 'utf8', env: { ...process.env, NO_COLOR: '1' } })
-    check('noru build on a Next.js app', build.status === 0, (build.stdout + build.stderr).slice(-800))
+    buildLogs = build.stdout + build.stderr
+    check('noru build on a Next.js app', build.status === 0, buildLogs.slice(-800))
     if (build.status !== 0) return
     const port = 4600 + Math.floor(Math.random() * 300)
     const preview = startServer(['preview', fixture, '--out-dir', out, '--port', String(port)])
@@ -159,6 +191,7 @@ async function testBuild(browserPath) {
       const page = await launchBrowser(browserPath)
       try {
         await testApp(page, `http://127.0.0.1:${port}`, 'production build (noru build + noru preview)')
+        await testProduction(page, `http://127.0.0.1:${port}`, out)
       } finally {
         page.close()
       }

@@ -41,6 +41,16 @@ export interface BuildOptions {
   emptyOutDir?: boolean
   /** Remove unused modules, exports and code. Default: true. */
   treeshake?: boolean
+  /** Split the JavaScript at import() points (one chunk per Next.js page). Default: true. */
+  split?: boolean
+  /** Generate a service worker (offline mode, instant repeat visits). Default: true. */
+  offline?: boolean
+  /** Render Next.js pages to HTML at build time. Default: true. */
+  prerender?: boolean
+  /** Fail when a page needs more than this many kB of JS + CSS (Brotli). */
+  budget?: number
+  /** Write noru-report.html in the project root. Default: false. */
+  report?: boolean
 }
 
 export interface BuildResult {
@@ -50,6 +60,10 @@ export interface BuildResult {
   moduleCount: number
   /** Modules left out of the bundle by tree-shaking. */
   removedModules: number
+  /** What each page downloads on a first visit. */
+  pages: Array<PageWeight>
+  /** Path of noru-report.html, when asked for. */
+  report?: string
   durationMs: number
 }
 
@@ -82,6 +96,21 @@ export interface OutputFile {
   fileName: string
   size: number
   gzipSize: number
+  /** Size once compressed with Brotli (0 for files not compressed). */
+  brotliSize: number
+}
+
+export interface PageWeight {
+  /** Route, e.g. "/blog/[slug]". */
+  route: string
+  /** Files downloaded on a first visit (JS + CSS). */
+  files: Array<string>
+  /** Bytes downloaded (Brotli). */
+  bytes: number
+  /** Estimated download time on slow 3G, in milliseconds. */
+  slow3gMs: number
+  /** Estimated download time on 4G, in milliseconds. */
+  fast4gMs: number
 }
 
 /**

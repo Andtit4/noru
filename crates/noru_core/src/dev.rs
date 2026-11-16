@@ -676,6 +676,11 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> std::io::Result<()> {
             return send(&mut stream, &req, dev_ok(mime_type(&ext), &body));
         }
     }
+    if path == "/sw.js" {
+        // Removes the service worker of a production build served earlier on this address.
+        let worker = crate::production::DEV_SERVICE_WORKER.as_bytes();
+        return send(&mut stream, &req, dev_ok("text/javascript; charset=utf-8", worker));
+    }
     // Next.js middleware and route handlers (API routes) decide first.
     if let Some(runtime) = shared.server_runtime() {
         return match dispatch(&runtime, &mut stream, &req)? {

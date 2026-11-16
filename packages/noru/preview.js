@@ -60,8 +60,18 @@ function headerObject(pairs) {
   return headers
 }
 
+/** The HTML file of a page: its pre-rendered HTML (blog/index.html), else the app shell. */
+function pageFile(dir, pathname) {
+  const route = pathname.replace(/index\.html$/, '').replace(/^\/+|\/+$/g, '')
+  const own = path.join(dir, route, 'index.html')
+  if (own.startsWith(dir) && fs.existsSync(own)) return own
+  const shell = path.join(dir, 'shell.html')
+  return fs.existsSync(shell) ? shell : path.join(dir, 'index.html')
+}
+
 function sendPage(res, req, dir, rewrite, extraHeaders) {
-  let html = fs.readFileSync(path.join(dir, 'index.html'), 'utf8')
+  const target = (rewrite || new URL(req.url, 'http://localhost').pathname).split('?')[0]
+  let html = fs.readFileSync(pageFile(dir, target), 'utf8')
   if (rewrite) {
     const value = JSON.stringify(rewrite).replace(/<\//g, '<\\/')
     html = html.replace('  </head>', `    <script>window.__NORU_REWRITE__ = ${value}</script>\n  </head>`)
@@ -153,7 +163,7 @@ function preview(options = {}) {
     }
     if (!fs.existsSync(file)) {
       // SPA fallback for paths without an extension.
-      if (path.extname(pathname) === '') file = path.join(dir, 'index.html')
+      if (path.extname(pathname) === '') file = pageFile(dir, pathname)
       else {
         res.writeHead(404, { 'Content-Type': 'text/plain' }).end('not found')
         return
@@ -166,13 +176,19 @@ function preview(options = {}) {
       'Cache-Control': pathname.startsWith('/assets/') ? 'public, max-age=31536000, immutable' : 'no-cache',
     }
     const compressible = /^text\/|javascript|json|svg|manifest/.test(type)
-    const gzip = compressible && /\bgzip\b/.test(req.headers['accept-encoding'] || '')
-    if (gzip) {
-      headers['Content-Encoding'] = 'gzip'
+    const accepted = req.headers['accept-encoding'] || ''
+    // Precompressed by `noru build` (Brotli at the highest level, then gzip): sent as-is.
+    let precompressed = null
+    if (/(^|,)\s*br\b/.test(accepted) && fs.existsSync(file + '.br')) precompressed = ['br', file + '.br']
+    else if (/\bgzip\b/.test(accepted) && fs.existsSync(file + '.gz')) precompressed = ['gzip', file + '.gz']
+    const gzip = !precompressed && compressible && /\bgzip\b/.test(accepted)
+    if (precompressed || gzip) {
+      headers['Content-Encoding'] = precompressed ? precompressed[0] : 'gzip'
       headers['Vary'] = 'Accept-Encoding'
     }
     res.writeHead(200, headers)
     if (req.method === 'HEAD') res.end()
+    else if (precompressed) fs.createReadStream(precompressed[1]).pipe(res)
     else if (gzip) fs.createReadStream(file).pipe(zlib.createGzip()).pipe(res)
     else fs.createReadStream(file).pipe(res)
   })

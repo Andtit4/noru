@@ -24,6 +24,11 @@ const HELP = `
     --mode <mode>            Mode, exposed as import.meta.env.MODE (default: production)
     --no-minify              Disable minification
     --no-treeshake           Keep unused modules and exports (disable tree-shaking)
+    --no-split               One JavaScript file instead of one chunk per page
+    --no-offline             Do not generate a service worker (offline mode)
+    --no-prerender           Do not render Next.js pages to HTML at build time
+    --budget <kB>            Fail when a page needs more than this many kB of JS + CSS (Brotli)
+    --report                 Write noru-report.html: page weights, what the bundle is made of
 
   Start / preview options
     --out-dir <dir>          Directory to serve (default: dist)
@@ -44,6 +49,10 @@ function parseArgs(argv) {
     const arg = argv[i]
     if (arg === '--no-minify') args.minify = false
     else if (arg === '--no-treeshake') args.treeshake = false
+    else if (arg === '--no-split') args.split = false
+    else if (arg === '--no-offline') args.offline = false
+    else if (arg === '--no-prerender') args.prerender = false
+    else if (arg === '--report') args.report = true
     else if (arg === '-h' || arg === '--help') args.help = true
     else if (arg === '-v' || arg === '--version') args.version = true
     else if (arg === '-p') {
@@ -71,16 +80,35 @@ function printResult(result) {
   const removed = result.removedModules > 0 ? ` (${result.removedModules} unused removed by tree-shaking)` : ''
   console.log(`${c('32', '✓')} ${result.moduleCount} modules transformed${removed}.`)
   const out = path.basename(result.outDir)
+  // AVIF / WebP versions of images: one summary line instead of one line each.
+  const isVariant = (f) => /-\d+w-[0-9a-f]{8}\.(avif|webp)$/.test(f.fileName)
+  const variants = result.files.filter(isVariant)
+  result = { ...result, files: result.files.filter((f) => !isVariant(f)) }
   const names = result.files.map((f) => `${out}/${f.fileName}`)
   const width = Math.max(...names.map((n) => n.length))
   const sizeWidth = Math.max(...result.files.map((f) => kb(f.size).length))
   result.files.forEach((file, i) => {
     const name = names[i]
     const color = name.endsWith('.js') ? '36' : name.endsWith('.css') ? '35' : name.endsWith('.html') ? '32' : '2'
+    const brotli = file.brotliSize > 0 ? ` │ brotli: ${kb(file.brotliSize).padStart(8)}` : ''
     console.log(
-      `${c(color, name)}${' '.repeat(width - name.length)}  ${kb(file.size).padStart(sizeWidth)} │ gzip: ${kb(file.gzipSize).padStart(8)}`,
+      `${c(color, name)}${' '.repeat(width - name.length)}  ${kb(file.size).padStart(sizeWidth)} │ gzip: ${kb(file.gzipSize).padStart(8)}${brotli}`,
     )
   })
+  if (variants.length) {
+    const total = variants.reduce((sum, f) => sum + f.size, 0)
+    console.log(c('2', `+ ${variants.length} responsive image versions (AVIF / WebP), ${kb(total)}`))
+  }
+  const pages = [...(result.pages || [])].sort((a, b) => b.bytes - a.bytes)
+  if (pages.length > 1 || pages.some((p) => p.files.length > 2)) {
+    const w = Math.max(4, ...pages.map((p) => p.route.length))
+    console.log('\n' + c('2', `${'page'.padEnd(w)}  first visit (JS + CSS)   slow 3G      4G`))
+    for (const p of pages.slice(0, 30)) {
+      console.log(`${p.route.padEnd(w)}  ${kb(p.bytes).padStart(22)}   ${((p.slow3gMs / 1000).toFixed(1) + ' s').padStart(7)}   ${((p.fast4gMs / 1000).toFixed(1) + ' s').padStart(5)}`)
+    }
+    if (pages.length > 30) console.log(c('2', `... and ${pages.length - 30} more pages`))
+  }
+  if (result.report) console.log(`${c('32', '✓')} report written to ${result.report}`)
   console.log(`${c('32', '✓')} built in ${Math.round(result.durationMs)}ms`)
 }
 
@@ -109,6 +137,11 @@ async function main() {
         mode,
         minify: args.minify,
         treeshake: args.treeshake,
+        split: args.split,
+        offline: args.offline,
+        prerender: args.prerender,
+        budget: args.budget !== undefined ? Number(args.budget) : undefined,
+        report: args.report,
       })
       printResult(result)
     } catch (error) {

@@ -132,6 +132,10 @@ function pruneAsyncCache() {
 
 export function clearAsyncCache() {
   asyncCache.clear();
+  // Chunks that failed to download (network) are retried.
+  routeModules.forEach(function (entry, load) {
+    if (entry.status === "rejected") routeModules.delete(load);
+  });
 }
 
 function propsKey(props) {
@@ -433,8 +437,89 @@ function searchObject(search) {
  * Renders the default export of a route file (page, layout, loading...). The file is loaded here,
  * when it is rendered: if it fails, the closest error boundary shows the error.
  */
+// Route files: required synchronously in dev, `import()`ed (separate chunks) in production.
+const routeModules = new Map();
+
+function trackModule(load) {
+  let entry = routeModules.get(load);
+  if (entry) return entry;
+  const result = load();
+  if (!result || typeof result.then !== "function") return { status: "fulfilled", value: result };
+  entry = { status: "pending", value: undefined, promise: null };
+  const current = entry;
+  current.promise = result.then(
+    function (value) {
+      current.status = "fulfilled";
+      current.value = value;
+    },
+    function (error) {
+      current.status = "rejected";
+      current.value = error;
+    },
+  );
+  routeModules.set(load, entry);
+  return entry;
+}
+
+/** The module of a route file, suspending while its chunk downloads. */
+function readModule(load) {
+  const entry = trackModule(load);
+  if (entry.status === "fulfilled") return entry.value;
+  if (entry.status === "rejected") throw entry.value;
+  throw entry.promise;
+}
+
+/** The module of a route file, or null if it cannot be loaded. */
+function loadModule(load) {
+  if (!load) return Promise.resolve(null);
+  try {
+    const entry = trackModule(load);
+    if (entry.status === "fulfilled") return Promise.resolve(entry.value);
+    return entry.promise.then(function () {
+      return entry.status === "fulfilled" ? entry.value : null;
+    });
+  } catch (error) {
+    return Promise.resolve(null);
+  }
+}
+
+/**
+ * How much the connection allows to download ahead of time: "none" (data saver, 2G),
+ * "intent" (3G: only the link the user is about to click) or "visible" (links on screen).
+ */
+export function prefetchLevel() {
+  const connection = navigator.connection;
+  if (!connection) return "visible";
+  if (connection.saveData) return "none";
+  const type = connection.effectiveType || "";
+  if (type.indexOf("2g") !== -1) return "none";
+  if (type === "3g" || (connection.downlink && connection.downlink < 1.5)) return "intent";
+  return "visible";
+}
+
+/** Downloads the chunks of a page ahead of time (next/link prefetch). */
+export function prefetchRoute(href) {
+  if (!currentRoutes || prefetchLevel() === "none") return;
+  let url;
+  try {
+    url = new URL(href, location.href);
+  } catch (error) {
+    return;
+  }
+  if (url.origin !== location.origin) return;
+  const found = match(currentRoutes.tree, splitPath(url.pathname), 0, {}, [currentRoutes.tree]);
+  if (!found) return;
+  found.chain.forEach(function (node) {
+    ["layout", "template", "loading", "error", "notFound", "page"].forEach(function (key) {
+      if (node[key]) loadModule(node[key]);
+    });
+  });
+}
+
+let currentRoutes = null;
+
 function RouteFile(props) {
-  const mod = props.load();
+  const mod = readModule(props.load);
   const type = mod && mod.default;
   if (typeof type !== "function" && (typeof type !== "object" || type === null)) {
     throw new Error("noru: this " + props.file + " file has no default export (a React component is expected).");
@@ -446,13 +531,6 @@ function routeFile(load, file, props, key, children) {
   return h(RouteFile, { key: key, load: load, file: file, props: props }, children);
 }
 
-function tryLoad(load) {
-  try {
-    return load ? load() : null;
-  } catch (error) {
-    return null;
-  }
-}
 
 function DefaultNotFound() {
   return h(
@@ -539,17 +617,15 @@ function setMeta(name, content) {
   meta.setAttribute("content", String(content));
 }
 
-async function applyMetadata(found, paramsProp, searchProp, key) {
-  if (!found) {
-    document.title = "404: This page could not be found.";
-    return;
-  }
+/** The title and description of a page, from the metadata of its layouts and of the page. */
+async function resolveMetadata(found, paramsProp, searchProp) {
+  if (!found) return { title: "404: This page could not be found.", description: undefined };
   const mods = [];
-  found.chain.forEach(function (node) {
-    const layout = tryLoad(node.layout);
+  for (const node of found.chain) {
+    const layout = await loadModule(node.layout);
     if (layout) mods.push(layout);
-  });
-  const page = tryLoad(found.chain[found.chain.length - 1].page);
+  }
+  const page = await loadModule(found.chain[found.chain.length - 1].page);
   if (page) mods.push(page);
 
   let template = null;
@@ -576,9 +652,14 @@ async function applyMetadata(found, paramsProp, searchProp, key) {
     }
     if (md.description != null) description = md.description;
   }
+  return { title: title, description: description };
+}
+
+async function applyMetadata(found, paramsProp, searchProp, key) {
+  const metadata = await resolveMetadata(found, paramsProp, searchProp);
   if (key !== snapshot.key) return; // navigated in the meantime
-  if (title != null) document.title = String(title);
-  if (description != null) setMeta("description", description);
+  if (metadata.title != null) document.title = String(metadata.title);
+  if (metadata.description != null) setMeta("description", metadata.description);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -641,8 +722,48 @@ function App(props) {
   return h(LocationContext.Provider, { value: loc }, el);
 }
 
+/**
+ * `noru build` renders the pages to HTML with Node.js: the app for a URL, and its metadata.
+ * (The page shows its content while the JavaScript downloads; the app then takes over.)
+ */
+export function prerenderApp(routes, href) {
+  prepare(routes.tree, true);
+  currentRoutes = routes;
+  snapshot = readLocation(++navigations);
+  const found = match(routes.tree, splitPath(snapshot.pathname), 0, {}, [routes.tree]);
+  return {
+    found: !!found,
+    element: h(App, { routes: routes }),
+    metadata: function () {
+      return resolveMetadata(found, thenable(found ? found.params : {}), thenable(searchObject(snapshot.search)));
+    },
+  };
+}
+
 export function start(routes) {
   prepare(routes.tree, true);
+  currentRoutes = routes;
+  const container = document.getElementById("__next");
+  if (container.hasChildNodes()) {
+    // HTML rendered by `noru build`: it stays on screen until the files of the page are loaded,
+    // then the app replaces it (no loading state in between).
+    const path = snapshot.rewrite ? snapshot.rewrite.split("?")[0] : snapshot.pathname;
+    const found = match(routes.tree, splitPath(path), 0, {}, [routes.tree]);
+    const files = [];
+    (found ? found.chain : []).forEach(function (node) {
+      ["layout", "template", "loading", "error", "notFound", "page"].forEach(function (key) {
+        if (node[key]) files.push(loadModule(node[key]));
+      });
+    });
+    Promise.all(files).then(function () {
+      mount(routes, container);
+    });
+    return;
+  }
+  mount(routes, container);
+}
+
+function mount(routes, container) {
   (routes.icons || []).forEach(function (icon) {
     const link = document.createElement("link");
     link.rel = icon.rel;
@@ -650,7 +771,7 @@ export function start(routes) {
     document.head.appendChild(link);
   });
   const app = h(App, { routes: routes });
-  const root = createRoot(document.getElementById("__next"), {
+  const root = createRoot(container, {
     // redirect() / notFound() are thrown on purpose: do not report them like errors (React 19+).
     onCaughtError: function (error, info) {
       if (isNavigationError(error)) return;

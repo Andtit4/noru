@@ -16,6 +16,7 @@ pub(crate) struct Request {
     /// The raw request target (path and query string, not decoded).
     pub target: String,
     pub accepts_gzip: bool,
+    pub accepts_brotli: bool,
     /// `If-None-Match` header (ETag the browser already has).
     pub if_none_match: Option<String>,
     pub headers: Vec<(String, String)>,
@@ -41,6 +42,7 @@ pub(crate) fn read_request(stream: &TcpStream) -> std::io::Result<Request> {
     let mut request_line = String::new();
     reader.read_line(&mut request_line)?;
     let mut accepts_gzip = false;
+    let mut accepts_brotli = false;
     let mut if_none_match = None;
     let mut headers = Vec::new();
     let mut content_length = 0usize;
@@ -51,8 +53,9 @@ pub(crate) fn read_request(stream: &TcpStream) -> std::io::Result<Request> {
         }
         if let Some((name, value)) = line.split_once(':') {
             let (name, value) = (name.trim(), value.trim());
-            if name.eq_ignore_ascii_case("accept-encoding") && value.contains("gzip") {
-                accepts_gzip = true;
+            if name.eq_ignore_ascii_case("accept-encoding") {
+                accepts_gzip = value.contains("gzip");
+                accepts_brotli = value.split(',').any(|e| e.trim().split(';').next() == Some("br"));
             } else if name.eq_ignore_ascii_case("if-none-match") {
                 if_none_match = Some(value.to_string());
             } else if name.eq_ignore_ascii_case("content-length") {
@@ -70,7 +73,7 @@ pub(crate) fn read_request(stream: &TcpStream) -> std::io::Result<Request> {
     let method = parts.next().unwrap_or("").to_string();
     let target = parts.next().unwrap_or("/").to_string();
     let path = percent_decode(target.split(['?', '#']).next().unwrap_or("/"));
-    Ok(Request { method, path, target, accepts_gzip, if_none_match, headers, body })
+    Ok(Request { method, path, target, accepts_gzip, accepts_brotli, if_none_match, headers, body })
 }
 
 /// Sends a response made by the Next.js server code (status, headers and body as they are).
@@ -81,7 +84,22 @@ pub(crate) fn send_raw(
     headers: &[(String, String)],
     body: &[u8],
 ) -> std::io::Result<()> {
+    send_encoded(stream, req, status, headers, body, None)
+}
+
+/// Like `send_raw`, for a body already compressed (`br`, `gzip`).
+fn send_encoded(
+    stream: &mut TcpStream,
+    req: &Request,
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    encoding: Option<&str>,
+) -> std::io::Result<()> {
     let mut head = format!("HTTP/1.1 {status} {}\r\n", reason_phrase(status));
+    if let Some(encoding) = encoding {
+        head.push_str(&format!("Content-Encoding: {encoding}\r\nVary: Accept-Encoding\r\n"));
+    }
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("content-length")
             || name.eq_ignore_ascii_case("transfer-encoding")
@@ -133,11 +151,13 @@ pub(crate) struct Response<'a> {
     pub cache_control: &'a str,
     /// Gzip the body when the browser accepts it (pointless on localhost in dev).
     pub compress: bool,
+    /// The body is already compressed (`br` or `gzip`, precompressed at build time).
+    pub encoding: Option<&'a str>,
 }
 
 impl<'a> Response<'a> {
     pub fn ok(content_type: &'a str, body: &'a [u8]) -> Self {
-        Self { status: "200 OK", content_type, body, cache_control: "no-cache", compress: true }
+        Self { status: "200 OK", content_type, body, cache_control: "no-cache", compress: true, encoding: None }
     }
 
     pub fn not_found() -> Self {
@@ -147,6 +167,7 @@ impl<'a> Response<'a> {
             body: b"not found",
             cache_control: "no-cache",
             compress: false,
+            encoding: None,
         }
     }
 }
@@ -176,15 +197,18 @@ pub(crate) fn send(stream: &mut TcpStream, req: &Request, res: Response) -> std:
     let etag_header = etag.map(|etag| format!("ETag: {etag}\r\n")).unwrap_or_default();
 
     let compressed;
-    let (body, encoding) =
-        if res.compress && req.accepts_gzip && res.body.len() > 1024 && is_compressible(res.content_type) {
-            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-            encoder.write_all(res.body)?;
-            compressed = encoder.finish()?;
-            (compressed.as_slice(), "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n")
-        } else {
-            (res.body, "")
-        };
+    let precompressed;
+    let (body, encoding) = if let Some(encoding) = res.encoding {
+        precompressed = format!("Content-Encoding: {encoding}\r\nVary: Accept-Encoding\r\n");
+        (res.body, precompressed.as_str())
+    } else if res.compress && req.accepts_gzip && res.body.len() > 1024 && is_compressible(res.content_type) {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(res.body)?;
+        compressed = encoder.finish()?;
+        (compressed.as_slice(), "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n")
+    } else {
+        (res.body, "")
+    };
     let header = format!(
         "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: {}\r\n{etag_header}{encoding}Connection: close\r\n\r\n",
         res.status,
@@ -259,7 +283,9 @@ impl PreviewServer {
     /// any. `root` is the project: its `.env` files and `node_modules` are used.
     pub fn start_server_code(&mut self, root: &Path) -> Result<bool, String> {
         let Ok(code) = std::fs::read_to_string(self.dir.join("server").join("app.js")) else { return Ok(false) };
-        let runtime = ServerRuntime::start(root, "production")?;
+        // Node.js needs an absolute path (`noru start my-app` gives a relative one).
+        let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+        let runtime = ServerRuntime::start(&root, "production")?;
         runtime.load(&code)?;
         self.server = Some(Arc::new(runtime));
         Ok(true)
@@ -311,25 +337,61 @@ fn handle_static(mut stream: TcpStream, dir: &Path, server: Option<&ServerRuntim
                 if target != "/" && !extension_of(target).is_empty() {
                     return send(&mut stream, &req, Response::not_found());
                 }
-                let html = std::fs::read_to_string(dir.join("index.html"))?;
+                let file = page_file(dir, target);
+                if rewrite.is_none() {
+                    // Precompressed by `noru build`.
+                    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    for (accepted, suffix, encoding) in
+                        [(req.accepts_brotli, "br", "br"), (req.accepts_gzip, "gz", "gzip")]
+                    {
+                        if !accepted {
+                            continue;
+                        }
+                        let Ok(body) = std::fs::read(file.with_file_name(format!("{name}.{suffix}"))) else { continue };
+                        let mut all = vec![
+                            ("Content-Type".to_string(), "text/html; charset=utf-8".to_string()),
+                            ("Cache-Control".to_string(), "no-cache".to_string()),
+                        ];
+                        all.extend(headers.iter().cloned());
+                        return send_encoded(&mut stream, &req, 200, &all, &body, Some(encoding));
+                    }
+                }
+                let html = std::fs::read_to_string(file)?;
                 send_page(&mut stream, &req, &html, rewrite.as_deref(), &headers)
             }
         };
     }
-    // index.html, and SPA fallback for client-side routes (paths without a file extension).
-    let index = (extension_of(&req.path).is_empty() || req.path.ends_with("/index.html"))
-        .then(|| safe_join(dir, "/index.html"))
-        .flatten();
-    match index {
-        Some(file) => send_file(&mut stream, &req, &file),
-        None => send(&mut stream, &req, Response::not_found()),
+    // Pages (pre-rendered HTML), and SPA fallback for client-side routes (paths without a file
+    // extension).
+    if extension_of(&req.path).is_empty() || req.path.ends_with("/index.html") {
+        return send_file(&mut stream, &req, &page_file(dir, &req.path));
     }
+    send(&mut stream, &req, Response::not_found())
+}
+
+/// The HTML file of a page: its pre-rendered HTML (`blog/index.html`), else the app shell.
+fn page_file(dir: &Path, path: &str) -> PathBuf {
+    let path = path.strip_suffix("index.html").unwrap_or(path).trim_matches('/');
+    let own =
+        if path.is_empty() { safe_join(dir, "/index.html") } else { safe_join(dir, &format!("/{path}/index.html")) };
+    own.or_else(|| safe_join(dir, "/shell.html")).unwrap_or_else(|| dir.join("index.html"))
 }
 
 fn send_file(stream: &mut TcpStream, req: &Request, file: &Path) -> std::io::Result<()> {
-    let body = std::fs::read(file)?;
     let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     // Files in assets/ have a content hash in their name: they can be cached forever.
     let cache_control = if req.path.contains("/assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
+    // Precompressed by `noru build` (Brotli at the highest level, then gzip): sent as-is.
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    for (accepted, suffix, encoding) in [(req.accepts_brotli, "br", "br"), (req.accepts_gzip, "gz", "gzip")] {
+        if !accepted {
+            continue;
+        }
+        if let Ok(body) = std::fs::read(file.with_file_name(format!("{name}.{suffix}"))) {
+            let res = Response { cache_control, encoding: Some(encoding), ..Response::ok(mime_type(&ext), &body) };
+            return send(stream, req, res);
+        }
+    }
+    let body = std::fs::read(file)?;
     send(stream, req, Response { cache_control, ..Response::ok(mime_type(&ext), &body) })
 }

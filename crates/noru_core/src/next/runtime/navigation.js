@@ -1,6 +1,7 @@
 // noru: browser version of `next/navigation`.
 import * as React from "react";
 import {
+  prefetchRoute,
   getSnapshot,
   LocationContext,
   navigate,
@@ -32,7 +33,9 @@ const router = {
   refresh: function () {
     refresh();
   },
-  prefetch: function () {},
+  prefetch: function (href) {
+    prefetchRoute(href);
+  },
 };
 
 export function useRouter() {

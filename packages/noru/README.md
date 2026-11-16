@@ -21,9 +21,9 @@ The npm package is `noru-bundler` (npm does not allow the name `noru`); the comm
 
 Then `npm run dev`, `npm run build`, `npm start`.
 
-> **Status: experimental (0.x).** noru builds the standard Vite React + TypeScript template and
-> Next.js App Router apps, and passes a suite of real-browser tests, but it is young: expect rough
-> edges and read [what is not supported yet](#not-supported-yet).
+> **Status: 1.1.** noru builds the standard Vite React + TypeScript template and Next.js App Router
+> apps, and passes a suite of real-browser tests, but it is a young project: expect rough edges and
+> read [what is not supported yet](#not-supported-yet).
 
 ## Why noru?
 
@@ -77,15 +77,17 @@ Tailwind CSS v4 ([`scripts/gen-next.mjs`](scripts/gen-next.mjs), measured by
 | Dev: link click to a page never opened    | **0.06 s**   | 1.0 s                    |
 | Dev: hot update                           | **0.15 s**   | 3.1 s                    |
 | Production build                          | **5.3 s**    | 54 – 71 s                |
-| JavaScript downloaded for a page (gzip)   | 229 kB       | **141 kB**               |
+| JavaScript downloaded for a page (gzip)   | **80 kB** ²  | 141 kB                   |
+
+² noru 1.1, with code splitting (229 kB with noru 0.2, which sent the whole app at once).
 
 On a real Next.js 16 project (35 pages, Tailwind v4): first page in dev **2.9 s** vs 22 s, other
 pages **0.2–0.3 s** vs 1.7–6.1 s, production build **1.4 s** vs 150 s.
 
 Most of noru's time on these apps is Tailwind itself (the same app without Tailwind builds in
-0.8 s). `next build` also type-checks and pre-renders pages on the server, which noru does not do.
-Next.js splits the JavaScript per page, while noru sends the whole app at once (code splitting is
-on the roadmap).
+0.8 s). With the [production features](#production-builds) of noru 1.1 (code splitting,
+pre-rendering, Brotli, service worker), the generated app builds in about 6–8 s. `next build` also
+type-checks the code, which noru does not do.
 
 **Tree-shaking** on a React app importing `lodash-es` and `lucide-react` (2,211 modules,
 [`fixtures/treeshake`](fixtures/treeshake)):
@@ -129,11 +131,54 @@ only, `${VAR}` references are expanded). npm packages such as `next-auth` are lo
 `node_modules`. `noru build` writes this server code to `dist/server/` (never sent to browsers) and
 `noru start` runs it, so the server needs the project's `node_modules` and `.env` files.
 
-**Not supported yet:** server actions (`'use server'`), server-side rendering (pages are rendered
-in the browser, which matters for SEO), ISR, `next/font/local`, parallel and intercepting routes,
+**Not supported yet:** server actions (`'use server'`), rendering pages on the server for each
+request (static pages are [pre-rendered at build time](#production-builds), the others render in
+the browser), ISR, `next/font/local`, parallel and intercepting routes,
 the Pages Router (`pages/`), `next.config` options, ESM-only packages that import `next/*` in
 server code. Async server components run in the browser: the APIs they call must be reachable from
 the browser, and server-only secrets are not available to them.
+
+## Production builds
+
+`noru build` prepares the app for real users, including people on a slow or unreliable connection.
+Everything is on by default; each feature has a flag to turn it off.
+
+- **Code splitting.** Each page downloads only its own code: the JavaScript is split at `import()`
+  points (one chunk per Next.js page, layout and `next/dynamic` component), code shared by several
+  pages goes to shared chunks, and the chunks of the requested page start downloading together with
+  the entry file (no waterfall). `--no-split` for a single file.
+- **Precompressed files.** Every text file is written next to a Brotli (`.br`) and a gzip (`.gz`)
+  version, compressed at a high level once at build time. `noru start` sends them as-is; most
+  hosts and CDNs can too.
+- **Pre-rendered pages (Next.js).** Static pages are rendered to HTML at build time
+  (`dist/about/index.html`...), with their title, description and `<html>` / `<body>` attributes:
+  the content shows up before the JavaScript has downloaded, and search engines see it. The app
+  then takes over. Pages that cannot be rendered at build time (dynamic segments, `redirect()`,
+  calls to relative URLs...) keep the empty app shell and are listed in the build output.
+  `--no-prerender` to disable.
+- **Offline and instant repeat visits.** A service worker (`sw.js`) keeps the app shell and the
+  hashed files in the browser: later visits do not download them again, visited pages open without
+  a network connection, and on a good connection the rest of the app is downloaded in the
+  background. Data saver and 2G connections skip that. `--no-offline` to disable; a `public/sw.js`
+  of your own is kept and nothing is generated.
+- **Network-aware prefetching (Next.js).** `next/link` downloads pages before the click: links on
+  screen on a good connection, only the hovered or touched link on 3G, nothing with the data saver
+  or on 2G.
+- **Optimized images (Next.js).** `import photo from "./photo.jpg"` gives `next/image` the width and
+  height of the image (no layout shift). When `sharp` is installed (Next.js installs it), noru also
+  generates a blurred preview (`placeholder="blur"`) and AVIF / WebP versions in several widths: the
+  browser downloads the smallest file that fits the screen. Encoded images are cached in
+  `node_modules/.noru-cache/`, so later builds are fast.
+- **Self-hosted Google fonts (Next.js).** `next/font/google` fonts are downloaded at build time and
+  served with the app, like Next.js: no request to Google, the main font files are preloaded.
+  (In `noru dev`, the browser loads them from Google.)
+- **Page weights and budget.** The build prints what each page downloads on a first visit
+  (JavaScript + CSS, Brotli) and an estimate on slow 3G and 4G. `--budget 150` (or
+  `"noru": { "budget": 150 }` in `package.json`) makes the build fail when a page needs more than
+  150 kB; `--report` writes `noru-report.html`, which shows what the bundle is made of.
+
+For static hosting, serve `dist/`: pages that have their own `index.html` are served as-is, and
+other URLs should fall back to `shell.html` (the empty app shell, also used offline).
 
 ## Commands
 
@@ -150,8 +195,13 @@ noru build [root]      Build for production into dist/
   --mode <mode>          import.meta.env.MODE (default: production)
   --no-minify            Disable minification
   --no-treeshake         Keep unused modules and exports
+  --no-split             One JavaScript file instead of one chunk per page
+  --no-prerender         Do not render Next.js pages to HTML at build time
+  --no-offline           Do not generate a service worker
+  --budget <kB>          Fail when a page needs more than this many kB of JS + CSS (Brotli)
+  --report               Write noru-report.html (page weights, what the bundle is made of)
 
-noru start [root]      Serve the production build (gzip, long-term caching, SPA fallback)
+noru start [root]      Serve the production build (Brotli / gzip, long-term caching, SPA fallback)
   --port, -p <port>      Port (default: $PORT or 3000)
   --host <host>          Host (default: 0.0.0.0)
 
@@ -179,7 +229,7 @@ noru follows the Vite conventions, so most Vite React apps work as-is:
 - Assets (images, fonts, media): hashed file names, small files inlined as data URLs
 - `import data from './data.json'`, `?raw`, `?url`, `?inline` imports, `import logo from '/logo.svg'` (public/)
 - `import.meta.env.*`, `process.env.NODE_ENV` and dead-code removal of `if (import.meta.env.DEV) {...}`
-- Dynamic `import()` (bundled in the same file for now)
+- Dynamic `import()`: split into chunks loaded on demand in production builds
 - Circular imports and live bindings
 - **Tree-shaking**: unused modules, exports and top-level code are removed, `export *` barrels
   are resolved statically, `package.json` `"sideEffects"` is honored, `/* @__PURE__ */` annotations
@@ -190,20 +240,21 @@ noru follows the Vite conventions, so most Vite React apps work as-is:
 
 - Vue, Svelte, Astro single-file components
 - Sass / Less / Stylus
-- Code splitting (dynamic imports are bundled in the main file), scope hoisting, source maps
+- Scope hoisting (each module stays wrapped in a function), source maps
 - An `import.meta.hot` API for non-React code (non-component modules propagate the update to
   their importers, up to the closest React component)
 - Plugins and a config file
-- Server-side rendering and server actions (Next.js pages run in the browser; middleware and route
-  handlers are supported, see [Next.js apps](#nextjs-apps))
+- Rendering pages on the server for each request, and server actions (static Next.js pages are
+  pre-rendered at build time; middleware and route handlers are supported, see
+  [Next.js apps](#nextjs-apps))
 
 ## JavaScript API
 
 ```js
 const { build, startDevServer, preview } = require('noru-bundler')
 
-const result = await build({ root: './my-app', outDir: 'dist', minify: true })
-console.log(result.files, `${result.durationMs} ms`)
+const result = await build({ root: './my-app', outDir: 'dist', budget: 150, report: true })
+console.log(result.files, result.pages, `${result.durationMs} ms`)
 
 const dev = startDevServer({ root: './my-app', port: 3000 })
 console.log(dev.url)

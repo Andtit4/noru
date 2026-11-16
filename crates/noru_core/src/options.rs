@@ -23,6 +23,16 @@ pub struct BuildOptions {
     pub treeshake: bool,
     /// Development: hot module replacement + React Fast Refresh. Default: `false`.
     pub hmr: bool,
+    /// Production: split the JavaScript at `import()` points (one chunk per Next.js page). Default: `true`.
+    pub split: bool,
+    /// Production: generate a service worker so the app opens offline and instantly on later visits. Default: `true`.
+    pub offline: bool,
+    /// Production: render Next.js pages to HTML at build time. Default: `true`.
+    pub prerender: bool,
+    /// Production: fail when a page needs more than this many kilobytes (Brotli) of JS + CSS.
+    pub budget_kb: Option<f64>,
+    /// Production: write an HTML report of what the bundle is made of (`noru-report.html`). Default: `false`.
+    pub report: bool,
 }
 
 impl BuildOptions {
@@ -38,6 +48,11 @@ impl BuildOptions {
             empty_out_dir: true,
             treeshake: true,
             hmr: false,
+            split: true,
+            offline: true,
+            prerender: true,
+            budget_kb: None,
+            report: false,
         }
     }
 

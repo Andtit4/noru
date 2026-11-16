@@ -38,6 +38,10 @@ pub struct Context {
     pub postcss: Option<PostCss>,
     /// Bundle for Node.js (Next.js middleware and route handlers): npm packages stay external.
     pub server: Option<ServerTarget>,
+    /// Production builds of Next.js apps with sharp: blur previews and AVIF / WebP versions.
+    pub images: Option<crate::images::ImageOptimizer>,
+    /// Production builds of Next.js apps: `next/font/google` calls, to self-host the fonts.
+    pub fonts: Option<crate::fonts::GoogleFonts>,
 }
 
 /// Query marker for imports of files in the public directory (`import logo from '/vite.svg'`).
@@ -151,6 +155,8 @@ pub struct JsModule {
     pub side_effects_hint: Option<bool>,
     /// Compiled with React Refresh registrations (dev server).
     pub refresh: bool,
+    /// Dependencies (indices in `Module::deps`) only loaded with `import()`.
+    pub dynamic_only: Vec<usize>,
 }
 
 pub enum ModuleOutput {
@@ -230,7 +236,13 @@ fn process_js_module(
     side_effects_hint: Option<bool>,
 ) -> Result<Processed, String> {
     let out = process_js(key, source, ctx)?;
-    let module = JsModule { segments: out.segments, esm: out.esm, side_effects_hint, refresh: out.refresh };
+    let module = JsModule {
+        segments: out.segments,
+        esm: out.esm,
+        side_effects_hint,
+        refresh: out.refresh,
+        dynamic_only: out.dynamic_only,
+    };
     Ok(Processed { output: ModuleOutput::Js(module), deps: out.deps, emitted: vec![], warnings: out.warnings })
 }
 
@@ -311,6 +323,9 @@ fn process_module(key: &ModuleKey, ctx: &Context) -> Result<Processed, String> {
     match ext.as_str() {
         "js" | "mjs" | "cjs" | "jsx" | "ts" | "tsx" | "mts" | "cts" => {
             let source = read_text(path)?;
+            if let Some(fonts) = ctx.fonts.as_ref().filter(|_| !key.is_in_node_modules()) {
+                fonts.scan(path, &source);
+            }
             process_js_module(key, &source, ctx, ctx.packages.side_effects(path))
         }
         "css" => {
@@ -353,7 +368,26 @@ fn process_module(key: &ModuleKey, ctx: &Context) -> Result<Processed, String> {
             let (url, file) = process_asset(path, &assets)?;
             // Next.js: `import logo from "./logo.png"` gives { src, width, height } (used by next/image).
             let value = if ctx.next.is_some() && is_image_extension(&ext) {
-                serde_json::json!({ "src": url, "width": null, "height": null })
+                let bytes = std::fs::read(path).unwrap_or_default();
+                let (width, height) = crate::images::dimensions(&bytes).unzip();
+                let mut value = serde_json::json!({ "src": url, "width": width, "height": height });
+                let emitted = file.as_ref().and_then(|f| {
+                    let name = f.file_name.strip_prefix("assets/")?;
+                    let (stem_hash, _) = name.rsplit_once('.')?;
+                    stem_hash.rsplit_once('-')
+                });
+                if let (Some(images), Some((stem, hash)), Some(width)) = (&ctx.images, emitted, width) {
+                    let optimized = images.optimize(path, &ext, stem, hash, width, &ctx.base);
+                    if let Some((blur, blur_width, blur_height)) = optimized.blur {
+                        value["blurDataURL"] = blur.into();
+                        value["blurWidth"] = blur_width.into();
+                        value["blurHeight"] = blur_height.into();
+                    }
+                    if let Some(sources) = optimized.sources {
+                        value["sources"] = sources;
+                    }
+                }
+                value
             } else {
                 serde_json::Value::String(url)
             };

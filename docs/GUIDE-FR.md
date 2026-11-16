@@ -64,6 +64,10 @@ crates/noru_core/     Le cœur en Rust : analyse, transformation, bundling, serv
   src/client.js       Script injecté en dev (hot updates, mise à jour CSS, erreurs)
   src/hmr-runtime.js  Runtime du hot reload (remplacement des modules + React Fast Refresh)
   src/treeshake.rs    Tree-shaking (suppression du code inutilisé)
+  src/production.rs   Build de production : Brotli/gzip, poids des pages, service worker, rapport
+  src/images.rs       Images : dimensions, aperçu flou, versions AVIF/WebP (via sharp)
+  src/fonts.rs        Polices Google téléchargées au build
+  src/next/           Projets Next.js : routeur, modules next/*, middleware et routes API, pré-rendu
   src/vendor/         Runtime React Refresh (licence MIT, Meta)
 crates/noru_cli/      La commande `noru` en Rust (pour développer et tester vite)
 packages/noru/        Le package npm : module natif Node (napi-rs) + commande `noru` en JS
@@ -134,8 +138,9 @@ l'application, comme avec Next. Les paquets npm (next-auth...) sont chargés dep
 `noru build` met ce code serveur dans `dist/server/` (jamais envoyé au navigateur) et `noru start`
 l'exécute : le serveur de production a donc besoin du `node_modules` et des fichiers `.env`.
 
-Ce qui ne marche pas encore : les server actions (`'use server'`), le rendu côté serveur (le
-référencement Google voit une page construite en JavaScript). Les pages `async` appellent leurs API
+Ce qui ne marche pas encore : les server actions (`'use server'`), le rendu sur le serveur à chaque
+requête (les pages statiques sont pré-rendues au build, voir la partie 7 ; les autres sont
+construites dans le navigateur). Les pages `async` appellent leurs API
 depuis le navigateur : ces API doivent l'accepter (CORS) et les secrets serveur ne leur sont pas
 disponibles.
 
@@ -197,19 +202,63 @@ ou `lucide-react`) et les annotations `/* @__PURE__ */`. Exemple mesuré (`fixtu
 
 En mode `dev`, le tree-shaking est désactivé pour garder des rebuilds instantanés.
 
-## 7. Limites actuelles et prochaines étapes
+## 7. Le build de production (v1.1)
 
-Pas encore supporté : Vue/Svelte, Sass/Less, découpage du code (code splitting), scope hoisting,
-source maps, plugins, fichier de config.
+`noru build` prépare l'application pour de vrais visiteurs, y compris avec une connexion lente ou
+instable. Tout est activé par défaut ; chaque fonction a une option pour la couper.
+
+- **Découpage du code** : chaque page ne télécharge que son code (un morceau par page, layout et
+  composant `next/dynamic`). Le code commun à plusieurs pages va dans des morceaux partagés, et les
+  morceaux de la page demandée partent en même temps que le fichier principal. `--no-split` pour un
+  seul fichier. Sur l'appli de test de 50 pages : **80 Ko** de JavaScript par page (gzip) au lieu
+  de 229 Ko, contre 141 Ko pour Next.js.
+- **Fichiers précompressés** : chaque fichier texte est écrit avec une version Brotli (`.br`) et
+  gzip (`.gz`), compressées une fois pour toutes au build. `noru start` les envoie tels quels.
+- **Pages pré-rendues (Next.js)** : les pages statiques sont transformées en HTML au build
+  (`dist/about/index.html`...), avec leur titre et leur description. Le visiteur voit le contenu
+  avant que le JavaScript soit téléchargé, et Google aussi. L'application prend ensuite le relais.
+  Les pages impossibles à rendre au build (routes `[id]`, `redirect()`, appels à des URL
+  relatives...) gardent la page vide habituelle et sont listées à la fin du build.
+  `--no-prerender` pour couper.
+- **Hors ligne et visites suivantes instantanées** : un service worker (`sw.js`) garde la coquille
+  de l'appli et les fichiers dans le navigateur. Les visites suivantes ne les retéléchargent pas,
+  les pages déjà vues s'ouvrent sans réseau, et sur une bonne connexion le reste de l'appli est
+  téléchargé en arrière-plan (jamais en mode économie de données ni en 2G). `--no-offline` pour
+  couper ; si tu as ton propre `public/sw.js`, noru le garde et n'en génère pas.
+- **Préchargement selon le réseau (Next.js)** : `next/link` télécharge les pages avant le clic :
+  les liens visibles sur une bonne connexion, seulement le lien survolé ou touché en 3G, rien en
+  2G ni en mode économie de données.
+- **Images optimisées (Next.js)** : `import photo from "./photo.jpg"` donne à `next/image` la
+  largeur et la hauteur (la page ne saute plus quand l'image arrive). Si `sharp` est installé (Next
+  l'installe), noru génère aussi un aperçu flou (`placeholder="blur"`) et des versions AVIF / WebP
+  en plusieurs largeurs : un téléphone télécharge une petite image moderne au lieu de l'originale.
+  Les images encodées sont gardées dans `node_modules/.noru-cache/` : les builds suivants sont
+  rapides.
+- **Polices Google hébergées avec le site (Next.js)** : les polices de `next/font/google` sont
+  téléchargées au build et servies par le site (aucune requête vers Google, la police principale
+  est préchargée). En `noru dev`, le navigateur les charge toujours depuis Google.
+- **Poids des pages et budget** : le build affiche ce que chaque page télécharge à la première
+  visite (JS + CSS, Brotli) et une estimation en 3G lente et en 4G. `--budget 150` (ou
+  `"noru": { "budget": 150 }` dans `package.json`) fait échouer le build si une page dépasse
+  150 Ko ; `--report` écrit `noru-report.html`, qui montre de quoi le JavaScript est fait.
+
+Hébergement statique : sers le dossier `dist/`. Les pages qui ont leur propre `index.html` sont
+servies telles quelles, et les autres URL doivent renvoyer vers `shell.html` (la page vide de
+l'appli, aussi utilisée hors ligne).
+
+Pour voir où passe le temps du build : `NORU_PROFILE=1 noru build`.
+
+## 8. Limites actuelles et prochaines étapes
+
+Pas encore supporté : Vue/Svelte, Sass/Less, scope hoisting, source maps, plugins, fichier de
+config.
 
 Pistes, par ordre d'intérêt :
 
 1. **Next.js côté serveur** : server actions, puis rendu côté serveur (les routes API et le
    middleware sont faits depuis la v0.3).
-2. **Code splitting** : un fichier par page / par `import()` dynamique (le JavaScript d'un gros
-   projet Next serait téléchargé page par page, comme avec Next).
-3. **Scope hoisting** : supprimer l'enveloppe de chaque module (le reste de l'écart de taille avec
+2. **Scope hoisting** : supprimer l'enveloppe de chaque module (le reste de l'écart de taille avec
    Vite sur les très gros projets).
-4. **Source maps** : voir son vrai code TypeScript dans les outils du navigateur.
-5. **Cache sur disque** : démarrage encore plus rapide des gros projets.
-6. **Vue** (via `@vue/compiler-sfc`) et **Sass**.
+3. **Source maps** : voir son vrai code TypeScript dans les outils du navigateur.
+4. **Cache sur disque** : démarrage encore plus rapide des gros projets.
+5. **Vue** (via `@vue/compiler-sfc`) et **Sass**.

@@ -33,6 +33,21 @@ enum Command {
         /// Disable tree-shaking (keep unused modules and exports)
         #[arg(long)]
         no_treeshake: bool,
+        /// One JavaScript file instead of one chunk per page
+        #[arg(long)]
+        no_split: bool,
+        /// Do not generate a service worker (offline mode, instant repeat visits)
+        #[arg(long)]
+        no_offline: bool,
+        /// Do not render Next.js pages to HTML at build time
+        #[arg(long)]
+        no_prerender: bool,
+        /// Fail when a page needs more than this many kB of JS + CSS (Brotli)
+        #[arg(long, value_name = "KB")]
+        budget: Option<f64>,
+        /// Write noru-report.html: page weights and what the bundle is made of
+        #[arg(long)]
+        report: bool,
     },
     /// Start the development server (everything pre-bundled in memory, instant reloads)
     Dev {
@@ -101,13 +116,30 @@ fn main() -> ExitCode {
         }
         Command::Start { root, out_dir, port, host } => serve_build(root, out_dir, port, host),
         Command::Preview { root, out_dir, port, host } => serve_build(root, out_dir, port, host),
-        Command::Build { root, out_dir, base, mode, no_minify, no_treeshake } => {
+        Command::Build {
+            root,
+            out_dir,
+            base,
+            mode,
+            no_minify,
+            no_treeshake,
+            no_split,
+            no_offline,
+            no_prerender,
+            budget,
+            report,
+        } => {
             let options = BuildOptions {
                 out_dir,
                 base,
                 mode,
                 minify: !no_minify,
                 treeshake: !no_treeshake,
+                split: !no_split,
+                offline: !no_offline,
+                prerender: !no_prerender,
+                budget_kb: budget,
+                report,
                 ..BuildOptions::new(root)
             };
             println!(
@@ -176,10 +208,20 @@ fn print_result(result: &BuildResult) {
     };
     println!("{} {} modules transformed{removed}.", color("32", "✓"), result.module_count);
     let out = result.out_dir.file_name().and_then(|n| n.to_str()).unwrap_or("dist");
-    let names: Vec<String> = result.files.iter().map(|f| format!("{out}/{}", f.file_name)).collect();
+    // AVIF / WebP versions of images: one summary line instead of one line each.
+    let is_variant = |name: &str| {
+        let Some((rest, ext)) = name.rsplit_once('.') else { return false };
+        let mut parts = rest.rsplit('-');
+        let (hash, width) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        matches!(ext, "avif" | "webp")
+            && hash.len() == 8
+            && width.strip_suffix('w').is_some_and(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let (variants, files): (Vec<_>, Vec<_>) = result.files.iter().partition(|f| is_variant(&f.file_name));
+    let names: Vec<String> = files.iter().map(|f| format!("{out}/{}", f.file_name)).collect();
     let width = names.iter().map(String::len).max().unwrap_or(0);
-    let size_width = result.files.iter().map(|f| kb(f.size).len()).max().unwrap_or(0);
-    for (file, name) in result.files.iter().zip(&names) {
+    let size_width = files.iter().map(|f| kb(f.size).len()).max().unwrap_or(0);
+    for (file, name) in files.iter().zip(&names) {
         let code = if name.ends_with(".js") {
             "36"
         } else if name.ends_with(".css") {
@@ -189,13 +231,43 @@ fn print_result(result: &BuildResult) {
         } else {
             "2"
         };
+        let brotli =
+            if file.brotli_size > 0 { format!(" │ brotli: {:>8}", kb(file.brotli_size)) } else { String::new() };
         println!(
-            "{}{}  {:>size_width$} │ gzip: {:>8}",
+            "{}{}  {:>size_width$} │ gzip: {:>8}{brotli}",
             color(code, name),
             " ".repeat(width - name.len()),
             kb(file.size),
             kb(file.gzip_size),
         );
+    }
+    if !variants.is_empty() {
+        let total: usize = variants.iter().map(|f| f.size).sum();
+        println!(
+            "{}",
+            color("2", &format!("+ {} responsive image versions (AVIF / WebP), {}", variants.len(), kb(total)))
+        );
+    }
+    if result.pages.len() > 1 || result.pages.iter().any(|p| p.files.len() > 2) {
+        let width = result.pages.iter().map(|p| p.route.len()).max().unwrap_or(0).max(4);
+        println!("\n{}", color("2", &format!("{:width$}  first visit (JS + CSS)   slow 3G      4G", "page")));
+        let mut pages: Vec<_> = result.pages.iter().collect();
+        pages.sort_by_key(|p| std::cmp::Reverse(p.bytes));
+        for page in pages.iter().take(30) {
+            println!(
+                "{:width$}  {:>22}   {:>7}   {:>5}",
+                page.route,
+                kb(page.bytes),
+                format!("{:.1} s", page.slow_3g_ms() as f64 / 1000.0),
+                format!("{:.1} s", page.fast_4g_ms() as f64 / 1000.0),
+            );
+        }
+        if pages.len() > 30 {
+            println!("{}", color("2", &format!("... and {} more pages", pages.len() - 30)));
+        }
+    }
+    if let Some(report) = &result.report {
+        println!("{} report written to {}", color("32", "✓"), report.display());
     }
     println!("{} built in {}ms", color("32", "✓"), result.duration.as_millis());
 }

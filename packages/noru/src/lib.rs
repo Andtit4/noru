@@ -25,6 +25,16 @@ pub struct BuildOptions {
     pub empty_out_dir: Option<bool>,
     /// Remove unused modules, exports and code. Default: true.
     pub treeshake: Option<bool>,
+    /// Split the JavaScript at import() points (one chunk per Next.js page). Default: true.
+    pub split: Option<bool>,
+    /// Generate a service worker (offline mode, instant repeat visits). Default: true.
+    pub offline: Option<bool>,
+    /// Render Next.js pages to HTML at build time. Default: true.
+    pub prerender: Option<bool>,
+    /// Fail when a page needs more than this many kB of JS + CSS (Brotli).
+    pub budget: Option<f64>,
+    /// Write noru-report.html in the project root. Default: false.
+    pub report: Option<bool>,
 }
 
 #[napi(object)]
@@ -33,6 +43,24 @@ pub struct OutputFile {
     pub file_name: String,
     pub size: u32,
     pub gzip_size: u32,
+    /// Size once compressed with Brotli (0 for files not compressed).
+    pub brotli_size: u32,
+}
+
+#[napi(object)]
+pub struct PageWeight {
+    /// Route, e.g. "/blog/[slug]".
+    pub route: String,
+    /// Files downloaded on a first visit (JS + CSS).
+    pub files: Vec<String>,
+    /// Bytes downloaded (Brotli).
+    pub bytes: u32,
+    /// Estimated download time on slow 3G, in milliseconds.
+    #[napi(js_name = "slow3gMs")]
+    pub slow_3g_ms: u32,
+    /// Estimated download time on 4G, in milliseconds.
+    #[napi(js_name = "fast4gMs")]
+    pub fast_4g_ms: u32,
 }
 
 #[napi(object)]
@@ -43,6 +71,10 @@ pub struct BuildResult {
     pub module_count: u32,
     /// Modules left out of the bundle by tree-shaking.
     pub removed_modules: u32,
+    /// What each page downloads on a first visit.
+    pub pages: Vec<PageWeight>,
+    /// Path of noru-report.html, when asked for.
+    pub report: Option<String>,
     pub duration_ms: f64,
 }
 
@@ -73,6 +105,19 @@ fn to_core(options: Option<BuildOptions>) -> noru_core::BuildOptions {
     if let Some(v) = o.treeshake {
         core.treeshake = v;
     }
+    if let Some(v) = o.split {
+        core.split = v;
+    }
+    if let Some(v) = o.offline {
+        core.offline = v;
+    }
+    if let Some(v) = o.prerender {
+        core.prerender = v;
+    }
+    core.budget_kb = o.budget;
+    if let Some(v) = o.report {
+        core.report = v;
+    }
     core
 }
 
@@ -82,8 +127,25 @@ fn to_js(result: noru_core::BuildResult) -> BuildResult {
         files: result
             .files
             .into_iter()
-            .map(|f| OutputFile { file_name: f.file_name, size: f.size as u32, gzip_size: f.gzip_size as u32 })
+            .map(|f| OutputFile {
+                file_name: f.file_name,
+                size: f.size as u32,
+                gzip_size: f.gzip_size as u32,
+                brotli_size: f.brotli_size as u32,
+            })
             .collect(),
+        pages: result
+            .pages
+            .iter()
+            .map(|p| PageWeight {
+                route: p.route.clone(),
+                files: p.files.clone(),
+                bytes: p.bytes as u32,
+                slow_3g_ms: p.slow_3g_ms() as u32,
+                fast_4g_ms: p.fast_4g_ms() as u32,
+            })
+            .collect(),
+        report: result.report.map(|p| p.to_string_lossy().into_owned()),
         warnings: result.warnings,
         module_count: result.module_count as u32,
         removed_modules: result.removed_modules as u32,

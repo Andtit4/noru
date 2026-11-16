@@ -112,6 +112,8 @@ pub struct JsOutput {
     pub warnings: Vec<String>,
     /// Compiled with React Refresh registrations (`$RefreshReg$` / `$RefreshSig$`).
     pub refresh: bool,
+    /// Dependencies (indices in `deps`) only loaded with `import()`: code splitting points.
+    pub dynamic_only: Vec<usize>,
 }
 
 pub fn process_js(key: &ModuleKey, source: &str, ctx: &dyn JsContext) -> Result<JsOutput, String> {
@@ -182,7 +184,10 @@ pub fn process_js(key: &ModuleKey, source: &str, ctx: &dyn JsContext) -> Result<
         has_eval: analyzer.has_eval,
     });
 
-    Ok(JsOutput { segments, esm, deps: analyzer.deps, warnings: analyzer.warnings, refresh })
+    let mut dynamic_only: Vec<usize> =
+        analyzer.dynamic_deps.iter().filter(|d| !analyzer.static_deps.contains(d)).copied().collect();
+    dynamic_only.sort_unstable();
+    Ok(JsOutput { segments, esm, deps: analyzer.deps, warnings: analyzer.warnings, refresh, dynamic_only })
 }
 
 /// Splits the code into a prelude (hashbang, directives) and one segment per top-level statement,
@@ -376,6 +381,10 @@ struct Analyzer<'s> {
 
     deps: Vec<ModuleKey>,
     dep_index: HashMap<ModuleKey, usize>,
+    /// Dependencies used by `import()` / used statically (for code splitting).
+    dynamic_deps: std::collections::HashSet<usize>,
+    static_deps: std::collections::HashSet<usize>,
+    resolving_dynamic: bool,
     edits: Vec<Edit>,
     /// Imported binding -> expression that reads it (`__noru_m0.useState`).
     import_bindings: HashMap<SymbolId, String>,
@@ -410,6 +419,9 @@ impl<'s> Analyzer<'s> {
             is_esm,
             deps: Vec::new(),
             dep_index: HashMap::new(),
+            dynamic_deps: Default::default(),
+            static_deps: Default::default(),
+            resolving_dynamic: false,
             edits: Vec::new(),
             import_bindings: HashMap::new(),
             import_info: HashMap::new(),
@@ -443,7 +455,13 @@ impl<'s> Analyzer<'s> {
                 if let Some(w) = warning {
                     self.warnings.push(w);
                 }
-                Some(self.add_dep(key))
+                let dep = self.add_dep(key);
+                if self.resolving_dynamic {
+                    self.dynamic_deps.insert(dep);
+                } else {
+                    self.static_deps.insert(dep);
+                }
+                Some(dep)
             }
             Err(message) => {
                 let message = format!("{message}\n    imported from {}", self.importer.display());
@@ -1146,7 +1164,10 @@ impl<'a> Visit<'a> for Analyzer<'_> {
             _ => None,
         };
         if let Some(specifier) = specifier {
-            if let Some(dep) = self.resolve(&specifier, ResolveKind::Import, false) {
+            self.resolving_dynamic = true;
+            let resolved = self.resolve(&specifier, ResolveKind::Import, false);
+            self.resolving_dynamic = false;
+            if let Some(dep) = resolved {
                 self.note_dynamic_dep(dep);
                 self.edits.push(Edit::with_parts(
                     it.span.start,

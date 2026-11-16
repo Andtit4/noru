@@ -102,6 +102,8 @@ export async function launchBrowser(path = findBrowser()) {
   }
   return {
     navigate: (url) => send('Page.navigate', { url }),
+    /** Raw DevTools Protocol command. */
+    send,
     evaluate,
     /** Errors reported by the page since the last call. */
     takeErrors() {

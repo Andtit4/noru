@@ -1,6 +1,62 @@
 // noru: browser version of `next/link`.
 import * as React from "react";
-import { navigate } from "noru-next/router";
+import { navigate, prefetchLevel, prefetchRoute } from "noru-next/router";
+
+// Pages are downloaded before the click, as much as the connection allows: links on screen on a
+// good connection, the hovered / touched link on 3G, nothing with the data saver or on 2G.
+const prefetched = new Set();
+function prefetch(url) {
+  if (!url || prefetched.has(url) || prefetchLevel() === "none") return;
+  prefetched.add(url);
+  prefetchRoute(url);
+}
+
+let observer = null;
+const observed = new WeakMap();
+function observe(element, url) {
+  if (typeof IntersectionObserver !== "function") return function () {};
+  if (!observer) {
+    observer = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (!entry.isIntersecting) return;
+        const target = observed.get(entry.target);
+        observer.unobserve(entry.target);
+        if (target && prefetchLevel() === "visible") {
+          const idle = window.requestIdleCallback || function (fn) { return setTimeout(fn, 1); };
+          idle(function () {
+            prefetch(target);
+          });
+        }
+      });
+    }, { rootMargin: "200px" });
+  }
+  observed.set(element, url);
+  observer.observe(element);
+  return function () {
+    observer.unobserve(element);
+    observed.delete(element);
+  };
+}
+
+function useAutoPrefetch(url, enabled, forwardedRef) {
+  const element = React.useRef(null);
+  React.useEffect(function () {
+    if (!enabled || !element.current) return undefined;
+    return observe(element.current, url);
+  }, [url, enabled]);
+  return React.useCallback(function (node) {
+    element.current = node;
+    if (typeof forwardedRef === "function") forwardedRef(node);
+    else if (forwardedRef) forwardedRef.current = node;
+  }, [forwardedRef]);
+}
+
+function intentHandler(url, original) {
+  return function (event) {
+    if (original) original(event);
+    prefetch(url);
+  };
+}
 
 export function formatUrl(href) {
   if (typeof href === "string") return href;
@@ -67,17 +123,28 @@ const Link = React.forwardRef(function Link(props, ref) {
     ...rest
   } = props;
   const url = formatUrl(as != null ? as : href);
+  const internal = url.charAt(0) === "/" && url.charAt(1) !== "/";
+  const setRef = useAutoPrefetch(url, internal && prefetch !== false, ref);
   if (legacyBehavior) {
     const child = React.Children.only(children);
     return React.cloneElement(child, {
       href: url,
-      ref: ref,
+      ref: setRef,
       onClick: clickHandler(url, replace, scroll, child.props.onClick),
+      onMouseEnter: internal ? intentHandler(url, child.props.onMouseEnter) : child.props.onMouseEnter,
+      onTouchStart: internal ? intentHandler(url, child.props.onTouchStart) : child.props.onTouchStart,
     });
   }
   return React.createElement(
     "a",
-    Object.assign({}, rest, { ref: ref, href: url, onClick: clickHandler(url, replace, scroll, onClick) }),
+    Object.assign({}, rest, {
+      ref: setRef,
+      href: url,
+      onClick: clickHandler(url, replace, scroll, onClick),
+      onMouseEnter: internal ? intentHandler(url, rest.onMouseEnter) : rest.onMouseEnter,
+      onTouchStart: internal ? intentHandler(url, rest.onTouchStart) : rest.onTouchStart,
+      onFocus: internal ? intentHandler(url, rest.onFocus) : rest.onFocus,
+    }),
     children,
   );
 });

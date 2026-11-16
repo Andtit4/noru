@@ -68,12 +68,17 @@ function useApplyAttributes(element, attrs) {
   );
 }
 
+// `noru build` renders pages with Node.js: the attributes go to the generated HTML.
+const ssr = typeof window !== "undefined" ? window.__NORU_SSR__ : null;
+
 function Html(props) {
+  if (ssr) ssr.html = props;
   useApplyAttributes(document.documentElement, props);
   return props.children === undefined ? null : props.children;
 }
 
 function Body(props) {
+  if (ssr) ssr.body = props;
   useApplyAttributes(document.body, props);
   return props.children === undefined ? null : props.children;
 }

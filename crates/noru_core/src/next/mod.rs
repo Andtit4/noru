@@ -7,6 +7,7 @@
 //! `next/image`, `next/font/google`...). All generated modules are virtual: they only exist in
 //! memory, under `node_modules/.noru-next/`, nothing is written to the project.
 
+pub mod prerender;
 pub mod server;
 
 use std::collections::HashMap;
@@ -36,6 +37,14 @@ pub const HTML: &str = "<!doctype html>
 const ENTRY: &str = "import { start } from \"noru-next/router\";
 import * as routes from \"noru-next/routes\";
 start(routes);
+";
+
+/// Entry of the bundle `noru build` runs with Node.js to render the pages to HTML.
+const PRERENDER: &str = "import * as React from \"react\";
+import * as server from \"react-dom/server\";
+import { prerenderApp } from \"noru-next/router\";
+import * as routes from \"noru-next/routes\";
+globalThis.__noru_prerender = { React: React, server: server, render: function (href) { return prerenderApp(routes, href); } };
 ";
 
 const SINGLE_FILE_MODULES: &[(&str, &str)] = &[
@@ -170,12 +179,16 @@ pub struct NextApp {
     middleware: Option<PathBuf>,
     /// Route handlers (`route.ts`): (URL pattern like `/api/items/[id]`, file).
     routes: Vec<(String, PathBuf)>,
+    /// Production build split in chunks: route files are loaded with `import()`.
+    split: bool,
+    /// Pages: (URL pattern, layouts and other segment files..., page).
+    pages: Vec<(String, Vec<PathBuf>)>,
 }
 
 const MISSING_QUERY: &str = "?noru-missing=";
 
 impl NextApp {
-    pub fn load(root: &Path, app_dir: &Path, lenient: bool) -> Self {
+    pub fn load(root: &Path, app_dir: &Path, lenient: bool, split: bool) -> Self {
         let virtual_dir = normalize_path(&root.join(VIRTUAL_DIR));
         let mut files = HashMap::new();
         for (name, source) in SINGLE_FILE_MODULES {
@@ -186,6 +199,7 @@ impl NextApp {
         }
         files.insert(virtual_dir.join("unsupported.js"), UNSUPPORTED_MODULE.to_string());
         files.insert(virtual_dir.join("entry.js"), ENTRY.to_string());
+        files.insert(virtual_dir.join("prerender.js"), PRERENDER.to_string());
         let mut app = Self {
             root: root.to_path_buf(),
             app_dir: app_dir.to_path_buf(),
@@ -196,6 +210,8 @@ impl NextApp {
             lenient,
             middleware: None,
             routes: Vec::new(),
+            split,
+            pages: Vec::new(),
         };
         app.refresh();
         app
@@ -273,7 +289,9 @@ impl NextApp {
         let mut report = ScanReport::default();
         let tree = scan(&self.app_dir, String::new(), true, &mut report);
         let icons = find_icons(&self.app_dir);
-        let code = generate_routes(&self.root, &tree, report.global_error.as_deref(), &icons);
+        let code = generate_routes(&self.root, &tree, report.global_error.as_deref(), &icons, self.split);
+        self.pages.clear();
+        collect_pages(&tree, "", &mut Vec::new(), &mut self.pages);
         self.files.insert(self.virtual_dir.join("routes.js"), code);
         self.page_count = count_pages(&tree);
         self.notices = report.notices(&self.root);
@@ -295,8 +313,18 @@ impl NextApp {
         self.virtual_dir.join("entry.js")
     }
 
+    /// Entry of the bundle used to render the pages to HTML at build time.
+    pub fn prerender_entry(&self) -> PathBuf {
+        self.virtual_dir.join("prerender.js")
+    }
+
     pub fn app_dir(&self) -> &Path {
         &self.app_dir
+    }
+
+    /// Pages: (URL pattern like `/blog/[slug]`, the route files it needs: layouts..., page).
+    pub fn pages(&self) -> &[(String, Vec<PathBuf>)] {
+        &self.pages
     }
 
     pub fn page_count(&self) -> usize {
@@ -458,20 +486,48 @@ fn find_icons(app_dir: &Path) -> Vec<(&'static str, PathBuf)> {
 
 /// `require("./app/page.tsx")`, relative to the project root.
 fn require_js(root: &Path, path: &Path) -> String {
+    load_js(root, path, false)
+}
+
+/// `require("./app/page.tsx")`, or `import("./app/page.tsx")` (its own chunk) when `asynchronous`.
+fn load_js(root: &Path, path: &Path, asynchronous: bool) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
-    format!("require({})", serde_json::to_string(&format!("./{rel}")).unwrap_or_default())
+    let specifier = serde_json::to_string(&format!("./{rel}")).unwrap_or_default();
+    if asynchronous {
+        format!("import({specifier})")
+    } else {
+        format!("require({specifier})")
+    }
 }
 
 /// Route files are loaded lazily (`function () { return require(...) }`): a page module only runs
-/// when the page is visited, so a broken page does not break the others (like Next.js).
-fn node_js(root: &Path, node: &RouteNode) -> String {
+/// when the page is visited, so a broken page does not break the others (like Next.js). In split
+/// production builds they are `import()`s: each page and layout is downloaded when needed.
+fn node_js(root: &Path, node: &RouteNode, asynchronous: bool) -> String {
     let mut fields = vec![format!("s: {}", serde_json::to_string(&node.segment).unwrap_or_default())];
     for (key, path) in &node.files {
-        fields.push(format!("{key}: function () {{ return {}; }}", require_js(root, path)));
+        fields.push(format!("{key}: function () {{ return {}; }}", load_js(root, path, asynchronous)));
     }
-    let children: Vec<String> = node.children.iter().map(|child| node_js(root, child)).collect();
+    let children: Vec<String> = node.children.iter().map(|child| node_js(root, child, asynchronous)).collect();
     fields.push(format!("children: [{}]", children.join(", ")));
     format!("{{ {} }}", fields.join(", "))
+}
+
+/// Pages with the route files they need: (URL pattern, layouts... then page).
+fn collect_pages(node: &RouteNode, url: &str, chain: &mut Vec<PathBuf>, out: &mut Vec<(String, Vec<PathBuf>)>) {
+    let added = node.files.iter().filter(|(k, _)| *k != "page").count();
+    chain.extend(node.files.iter().filter(|(k, _)| *k != "page").map(|(_, p)| p.clone()));
+    if let Some((_, page)) = node.files.iter().find(|(k, _)| *k == "page") {
+        let mut files = chain.clone();
+        files.push(page.clone());
+        out.push((if url.is_empty() { "/".to_string() } else { url.to_string() }, files));
+    }
+    for child in &node.children {
+        let is_group = child.segment.starts_with('(') && child.segment.ends_with(')');
+        let child_url = if is_group { url.to_string() } else { format!("{url}/{}", child.segment) };
+        collect_pages(child, &child_url, chain, out);
+    }
+    chain.truncate(chain.len() - added);
 }
 
 /// The route tree module (CommonJS, so that `require` can load route files on demand).
@@ -480,14 +536,15 @@ fn generate_routes(
     tree: &RouteNode,
     global_error: Option<&Path>,
     icons: &[(&'static str, PathBuf)],
+    asynchronous: bool,
 ) -> String {
-    let global_error_js =
-        global_error.map_or("null".to_string(), |p| format!("function () {{ return {}; }}", require_js(root, p)));
+    let global_error_js = global_error
+        .map_or("null".to_string(), |p| format!("function () {{ return {}; }}", load_js(root, p, asynchronous)));
     let icons_js: Vec<String> =
         icons.iter().map(|(rel, path)| format!("{{ rel: \"{rel}\", href: {} }}", require_js(root, path))).collect();
     format!(
         "exports.tree = {};\nexports.globalError = {global_error_js};\nexports.icons = [{}];\n",
-        node_js(root, tree),
+        node_js(root, tree, asynchronous),
         icons_js.join(", ")
     )
 }
@@ -541,14 +598,14 @@ mod tests {
         }
 
         assert_eq!(detect(&root), Some(app.clone()));
-        let next = NextApp::load(&root, &app, true);
+        let next = NextApp::load(&root, &app, true, false);
         let (path, query, _) = next.missing_module("cannot resolve \"./x?a&b\"", &app.join("page.tsx")).unwrap();
         let source = next.missing_source(&path, Some(&query)).unwrap();
         assert_eq!(
             source,
             "throw new Error(\"Module not found: cannot resolve \\\"./x?a&b\\\" (in app/page.tsx)\");\n"
         );
-        assert!(NextApp::load(&root, &app, false).missing_module("x", &app).is_none());
+        assert!(NextApp::load(&root, &app, false, false).missing_module("x", &app).is_none());
         let routes = next.source(&next.virtual_dir.join("routes.js")).unwrap();
         assert!(routes.contains("layout: function () { return require(\"./app/layout.tsx\"); }"), "{routes}");
         assert!(
