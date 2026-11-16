@@ -34,6 +34,7 @@ export const Playable = React.forwardRef(function Playable(props, ref) {
     muted = false,
     language,
     player,
+    autoFocus = false,
     autoPause = true,
     storage,
     loading,
@@ -56,6 +57,7 @@ export const Playable = React.forwardRef(function Playable(props, ref) {
   const [shown, setShown] = React.useState(false)
   const callbacks = {
     storage,
+    autoFocus,
     onConnect: () => {
       setShown(false)
       if (onConnect) onConnect()

@@ -66,6 +66,7 @@ export default function GamePage() {
 | `onScore(score)` | — | a score from the game; throw / reject to refuse it |
 | `onReady`, `onFirstFrame`, `onError`, `onWarning`, `onPause`, `onResume` | — | events |
 | `paused`, `muted` | `false` | control the game from the page |
+| `autoFocus` | `false` | give the keyboard focus to the game once it is shown (keyboard games) |
 | `autoPause` | `true` | pause when the tab is hidden or the game is less than 25 % visible |
 | `language` | browser language | given to the game |
 | `player` | — | the logged-in user `{ name, avatar }`, shown by the game (picture: same website or `data:` URL) |
