@@ -167,6 +167,12 @@ export const MACHINES: Record<MachineId, { level: number; price: number }> = {
   truck: { level: 3, price: 300 },
   tractor: { level: 4, price: 450 },
 }
+/**
+ * A farmhand to hire for a while: harvests ripe fields (and replants them), collects the animals'
+ * products and the workshops' goods. Each hire adds `duration` seconds of work.
+ */
+export const HELPER = { level: 3, price: 120, duration: 600, maxAhead: 3600, actionTime: 2 }
+
 /** Seconds of a delivery trip of the truck. */
 export const TRUCK_TRIP = 14
 
@@ -246,6 +252,8 @@ export interface Save {
   decor: { kind: DecorKind; x: number; y: number }[]
   /** Delivery truck on the road (returnAt 0: at the farm). */
   truck: { returnAt: number; coins: number; xp: number }
+  /** Farmhand: works until this game clock. */
+  helper: { hiredUntil: number }
 }
 
 export interface OrderState {
@@ -276,6 +284,7 @@ export const NEW_SAVE = (): Save => ({
   silo: 0,
   decor: [],
   truck: { returnAt: 0, coins: 0, xp: 0 },
+  helper: { hiredUntil: 0 },
 })
 
 /** Time away that counts (the farm works up to 12 hours without the player). */

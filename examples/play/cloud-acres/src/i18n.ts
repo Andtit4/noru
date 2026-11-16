@@ -2,6 +2,11 @@ import type { ItemId, PlaceKind, AnimalKind, WorkshopKind, DecorKind } from './d
 
 const fr = {
   shop: 'Boutique',
+  helperName: 'Ouvrier agricole',
+  helperHelp: 'Récolte et replante, ramasse œufs, lait… · +10 min',
+  helperTag: 'Aide',
+  clickToFocus: 'Cliquez sur le jeu pour jouer au clavier',
+  clickToStart: 'Cliquez sur le jeu pour commencer',
   tabs: ['Terrains', 'Machines', 'Déco'],
   owned: 'Acquis',
   max: 'Max',
@@ -78,6 +83,11 @@ const fr = {
 
 const en: typeof fr = {
   shop: 'Shop',
+  helperName: 'Farmhand',
+  helperHelp: 'Harvests and replants, collects eggs, milk… · +10 min',
+  helperTag: 'Helper',
+  clickToFocus: 'Click the game to play with the keyboard',
+  clickToStart: 'Click the game to start',
   tabs: ['Land', 'Machines', 'Decor'],
   owned: 'Owned',
   max: 'Max',

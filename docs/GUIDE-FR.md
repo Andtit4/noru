@@ -296,6 +296,10 @@ Le premier jeu, **Cloud Acres** (`examples/play/cloud-acres/`), est une ferme vu
   livraison** (il livre les commandes prêtes tout seul, même pendant l'absence), arrosage (pousse
   plus rapide), silos (grange plus grande, elle a maintenant une limite) et décorations à placer où
   l'on veut (fleurs, botte de foin, banc, lampadaire, épouvantail, fontaine).
+- **l'ouvrier agricole** (boutique, onglet Machines, dès le niveau 3) : on le paie 120 pièces pour
+  10 minutes de travail (jusqu'à une heure d'avance) ; il va tout seul récolter et replanter les
+  champs mûrs, ramasser œufs, lait, laine, truffes et les produits des ateliers, même pendant
+  l'absence du joueur.
 
 Tout est dessiné par le code (aucune image). **Au clavier** : les flèches (ou ZQSD / WASD)
 font marcher le fermier, qui plante et récolte en passant sur les champs ; Espace utilise ce qui

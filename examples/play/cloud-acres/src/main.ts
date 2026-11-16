@@ -27,6 +27,7 @@ import {
   SPRINKLER_LEVEL,
   SILO_PRICES,
   SILO_LEVEL,
+  HELPER,
   type DecorKind,
   type MachineId,
   type Zone,
@@ -37,7 +38,7 @@ import {
 } from './data'
 import { drawAnimal, drawBarn, drawBoard, drawFence, drawItem, drawPond, drawTree, drawTrough, drawWorkshop } from './art'
 import { VILLAGERS, drawCloud, drawCoin, drawPlant, drawPlot, drawVillager, roundRect, star4 } from './draw'
-import { Farm, ORDER_SLOTS, type Missing } from './farm'
+import { Farm, ORDER_SLOTS, type HelperTask, type Missing } from './farm'
 import { texts } from './i18n'
 import { drawDecor, drawFarmer, drawFarmerFace, drawForest, drawSilo, drawSprinkler, drawTractor, drawTruck, type Look } from './extras'
 
@@ -89,6 +90,70 @@ const farmer = { x: HOME.x, y: HOME.y, tx: HOME.x, ty: HOME.y, facing: 1, idle: 
 const TRACTOR_HOME = { x: 1.3 * TILE, y: 4.75 * TILE }
 const tractor = { x: TRACTOR_HOME.x, y: TRACTOR_HOME.y, facing: 1, job: null as null | { place: Place; order: number[]; i: number } }
 const TRUCK_HOME = { x: 8.7 * TILE, y: 3.75 * TILE }
+// The farmhand (when hired) walks to ripe plots, animals and workshops.
+const HELPER_HOME = { x: 2.2 * TILE, y: 5 * TILE }
+const helper = { x: HELPER_HOME.x, y: HELPER_HOME.y, facing: 1, task: null as HelperTask | null, wait: 0 }
+const HELPER_LOOK: Look = { skin: SKINS[3], shirt: '#7bc950', pants: '#5c4a3d', hat: 'straw' }
+let helperFullAt = -10
+
+function taskPoint(task: HelperTask) {
+  if (task.kind === 'plot') return { x: (task.place.x + (task.index % task.place.w) + 0.5) * TILE, y: (task.place.y + Math.floor(task.index / task.place.w) + 0.8) * TILE }
+  return { x: (task.place.x + task.place.w / 2) * TILE, y: (task.place.y + task.place.h) * TILE + 12 }
+}
+
+function updateHelper(dt: number) {
+  if (!farm.helperActive()) {
+    helper.task = null
+    helper.x = HELPER_HOME.x
+    helper.y = HELPER_HOME.y
+    return
+  }
+  helper.wait -= dt
+  if (!helper.task && helper.wait <= 0) {
+    // The nearest thing to do.
+    let best: HelperTask | null = null
+    let bestD = Infinity
+    for (const task of farm.helperTasks()) {
+      const p = taskPoint(task)
+      const d = Math.hypot(p.x - helper.x, p.y - helper.y)
+      if (d < bestD) {
+        bestD = d
+        best = task
+      }
+    }
+    helper.task = best
+    if (!best) helper.wait = 1
+  }
+  const target = helper.task ? taskPoint(helper.task) : HELPER_HOME
+  const dx = target.x - helper.x
+  const dy = target.y - helper.y
+  const d = Math.hypot(dx, dy)
+  if (d > 3) {
+    const step = Math.min(d, 150 * dt)
+    helper.x += (dx / d) * step
+    helper.y += (dy / d) * step
+    if (Math.abs(dx) > 1) helper.facing = dx > 0 ? 1 : -1
+    return
+  }
+  if (!helper.task) return
+  const task = helper.task
+  helper.task = null
+  helper.wait = 0.45
+  const result = farm.helperDo(task)
+  if (result === 'full') {
+    if (clock - helperFullAt > 5) {
+      helperFullAt = clock
+      barnFull(helper.x, helper.y - 60)
+    }
+    helper.wait = 3
+  } else if (result) {
+    sound.harvest(2)
+    burst(helper.x, helper.y - 20, 8, ['#7bc950', '#ffe08a', '#fff'], 0.5)
+    flyToBarn(result.item, helper.x, helper.y - 20, result.count)
+    floatText(helper.x, helper.y - 66, `+${result.count} ${t.items[result.item]}`, '#e8ffd6', 14)
+    changed()
+  }
+}
 
 function look(): Look {
   const a = farm.s.avatar
@@ -699,6 +764,7 @@ function update(dt: number) {
   if (started && !paused) farm.advance(dt * speedUp)
   updateWalkers(dt)
   updateFarmer(dt)
+  if (started && !paused) updateHelper(dt)
   if (followCamera) {
     const k = Math.min(1, dt * 4)
     cam.x += (farmer.x - cam.x) * k
@@ -994,6 +1060,22 @@ function drawWorld() {
   if (farm.s.silo > 0) tall.push({ y: 3.7 * TILE, draw: () => drawSilo(ctx, 0.35 * TILE, 0.7 * TILE, 1.25 * TILE, 3 * TILE, farm.s.silo) })
   const farmerWalking = Math.hypot(farmer.tx - farmer.x, farmer.ty - farmer.y) > 2
   tall.push({ y: farmer.y, draw: () => drawFarmer(ctx, look(), farmer.x, farmer.y, 46, clock, farmer.facing, farmerWalking) })
+  if (farm.helperActive()) {
+    const walking = !!helper.task
+    tall.push({
+      y: helper.y,
+      draw: () => {
+        drawFarmer(ctx, HELPER_LOOK, helper.x, helper.y, 44, clock + 1.7, helper.facing, walking)
+        const label = `${t.helperTag} · ${Math.ceil(farm.helperLeft() / 60)} min`
+        ctx.font = '800 11px ' + FONT
+        const w = ctx.measureText(label).width + 14
+        ctx.fillStyle = 'rgba(70, 120, 40, 0.85)'
+        roundRect(ctx, helper.x - w / 2, helper.y + 4, w, 18, 9)
+        ctx.fill()
+        text(label, helper.x, helper.y + 13, 11, '#fff', 'center', 800, null)
+      },
+    })
+  }
   if (keyboard && started && !panel) {
     const near = nearPlace() || null
     const zone = near ? null : nearZone()
@@ -1368,7 +1450,7 @@ function drawBuyPanel(place: Place) {
 }
 
 /** A row of the shop: icon, name, help, and a price button / owned / level. */
-function shopRow(x: number, y: number, w: number, h: number, icon: () => void, name: string, help: string, level: number, price: number | null, buy: () => void) {
+function shopRow(x: number, y: number, w: number, h: number, icon: () => void, name: string, help: string, level: number, price: number | null, buy: () => void, doneLabel = t.owned + ' ✓') {
   ctx.fillStyle = '#f3ead9'
   roundRect(ctx, x, y, w, h - 8 * ui, 14 * ui)
   ctx.fill()
@@ -1379,7 +1461,7 @@ function shopRow(x: number, y: number, w: number, h: number, icon: () => void, n
   const bw = 104 * ui
   const bh = 36 * ui
   const bx = x + w - bw - 10 * ui
-  if (price === null) text(t.owned + ' ✓', bx + bw / 2, mid, 15 * ui, '#5c9e3a', 'center', 900, null)
+  if (price === null) text(doneLabel, bx + bw / 2, mid, 15 * ui, '#5c9e3a', 'center', 900, null)
   else if (farm.level < level) text('🔒 ' + t.levelNeeded + ' ' + level, bx + bw / 2, mid, 13 * ui, '#8a7a6a', 'center', 800, null)
   else {
     button('    ' + price, bx, mid - bh / 2, bw, bh, '#ffb627', farm.s.coins >= price, buy)
@@ -1418,7 +1500,7 @@ function drawShopPanel() {
   const x = box.x + 16 * ui
   const w = box.w - 32 * ui
   let y = box.y + 56 * ui
-  const rowH = Math.min(78 * ui, (box.h - 66 * ui) / 4)
+  const rowH = Math.min(78 * ui, (box.h - 66 * ui) / (shopTab === 1 ? 5 : 4))
   if (shopTab === 0) {
     for (const zone of ZONES) {
       shopRow(x, y, w, rowH, () => {
@@ -1433,6 +1515,19 @@ function drawShopPanel() {
       y += rowH
     }
   } else if (shopTab === 1) {
+    const hy = y
+    const left = farm.helperLeft()
+    const helperName = left > 0 ? `${t.helperName} · ${Math.ceil(left / 60)} min` : t.helperName
+    const atMax = left + HELPER.duration > HELPER.maxAhead
+    shopRow(x, y, w, rowH, () => drawFarmer(ctx, HELPER_LOOK, x + rowH * 0.45, hy + rowH * 0.78, rowH * 0.62, clock, 1, false), helperName, t.helperHelp, HELPER.level, atMax ? null : HELPER.price, () => {
+      const result = farm.hireHelper()
+      bought(result)
+      if (result === 'ok') {
+        helper.x = HELPER_HOME.x
+        helper.y = HELPER_HOME.y
+      }
+    }, t.max)
+    y += rowH
     const machines: MachineId[] = ['truck', 'tractor']
     for (const id of machines) {
       const iy = y
@@ -1623,7 +1718,7 @@ function drawTitle() {
   text('ACRES', width / 2, height * 0.3 + 70 * s, 72 * s, '#ffe08a', 'center', 900, 'rgba(150, 80, 20, 0.95)')
   text(t.tagline, width / 2, height * 0.3 + 124 * s, 22 * s, '#fff', 'center', 800)
   ctx.globalAlpha = 0.6 + 0.4 * Math.sin(clock * 4)
-  text(keyboard ? t.pressToStart : t.tapToStart, width / 2, height * 0.78, 30 * s, '#fff', 'center', 900)
+  text(keyboard ? (document.hasFocus() ? t.pressToStart : t.clickToStart) : t.tapToStart, width / 2, height * 0.78, 30 * s, '#fff', 'center', 900)
   ctx.globalAlpha = 1
   const help = keyboard ? t.howToKeys : t.howTo
   text(help, width / 2, height * 0.78 + 40 * s, Math.min(15 * s, (width / help.length) * 1.7), '#fff', 'center', 700)
@@ -1648,6 +1743,14 @@ function draw() {
   else if (panel === 'avatar') drawAvatarPanel()
   else if (panel && 'zone' in panel) drawZonePanel(panel.zone)
   else if (panel) drawBuyPanel(panel.buy)
+  if (keyboard && !document.hasFocus() && !paused && !panel) {
+    // Keys go to the page around the game until it is clicked.
+    const w = Math.min(width - 40, 380 * ui)
+    ctx.fillStyle = 'rgba(40, 30, 60, 0.8)'
+    roundRect(ctx, (width - w) / 2, height - 130 * ui, w, 34 * ui, 17 * ui)
+    ctx.fill()
+    text('⌨ ' + t.clickToFocus, width / 2, height - 113 * ui, 13 * ui, '#fff', 'center', 800, null)
+  }
   if (paused) {
     ctx.fillStyle = 'rgba(30, 20, 40, 0.5)'
     ctx.fillRect(0, 0, width, height)
