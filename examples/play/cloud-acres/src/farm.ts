@@ -3,6 +3,7 @@
 // moves forward by the time spent away.
 
 import {
+  HELPER,
   BARN_BASE,
   DECORS,
   MACHINES,
@@ -37,6 +38,8 @@ export type Missing = { item: ItemId; count: number }[]
 export const ORDER_SLOTS = 3
 
 export type Buy = 'ok' | 'level' | 'coins' | 'max'
+export type HelperTask = { kind: 'plot'; place: Place; index: number } | { kind: 'pen'; place: Place } | { kind: 'workshop'; place: Place }
+export type HelperResult = { item: ItemId; count: number } | 'full' | null
 export type FarmEvent = { type: 'truck-out' } | { type: 'truck-back'; coins: number }
 
 export class Farm {
@@ -52,8 +55,67 @@ export class Farm {
     if (saved && saved.version === 2) {
       this.away = Math.min(Math.max((Date.now() - saved.savedAt) / 1000, 0), MAX_AWAY)
       this.s.clock += this.away
+      // The farmhand kept working while the game was closed.
+      const start = this.s.clock - this.away
+      const worked = Math.max(0, Math.min(this.away, this.s.helper.hiredUntil - start))
+      for (let i = 0; i < Math.floor(worked / HELPER.actionTime); i++) {
+        const task = this.helperTasks()[0]
+        if (!task || this.helperDo(task) === 'full') break
+      }
     }
     this.ensureOrders()
+  }
+
+  // --- farmhand ---------------------------------------------------------------------------------
+
+  helperActive() {
+    return this.s.helper.hiredUntil > this.clock
+  }
+
+  /** Seconds of work left. */
+  helperLeft() {
+    return Math.max(0, this.s.helper.hiredUntil - this.clock)
+  }
+
+  hireHelper(): Buy {
+    if (this.helperLeft() + HELPER.duration > HELPER.maxAhead) return 'max'
+    const result = this.pay(HELPER.level, HELPER.price)
+    if (result === 'ok') this.s.helper = { hiredUntil: Math.max(this.clock, this.s.helper.hiredUntil) + HELPER.duration }
+    return result
+  }
+
+  /** What the farmhand can do now. */
+  helperTasks(): HelperTask[] {
+    const tasks: HelperTask[] = []
+    for (const place of PLACES) {
+      if (!this.usable(place)) continue
+      if (place.kind === 'field') {
+        this.plots(place).forEach((plot, index) => {
+          if (plot.crop && plot.readyAt <= this.clock) tasks.push({ kind: 'plot', place, index })
+        })
+      } else if (place.kind === 'pen' && this.penStatus(place) === 'ready') tasks.push({ kind: 'pen', place })
+      else if (place.kind === 'workshop' && this.readyCount(place) > 0) tasks.push({ kind: 'workshop', place })
+    }
+    return tasks
+  }
+
+  /** Does a task (if it is still to do): harvest and replant, or collect. */
+  helperDo(task: HelperTask): HelperResult {
+    if (task.kind === 'plot') {
+      const crop = this.plots(task.place)[task.index].crop
+      const result = this.harvest(task.place, task.index)
+      if (result === 'full') return 'full'
+      if (!result || !crop) return null
+      this.plant(task.place, task.index, crop)
+      return { item: crop, count: 1 }
+    }
+    if (task.kind === 'pen') {
+      const product = this.collectPen(task.place)
+      return product === 'full' ? 'full' : product
+    }
+    const count = this.collectWorkshop(task.place)
+    if (count === 'full') return 'full'
+    return count ? { item: WORKSHOPS[task.place.workshop!].output, count } : null
   }
 
   get clock() {
