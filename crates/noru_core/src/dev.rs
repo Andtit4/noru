@@ -628,6 +628,8 @@ fn handle(mut stream: TcpStream, shared: &Shared) -> std::io::Result<()> {
 
     match path.as_str() {
         "/@noru/events" => return events(stream, shared),
+        // Multiplayer rooms of noru-play games.
+        crate::play_server::PATH => return crate::play_server::handle(stream, &req, crate::play_server::shared()),
         "/@noru/client.js" => {
             return send(&mut stream, &req, dev_ok("text/javascript; charset=utf-8", CLIENT.as_bytes()));
         }

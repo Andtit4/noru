@@ -92,6 +92,19 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
     },
+    /// Run the multiplayer rooms server of noru-play games (WebSocket). Uses $PORT when set.
+    PlayServer {
+        #[arg(long, short, env = "PORT", default_value_t = 4040)]
+        port: u16,
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+        /// Players per room
+        #[arg(long, default_value_t = 16)]
+        max_players: usize,
+        /// Origin of a website allowed to connect, e.g. https://example.com (repeat it; default: any)
+        #[arg(long = "allow-origin", value_name = "ORIGIN")]
+        allow_origin: Vec<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -116,6 +129,27 @@ fn main() -> ExitCode {
         }
         Command::Start { root, out_dir, port, host } => serve_build(root, out_dir, port, host),
         Command::Preview { root, out_dir, port, host } => serve_build(root, out_dir, port, host),
+        Command::PlayServer { port, host, max_players, allow_origin } => {
+            let config = noru_core::RoomsConfig { max_players: max_players.max(1), allowed_origins: allow_origin };
+            match noru_core::PlayServer::start(&host, port, config) {
+                Ok(server) => {
+                    let port = server.local_addr().port();
+                    let shown = if host == "0.0.0.0" || host == "127.0.0.1" { "localhost" } else { host.as_str() };
+                    println!(
+                        "\n  {} multiplayer rooms server\n\n  {}  Local:   {}\n",
+                        color("36;1", "noru play"),
+                        color("32", "➜"),
+                        color("36", &format!("ws://{shown}:{port}/"))
+                    );
+                    server.wait();
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{} cannot listen on {host}:{port}: {e}", color("31;1", "x"));
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Command::Build {
             root,
             out_dir,

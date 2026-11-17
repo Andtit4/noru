@@ -20,6 +20,11 @@ module.exports = {
    * @param {import('./index').DevOptions} [options]
    */
   startDevServer: (options) => binding.startDevServer(options),
+  /**
+   * Start the multiplayer rooms server of noru-play games.
+   * @param {import('./index').PlayServerOptions} [options]
+   */
+  startPlayServer: (options) => binding.startPlayServer(options),
   preview,
   version: require('./package.json').version,
   coreVersion: binding.coreVersion(),

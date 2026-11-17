@@ -836,7 +836,9 @@ function __napiStampBindingTarget(exportsObject, target) {
 module.exports.__napiBindingTarget = __napiStampBindingTarget(nativeBinding, __napiLoadedBindingTarget)
 module.exports = nativeBinding
 module.exports.DevServer = nativeBinding.DevServer
+module.exports.PlayServer = nativeBinding.PlayServer
 module.exports.build = nativeBinding.build
 module.exports.buildSync = nativeBinding.buildSync
 module.exports.coreVersion = nativeBinding.coreVersion
 module.exports.startDevServer = nativeBinding.startDevServer
+module.exports.startPlayServer = nativeBinding.startPlayServer

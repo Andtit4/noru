@@ -314,6 +314,10 @@ fn is_server_code(path: &str) -> bool {
 
 fn handle_static(mut stream: TcpStream, dir: &Path, server: Option<&ServerRuntime>) -> std::io::Result<()> {
     let req = read_request(&stream)?;
+    // Multiplayer rooms of noru-play games.
+    if req.path == crate::play_server::PATH {
+        return crate::play_server::handle(stream, &req, crate::play_server::shared());
+    }
     // Client-side navigations ask the middleware first.
     if let (Some(runtime), "/@noru/middleware") = (server, req.path.as_str()) {
         return middleware_endpoint(runtime, &mut stream, &req);

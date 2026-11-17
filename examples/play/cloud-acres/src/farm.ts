@@ -3,7 +3,14 @@
 // moves forward by the time spent away.
 
 import {
-  HELPER,
+  WORKER,
+  WORKERS,
+  WORKER_IDS,
+  UPGRADES,
+  MAX_UPGRADE,
+  type UpgradeId,
+  type WorkerId,
+  type SaveV2,
   BARN_BASE,
   DECORS,
   MACHINES,
@@ -38,9 +45,28 @@ export type Missing = { item: ItemId; count: number }[]
 export const ORDER_SLOTS = 3
 
 export type Buy = 'ok' | 'level' | 'coins' | 'max'
-export type HelperTask = { kind: 'plot'; place: Place; index: number } | { kind: 'pen'; place: Place } | { kind: 'workshop'; place: Place }
-export type HelperResult = { item: ItemId; count: number } | 'full' | null
+/** A job of a worker: harvest a plot, collect or feed a pen, collect or start a workshop. */
+export type WorkerTask =
+  | { kind: 'plot'; place: Place; index: number }
+  | { kind: 'pen'; place: Place }
+  | { kind: 'feed'; place: Place }
+  | { kind: 'workshop'; place: Place }
+  | { kind: 'start'; place: Place }
+export type WorkerResult = { item: ItemId; count: number } | 'fed' | 'started' | 'full' | null
 export type FarmEvent = { type: 'truck-out' } | { type: 'truck-back'; coins: number }
+
+/** A save of any version, as the newest one. */
+function upgradeSave(saved: Save | SaveV2): Save {
+  const fresh = NEW_SAVE()
+  const s = { ...fresh, ...saved, version: 3 } as Save & { helper?: { hiredUntil: number } }
+  s.workers = { ...fresh.workers, ...(saved.version === 3 ? saved.workers : {}) }
+  s.upgrades = { ...fresh.upgrades, ...(saved.version === 3 ? saved.upgrades : {}) }
+  s.credited = saved.version === 3 && Array.isArray(saved.credited) ? saved.credited : []
+  // Version 2 had one farmhand: they become the field hand.
+  if (saved.version === 2 && saved.helper) s.workers.field = { until: saved.helper.hiredUntil, forever: false }
+  delete s.helper
+  return s
+}
 
 export class Farm {
   s: Save
@@ -50,72 +76,175 @@ export class Farm {
   /** Things that happened by themselves (the truck), for the display. */
   events: FarmEvent[] = []
 
-  constructor(saved: Save | null) {
-    this.s = saved && saved.version === 2 ? { ...NEW_SAVE(), ...saved } : NEW_SAVE()
-    if (saved && saved.version === 2) {
-      this.away = Math.min(Math.max((Date.now() - saved.savedAt) / 1000, 0), MAX_AWAY)
-      this.s.clock += this.away
-      // The farmhand kept working while the game was closed.
-      const start = this.s.clock - this.away
-      const worked = Math.max(0, Math.min(this.away, this.s.helper.hiredUntil - start))
-      for (let i = 0; i < Math.floor(worked / HELPER.actionTime); i++) {
-        const task = this.helperTasks()[0]
-        if (!task || this.helperDo(task) === 'full') break
-      }
+  constructor(saved: Save | SaveV2 | null) {
+    const known = !!saved && (saved.version === 2 || saved.version === 3)
+    this.s = known ? upgradeSave(saved!) : NEW_SAVE()
+    if (known) {
+      this.away = Math.min(Math.max((Date.now() - saved!.savedAt) / 1000, 0), MAX_AWAY)
+      this.catchUp(this.s.clock + this.away)
     }
     this.ensureOrders()
   }
 
-  // --- farmhand ---------------------------------------------------------------------------------
-
-  helperActive() {
-    return this.s.helper.hiredUntil > this.clock
+  /**
+   * The time spent away: with workers, the farm lives it step by step (crops grow again after being
+   * harvested, the truck delivers); without, the clock jumps.
+   */
+  private catchUp(end: number) {
+    const working = WORKER_IDS.some((id) => this.s.workers[id].forever || this.s.workers[id].until > this.s.clock)
+    if (!working) {
+      this.s.clock = end
+      return
+    }
+    while (this.s.clock < end) {
+      this.s.clock = Math.min(end, this.s.clock + WORKER.actionTime)
+      this.ensureOrders()
+      this.tickTruck()
+      for (const id of WORKER_IDS) {
+        if (!this.workerActive(id)) continue
+        const task = this.workerTasks(id).find((t) => t.kind !== 'plot' || this.space() > 0)
+        if (task) this.workerDo(task)
+      }
+    }
+    this.events = []
   }
 
-  /** Seconds of work left. */
-  helperLeft() {
-    return Math.max(0, this.s.helper.hiredUntil - this.clock)
+  // --- workers ----------------------------------------------------------------------------------
+
+  workerActive(id: WorkerId) {
+    const w = this.s.workers[id]
+    return w.forever || w.until > this.clock
   }
 
-  hireHelper(): Buy {
-    if (this.helperLeft() + HELPER.duration > HELPER.maxAhead) return 'max'
-    const result = this.pay(HELPER.level, HELPER.price)
-    if (result === 'ok') this.s.helper = { hiredUntil: Math.max(this.clock, this.s.helper.hiredUntil) + HELPER.duration }
+  /** Seconds of work left (Infinity when hired for good). */
+  workerLeft(id: WorkerId) {
+    const w = this.s.workers[id]
+    return w.forever ? Infinity : Math.max(0, w.until - this.clock)
+  }
+
+  /** Hires a worker for WORKER.duration more seconds. */
+  hireWorker(id: WorkerId): Buy {
+    const w = this.s.workers[id]
+    if (w.forever || this.workerLeft(id) + WORKER.duration > WORKER.maxAhead) return 'max'
+    const result = this.pay(WORKERS[id].level, WORKERS[id].price)
+    if (result === 'ok') this.s.workers[id] = { until: Math.max(this.clock, w.until) + WORKER.duration, forever: false }
     return result
   }
 
-  /** What the farmhand can do now. */
-  helperTasks(): HelperTask[] {
-    const tasks: HelperTask[] = []
+  hireWorkerForever(id: WorkerId): Buy {
+    if (this.s.workers[id].forever) return 'max'
+    const result = this.pay(WORKERS[id].level, WORKERS[id].forever)
+    if (result === 'ok') this.s.workers[id] = { until: 0, forever: true }
+    return result
+  }
+
+  /** What a worker can do now. */
+  workerTasks(id: WorkerId): WorkerTask[] {
+    const tasks: WorkerTask[] = []
     for (const place of PLACES) {
       if (!this.usable(place)) continue
-      if (place.kind === 'field') {
+      if (id === 'field' && place.kind === 'field') {
         this.plots(place).forEach((plot, index) => {
           if (plot.crop && plot.readyAt <= this.clock) tasks.push({ kind: 'plot', place, index })
         })
-      } else if (place.kind === 'pen' && this.penStatus(place) === 'ready') tasks.push({ kind: 'pen', place })
-      else if (place.kind === 'workshop' && this.readyCount(place) > 0) tasks.push({ kind: 'workshop', place })
+      } else if (id === 'animal' && place.kind === 'pen') {
+        const status = this.penStatus(place)
+        const feed = PENS[place.animal!].feed
+        if (status === 'ready') tasks.push({ kind: 'pen', place })
+        else if (status === 'hungry' && this.count(feed.item) >= feed.count) tasks.push({ kind: 'feed', place })
+      } else if (id === 'craft' && place.kind === 'workshop') {
+        if (this.readyCount(place) > 0) tasks.push({ kind: 'workshop', place })
+        else if (this.queue(place).length === 0 && this.missing(WORKSHOPS[place.workshop!].inputs).length === 0) tasks.push({ kind: 'start', place })
+      }
     }
     return tasks
   }
 
-  /** Does a task (if it is still to do): harvest and replant, or collect. */
-  helperDo(task: HelperTask): HelperResult {
+  /** Does a task (if it is still to do). */
+  workerDo(task: WorkerTask): WorkerResult {
     if (task.kind === 'plot') {
       const crop = this.plots(task.place)[task.index].crop
       const result = this.harvest(task.place, task.index)
       if (result === 'full') return 'full'
       if (!result || !crop) return null
       this.plant(task.place, task.index, crop)
-      return { item: crop, count: 1 }
+      return { item: crop, count: this.harvestYield() }
     }
     if (task.kind === 'pen') {
       const product = this.collectPen(task.place)
       return product === 'full' ? 'full' : product
     }
+    if (task.kind === 'feed') return this.penStatus(task.place) === 'hungry' && this.feed(task.place) === 'ok' ? 'fed' : null
+    if (task.kind === 'start') return this.startWorkshop(task.place) === 'ok' ? 'started' : null
     const count = this.collectWorkshop(task.place)
     if (count === 'full') return 'full'
     return count ? { item: WORKSHOPS[task.place.workshop!].output, count } : null
+  }
+
+  // --- upgrades ---------------------------------------------------------------------------------
+
+  upgradeLevel(id: UpgradeId) {
+    return this.s.upgrades[id]
+  }
+
+  /** Level and price of the next level of an upgrade, or null at the top. */
+  nextUpgrade(id: UpgradeId) {
+    const level = this.s.upgrades[id]
+    if (level >= MAX_UPGRADE) return null
+    return { level: UPGRADES[id].levels[level - 1], price: UPGRADES[id].prices[level - 1] }
+  }
+
+  buyUpgrade(id: UpgradeId): Buy {
+    const next = this.nextUpgrade(id)
+    if (!next) return 'max'
+    const result = this.pay(next.level, next.price)
+    if (result === 'ok') this.s.upgrades = { ...this.s.upgrades, [id]: this.s.upgrades[id] + 1 }
+    return result
+  }
+
+  /** Crops given by one plot (fertile fields). */
+  harvestYield() {
+    return this.s.upgrades.fields
+  }
+
+  /** Products of a pen (comfortable pens). */
+  penProduct(place: Place) {
+    const product = PENS[place.animal!].product
+    return { item: product.item, count: product.count + this.s.upgrades.pens - 1 }
+  }
+
+  /** Seconds of one production of a workshop (modern workshops). */
+  workshopTime(place: Place) {
+    return WORKSHOPS[place.workshop!].time * (1 - 0.25 * (this.s.upgrades.workshops - 1))
+  }
+
+  /** Productions waiting in a workshop at most. */
+  queueMax() {
+    return WORKSHOP_QUEUE + this.s.upgrades.workshops - 1
+  }
+
+  // --- purchases and gifts ------------------------------------------------------------------------
+
+  /** Coins bought on the website. false if this purchase was already given. */
+  creditPurchase(purchaseId: string, coins: number) {
+    if (this.s.credited.includes(purchaseId)) return false
+    this.s.coins += Math.max(0, Math.floor(coins))
+    this.s.credited = [...this.s.credited, purchaseId].slice(-50)
+    return true
+  }
+
+  /** Gives items to another player (taken from the barn). */
+  giveGift(item: ItemId, count: number) {
+    if (this.count(item) < count) return false
+    this.s.barn[item] = this.count(item) - count
+    return true
+  }
+
+  /** Items given by another player (as many as the barn can hold). */
+  receiveGift(item: ItemId, count: number) {
+    const n = Math.min(count, this.space())
+    if (n > 0) this.add(item, n)
+    return n
   }
 
   get clock() {
@@ -309,7 +438,7 @@ export class Farm {
     if (this.space() < 1) return 'full'
     const crop = plot.crop
     plot.crop = null
-    this.add(crop, 1)
+    this.add(crop, Math.min(this.harvestYield(), this.space()))
     this.addXp(1)
     return crop
   }
@@ -340,12 +469,12 @@ export class Farm {
 
   collectPen(place: Place) {
     if (this.penStatus(place) !== 'ready') return null
-    const pen = PENS[place.animal!]
-    if (this.space() < pen.product.count) return 'full' as const
-    this.add(pen.product.item, pen.product.count)
+    const product = this.penProduct(place)
+    if (this.space() < product.count) return 'full' as const
+    this.add(product.item, product.count)
     this.s.pens[place.id] = { readyAt: 0 }
-    this.addXp(2 * pen.product.count)
-    return pen.product
+    this.addXp(2 * product.count)
+    return product
   }
 
   // --- workshops --------------------------------------------------------------------------------
@@ -367,19 +496,19 @@ export class Farm {
   workshopProgress(place: Place) {
     const pending = this.queue(place).filter((t) => t > this.clock)
     if (!pending.length) return -1
-    const time = WORKSHOPS[place.workshop!].time
-    return Math.min(1, 1 - (pending[0] - this.clock) / time)
+    const time = this.workshopTime(place)
+    return Math.min(1, Math.max(0, 1 - (pending[0] - this.clock) / time))
   }
 
   startWorkshop(place: Place): 'ok' | 'full' | Missing {
     const type = WORKSHOPS[place.workshop!]
     const queue = this.queue(place)
-    if (queue.length >= WORKSHOP_QUEUE) return 'full'
+    if (queue.length >= this.queueMax()) return 'full'
     const missing = this.missing(type.inputs)
     if (missing.length) return missing
     this.take(type.inputs)
     const start = Math.max(this.clock, queue.length ? queue[queue.length - 1] : 0)
-    queue.push(start + type.time)
+    queue.push(start + this.workshopTime(place))
     return 'ok'
   }
 

@@ -2,7 +2,7 @@
 // Swipe over the fields to plant and harvest, feed the animals, run the workshops, fill the
 // villagers' orders and grow the farm. It keeps working while the game is closed.
 
-import { play } from 'noru-play'
+import { play, type Product, type Purchase, type Room, type RoomPlayer } from 'noru-play'
 import { Sound } from './audio'
 import {
   CROPS,
@@ -13,7 +13,6 @@ import {
   TILE,
   TREES,
   WORKSHOPS,
-  WORKSHOP_QUEUE,
   WORLD_H,
   WORLD_W,
   ZONES,
@@ -27,7 +26,13 @@ import {
   SPRINKLER_LEVEL,
   SILO_PRICES,
   SILO_LEVEL,
-  HELPER,
+  WORKER,
+  WORKERS,
+  WORKER_IDS,
+  UPGRADE_IDS,
+  MAX_UPGRADE,
+  type WorkerId,
+  type UpgradeId,
   type DecorKind,
   type MachineId,
   type Zone,
@@ -38,14 +43,15 @@ import {
 } from './data'
 import { drawAnimal, drawBarn, drawBoard, drawFence, drawItem, drawPond, drawTree, drawTrough, drawWorkshop } from './art'
 import { VILLAGERS, drawCloud, drawCoin, drawPlant, drawPlot, drawVillager, roundRect, star4 } from './draw'
-import { Farm, ORDER_SLOTS, type HelperTask, type Missing } from './farm'
+import { Farm, ORDER_SLOTS, type WorkerTask, type Missing } from './farm'
 import { texts } from './i18n'
 import { drawDecor, drawFarmer, drawFarmerFace, drawForest, drawSilo, drawSprinkler, drawTractor, drawTruck, type Look } from './extras'
 
 const canvas = document.getElementById('game') as HTMLCanvasElement
 const ctx = canvas.getContext('2d') as CanvasRenderingContext2D
 const sound = new Sound()
-const t = texts(play.language)
+// Language and player come from the website once noru play is connected (see the end of the file).
+let t = texts(play.language)
 const FONT = '"Trebuchet MS", "Segoe UI", system-ui, -apple-system, sans-serif'
 const WORLD_PX_W = WORLD_W * TILE
 const WORLD_PX_H = WORLD_H * TILE
@@ -64,7 +70,7 @@ let clock = 0
 let dirty = false
 let saveTimer = 0
 let selected: CropId = 'wheat'
-type Panel = null | 'barn' | 'orders' | 'shop' | 'avatar' | { buy: Place } | { zone: Zone }
+type Panel = null | 'barn' | 'orders' | 'shop' | 'avatar' | 'online' | { buy: Place } | { zone: Zone } | { visitor: string }
 let panel: Panel = null
 let toast: { title: string; text: string; life: number } | null = null
 let levelBanner: { level: number; news: string[]; life: number } | null = null
@@ -76,13 +82,17 @@ let placing: DecorKind | null = null
 let hover: { x: number; y: number } | null = null // world, for the decoration being placed
 
 // The player logged in on the website (noru play), shown in the profile badge.
-const player = play.player
+let player = play.player
 const playerImage = new Image()
 let playerImageReady = false
-if (player && player.avatar) {
-  playerImage.onload = () => (playerImageReady = true)
-  playerImage.src = player.avatar
+function loadPlayer() {
+  player = play.player
+  if (player && player.avatar && !playerImage.src) {
+    playerImage.onload = () => (playerImageReady = true)
+    playerImage.src = player.avatar
+  }
 }
+loadPlayer()
 
 // The farmer walks where the player acts; the tractor works the fields.
 const HOME = { x: 3.5 * TILE, y: 4.9 * TILE }
@@ -90,74 +100,327 @@ const farmer = { x: HOME.x, y: HOME.y, tx: HOME.x, ty: HOME.y, facing: 1, idle: 
 const TRACTOR_HOME = { x: 1.3 * TILE, y: 4.75 * TILE }
 const tractor = { x: TRACTOR_HOME.x, y: TRACTOR_HOME.y, facing: 1, job: null as null | { place: Place; order: number[]; i: number } }
 const TRUCK_HOME = { x: 8.7 * TILE, y: 3.75 * TILE }
-// The farmhand (when hired) walks to ripe plots, animals and workshops.
-const HELPER_HOME = { x: 2.2 * TILE, y: 5 * TILE }
-const helper = { x: HELPER_HOME.x, y: HELPER_HOME.y, facing: 1, task: null as HelperTask | null, wait: 0 }
-const HELPER_LOOK: Look = { skin: SKINS[3], shirt: '#7bc950', pants: '#5c4a3d', hat: 'straw' }
-let helperFullAt = -10
+// Workers (when hired) walk to ripe plots, animals and workshops, each to their own job.
+interface Worker { x: number; y: number; facing: number; task: WorkerTask | null; wait: number; fullAt: number }
+const WORKER_HOME: Record<WorkerId, { x: number; y: number }> = {
+  field: { x: 2.2 * TILE, y: 5 * TILE },
+  animal: { x: 12.5 * TILE, y: 4.55 * TILE },
+  craft: { x: 13 * TILE, y: 9.1 * TILE },
+}
+const WORKER_LOOK: Record<WorkerId, Look> = {
+  field: { skin: SKINS[3], shirt: '#7bc950', pants: '#5c4a3d', hat: 'straw' },
+  animal: { skin: SKINS[1], shirt: '#ffb627', pants: '#3d6fb6', hat: 'cap' },
+  craft: { skin: SKINS[4], shirt: '#9b6bd1', pants: '#2f3a4a', hat: 'bandana' },
+}
+const workers = Object.fromEntries(
+  WORKER_IDS.map((id) => [id, { ...WORKER_HOME[id], facing: 1, task: null, wait: 0, fullAt: -10 }]),
+) as Record<WorkerId, Worker>
 
-function taskPoint(task: HelperTask) {
+function taskPoint(task: WorkerTask) {
   if (task.kind === 'plot') return { x: (task.place.x + (task.index % task.place.w) + 0.5) * TILE, y: (task.place.y + Math.floor(task.index / task.place.w) + 0.8) * TILE }
   return { x: (task.place.x + task.place.w / 2) * TILE, y: (task.place.y + task.place.h) * TILE + 12 }
 }
 
-function updateHelper(dt: number) {
-  if (!farm.helperActive()) {
-    helper.task = null
-    helper.x = HELPER_HOME.x
-    helper.y = HELPER_HOME.y
+function updateWorker(id: WorkerId, dt: number) {
+  const w = workers[id]
+  if (!farm.workerActive(id)) {
+    w.task = null
+    w.x = WORKER_HOME[id].x
+    w.y = WORKER_HOME[id].y
     return
   }
-  helper.wait -= dt
-  if (!helper.task && helper.wait <= 0) {
+  w.wait -= dt
+  if (!w.task && w.wait <= 0) {
     // The nearest thing to do.
-    let best: HelperTask | null = null
+    let best: WorkerTask | null = null
     let bestD = Infinity
-    for (const task of farm.helperTasks()) {
+    for (const task of farm.workerTasks(id)) {
       const p = taskPoint(task)
-      const d = Math.hypot(p.x - helper.x, p.y - helper.y)
+      const d = Math.hypot(p.x - w.x, p.y - w.y)
       if (d < bestD) {
         bestD = d
         best = task
       }
     }
-    helper.task = best
-    if (!best) helper.wait = 1
+    w.task = best
+    if (!best) w.wait = 1
   }
-  const target = helper.task ? taskPoint(helper.task) : HELPER_HOME
-  const dx = target.x - helper.x
-  const dy = target.y - helper.y
+  const target = w.task ? taskPoint(w.task) : WORKER_HOME[id]
+  const dx = target.x - w.x
+  const dy = target.y - w.y
   const d = Math.hypot(dx, dy)
   if (d > 3) {
     const step = Math.min(d, 150 * dt)
-    helper.x += (dx / d) * step
-    helper.y += (dy / d) * step
-    if (Math.abs(dx) > 1) helper.facing = dx > 0 ? 1 : -1
+    w.x += (dx / d) * step
+    w.y += (dy / d) * step
+    if (Math.abs(dx) > 1) w.facing = dx > 0 ? 1 : -1
     return
   }
-  if (!helper.task) return
-  const task = helper.task
-  helper.task = null
-  helper.wait = 0.45
-  const result = farm.helperDo(task)
+  if (!w.task) return
+  const task = w.task
+  w.task = null
+  w.wait = 0.45
+  const result = farm.workerDo(task)
   if (result === 'full') {
-    if (clock - helperFullAt > 5) {
-      helperFullAt = clock
-      barnFull(helper.x, helper.y - 60)
+    if (clock - w.fullAt > 5) {
+      w.fullAt = clock
+      barnFull(w.x, w.y - 60)
     }
-    helper.wait = 3
+    w.wait = 3
+  } else if (result === 'fed') {
+    sound.plant()
+    floatText(w.x, w.y - 66, t.fed, '#e8ffd6', 14)
+    changed()
+  } else if (result === 'started') {
+    sound.plant()
+    floatText(w.x, w.y - 66, `+1 ${t.items[WORKSHOPS[task.place.workshop!].output]}…`, '#e8ffd6', 14)
+    changed()
   } else if (result) {
     sound.harvest(2)
-    burst(helper.x, helper.y - 20, 8, ['#7bc950', '#ffe08a', '#fff'], 0.5)
-    flyToBarn(result.item, helper.x, helper.y - 20, result.count)
-    floatText(helper.x, helper.y - 66, `+${result.count} ${t.items[result.item]}`, '#e8ffd6', 14)
+    burst(w.x, w.y - 20, 8, ['#7bc950', '#ffe08a', '#fff'], 0.5)
+    flyToBarn(result.item, w.x, w.y - 20, result.count)
+    floatText(w.x, w.y - 66, `+${result.count} ${t.items[result.item]}`, '#e8ffd6', 14)
     changed()
   }
 }
 
+function lookOf(a: { skin: number; hat: number; shirt: number; pants: number }): Look {
+  const at = <T>(list: readonly T[], i: number) => list[((Math.floor(i) || 0) % list.length + list.length) % list.length]
+  return { skin: at(SKINS, a.skin), shirt: at(SHIRTS, a.shirt), pants: at(PANTS, a.pants), hat: at(HATS, a.hat) }
+}
+
 function look(): Look {
+  return lookOf(farm.s.avatar)
+}
+
+// --- coins sold by the website (noru play purchases) -----------------------------------------
+
+// ?shop=test: products bought for free, to try the shop when the game runs on its own.
+if (new URLSearchParams(location.search).get('shop') === 'test') {
+  play.configure({
+    testProducts: [
+      { id: 'coins-500', title: '500', price: 'Test', coins: 500 },
+      { id: 'coins-1500', title: '1 500', price: 'Test', coins: 1500 },
+      { id: 'coins-5000', title: '5 000', price: 'Test', coins: 5000 },
+    ],
+  })
+}
+let products: Product[] | null = null // null: loading, or not sold here
+let paying = false
+
+const productCoins = (product: Product) => Math.max(0, Math.floor(Number(product.coins) || 0))
+
+/** Gives the coins of a paid purchase, saves, then tells the website it was given. */
+async function deliverPurchase(purchase: Purchase) {
+  const coins = productCoins(purchase.product)
+  if (farm.creditPurchase(purchase.purchaseId, coins)) {
+    // Saved before the website forgets the purchase: never lost, never given twice.
+    dirty = false
+    await play.save(farm.toSave())
+    toast = { title: t.thanksPurchase, text: `+${coins} ${t.coinsAdded}`, life: 3.5 }
+    flyCoins(width / 2, height / 2, coins)
+    burst(width / 2, height / 2, 50, ['#ffd54a', '#ffe08a', '#fff'], 1.6, true, true)
+    sound.golden()
+  }
+  await play.consumePurchase(purchase.purchaseId)
+}
+
+async function loadShop() {
+  if (!play.canPurchase) return
+  try {
+    products = await play.getProducts()
+    // Paid while the game was closing: given now.
+    for (const purchase of await play.getPendingPurchases()) await deliverPurchase(purchase)
+  } catch (error) {
+    play.logWarning(error)
+  }
+}
+
+function buyProduct(product: Product) {
+  if (paying) return
+  paying = true
+  play
+    .purchase(product.id)
+    .then((purchase) => {
+      if (purchase) return deliverPurchase(purchase)
+      toast = { title: t.purchaseCancelled, text: product.title, life: 2 }
+    })
+    .catch((error) => {
+      play.logWarning(error)
+      sound.denied()
+      toast = { title: t.purchaseFailed, text: String((error && error.message) || error).slice(0, 90), life: 3.5 }
+    })
+    .finally(() => (paying = false))
+}
+
+// --- multiplayer (noru play rooms): the other farmers walk on your farm -------------------------
+
+/** What each farmer shares: position, facing, walking, look and level. */
+interface Shared { x: number; y: number; f: number; w: boolean; a: number[]; l: number }
+type RoomMessage = { type: 'wave' } | { type: 'gift'; item: ItemId; count: number }
+interface Visitor { id: string; name: string; image: HTMLImageElement | null; look: Look; level: number; x: number; y: number; tx: number; ty: number; facing: number; walking: boolean; emote: { text: string; life: number } | null }
+
+let room: Room<Shared, RoomMessage> | null = null
+const visitors = new Map<string, Visitor>()
+let sentState = ''
+let stateTimer = 0
+let myEmote: { text: string; life: number } | null = null
+let roomWarned = false
+const giftsFrom = new Map<string, number>()
+
+function sharedState(): Shared {
   const a = farm.s.avatar
-  return { skin: SKINS[a.skin % SKINS.length], shirt: SHIRTS[a.shirt % SHIRTS.length], pants: PANTS[a.pants % PANTS.length], hat: HATS[a.hat % HATS.length] }
+  const walking = Math.hypot(farmer.tx - farmer.x, farmer.ty - farmer.y) > 2 || [...held].some((k) => KEYS[k])
+  return { x: Math.round(farmer.x), y: Math.round(farmer.y), f: farmer.facing, w: walking, a: [a.skin, a.hat, a.shirt, a.pants], l: farm.level }
+}
+
+function applyShared(v: Visitor, s: Shared | null) {
+  if (!s || typeof s !== 'object') return
+  const n = (value: unknown, fallback: number) => (typeof value === 'number' && Number.isFinite(value) ? value : fallback)
+  v.tx = Math.min(Math.max(n(s.x, v.tx), 0), WORLD_PX_W)
+  v.ty = Math.min(Math.max(n(s.y, v.ty), 0), WORLD_PX_H)
+  v.facing = s.f === -1 ? -1 : 1
+  v.walking = !!s.w
+  if (Array.isArray(s.a)) v.look = lookOf({ skin: n(s.a[0], 0), hat: n(s.a[1], 0), shirt: n(s.a[2], 0), pants: n(s.a[3], 0) })
+  v.level = Math.max(1, Math.floor(n(s.l, 1)))
+}
+
+function visitorOf(p: RoomPlayer<Shared>): Visitor {
+  const v: Visitor = { id: p.id, name: p.name || `${t.farmer} ${p.id.slice(-3)}`, image: null, look: lookOf({ skin: 2, hat: 1, shirt: 1, pants: 0 }), level: 1, x: HOME.x, y: HOME.y, tx: HOME.x, ty: HOME.y, facing: 1, walking: false, emote: null }
+  applyShared(v, p.state)
+  v.x = v.tx
+  v.y = v.ty
+  // Pictures of the website only (same origin, or data: URLs).
+  if (p.avatar && (p.avatar.startsWith('/') || p.avatar.startsWith('data:image/'))) {
+    v.image = new Image()
+    v.image.src = p.avatar
+  }
+  return v
+}
+
+async function joinRoom() {
+  if (room || !play.canJoinRooms) return
+  try {
+    const joined = await play.joinRoom<Shared, RoomMessage>('cloud-acres', { state: sharedState() })
+    room = joined
+    roomWarned = false
+    visitors.clear()
+    for (const p of joined.players.values()) visitors.set(p.id, visitorOf(p))
+    joined.on('join', (p) => {
+      const v = visitorOf(p)
+      visitors.set(p.id, v)
+      floatText(v.x, v.y - 74, `${v.name} ${t.arrived}`, '#ffffff', 14)
+      sound.coin()
+    })
+    joined.on('leave', (p) => {
+      visitors.delete(p.id)
+      if (panel && typeof panel === 'object' && 'visitor' in panel && panel.visitor === p.id) panel = null
+    })
+    joined.on('state', (p) => {
+      const v = visitors.get(p.id)
+      if (v) applyShared(v, p.state)
+    })
+    joined.on('message', receiveFromVisitor)
+    joined.on('close', (reason) => {
+      room = null
+      visitors.clear()
+      // Lost connection: try again a bit later.
+      if (reason !== 'left') setTimeout(joinRoom, 5000)
+    })
+  } catch (error) {
+    if (!roomWarned) play.logWarning(error)
+    roomWarned = true
+    setTimeout(joinRoom, 15000)
+  }
+}
+
+function receiveFromVisitor(data: RoomMessage, from: RoomPlayer<Shared>) {
+  const v = visitors.get(from.id)
+  if (!v || !data || typeof data !== 'object') return
+  if (data.type === 'wave') {
+    v.emote = { text: '👋 ' + t.hello, life: 2.5 }
+    sound.coin()
+  } else if (data.type === 'gift') {
+    const count = Math.floor(Number(data.count))
+    if (!Object.prototype.hasOwnProperty.call(ITEMS, data.item) || !(count >= 1 && count <= 5)) return
+    // Up to 30 gifts from each farmer per session.
+    const given = giftsFrom.get(from.id) || 0
+    if (given >= 30) return
+    giftsFrom.set(from.id, given + count)
+    const got = farm.receiveGift(data.item, count)
+    if (!got) {
+      barnFull(farmer.x, farmer.y - 60)
+      return
+    }
+    v.emote = { text: '🎁', life: 2.5 }
+    flyToBarn(data.item, v.x, v.y - 30, got)
+    toast = { title: `🎁 ${v.name}`, text: `${t.offers} ${got} ${t.items[data.item].toLowerCase()}`, life: 3.5 }
+    sound.order()
+    persist()
+  }
+}
+
+function wave(id: string) {
+  if (!room) return
+  room.send({ type: 'wave' }, id)
+  myEmote = { text: '👋 ' + t.hello, life: 2.5 }
+  sound.coin()
+}
+
+function giveTo(id: string, item: ItemId) {
+  const v = visitors.get(id)
+  if (!room || !v || !farm.giveGift(item, 1)) return
+  room.send({ type: 'gift', item, count: 1 }, id)
+  floatText(v.x, v.y - 74, `${t.giftSent} 1 ${t.items[item].toLowerCase()}`, '#fff6b3', 15)
+  sound.harvest(1)
+  changed()
+}
+
+function updateVisitors(dt: number) {
+  for (const v of visitors.values()) {
+    const dx = v.tx - v.x
+    const dy = v.ty - v.y
+    const d = Math.hypot(dx, dy)
+    if (d > 400) {
+      v.x = v.tx
+      v.y = v.ty
+    } else if (d > 1) {
+      const step = Math.min(d, Math.max(190, d * 6) * dt)
+      v.x += (dx / d) * step
+      v.y += (dy / d) * step
+      if (Math.abs(dx) > 1) v.facing = dx > 0 ? 1 : -1
+    }
+    if (v.emote && (v.emote.life -= dt) <= 0) v.emote = null
+  }
+  if (myEmote && (myEmote.life -= dt) <= 0) myEmote = null
+  stateTimer += dt
+  if (room && stateTimer > 0.15) {
+    stateTimer = 0
+    const state = sharedState()
+    const text = JSON.stringify(state)
+    if (text !== sentState) {
+      sentState = text
+      room.setState(state)
+    }
+  }
+}
+
+function visitorAt(wx: number, wy: number) {
+  for (const v of visitors.values()) if (Math.abs(wx - v.x) < 26 && wy > v.y - 64 && wy < v.y + 12) return v
+  return null
+}
+
+function nearVisitor() {
+  let best: Visitor | null = null
+  let bestD = 56
+  for (const v of visitors.values()) {
+    const d = Math.hypot(v.x - farmer.x, v.y - farmer.y)
+    if (d < bestD) {
+      bestD = d
+      best = v
+    }
+  }
+  return best
 }
 
 function goTo(x: number, y: number) {
@@ -214,6 +477,11 @@ function nearZone() {
 }
 
 function useNearby() {
+  const visitor = nearVisitor()
+  if (visitor) {
+    panel = { visitor: visitor.id }
+    return
+  }
   const place = nearPlace()
   if (place) {
     const keep = { tx: farmer.tx, ty: farmer.ty }
@@ -578,7 +846,7 @@ function actOnPlot(hit: { place: Place; index: number }) {
       chain++
       sound.harvest(chain - 1)
       burst(wx, wy, 8, [CROPS.find((c) => c.id === crop)!.color, '#7bc950', '#fff'], 0.5)
-      flyToBarn(crop, wx, wy)
+      flyToBarn(crop, wx, wy, farm.harvestYield())
       changed()
     }
   }
@@ -764,7 +1032,8 @@ function update(dt: number) {
   if (started && !paused) farm.advance(dt * speedUp)
   updateWalkers(dt)
   updateFarmer(dt)
-  if (started && !paused) updateHelper(dt)
+  if (started && !paused) for (const id of WORKER_IDS) updateWorker(id, dt)
+  updateVisitors(dt)
   if (followCamera) {
     const k = Math.min(1, dt * 4)
     cam.x += (farmer.x - cam.x) * k
@@ -863,6 +1132,46 @@ function ring(x: number, y: number, r: number, k: number, color: string) {
   ctx.beginPath()
   ctx.arc(x, y, r, -Math.PI / 2, -Math.PI / 2 + k * Math.PI * 2)
   ctx.stroke()
+}
+
+/** A small label under a character (workers, other farmers). */
+function nameTag(label: string, x: number, y: number, background: string, color: string) {
+  ctx.font = '800 11px ' + FONT
+  const w = ctx.measureText(label).width + 14
+  ctx.fillStyle = background
+  roundRect(ctx, x - w / 2, y, w, 18, 9)
+  ctx.fill()
+  text(label, x, y + 9, 11, color, 'center', 800, null)
+}
+
+/** A speech bubble over a character (a wave, a gift). */
+function emoteBubble(label: string, x: number, y: number, life: number) {
+  ctx.globalAlpha = Math.min(1, life * 2)
+  ctx.font = '900 14px ' + FONT
+  const w = ctx.measureText(label).width + 20
+  const by = y - Math.min(1, (2.5 - life) * 6) * 6
+  ctx.fillStyle = '#fffaf0'
+  roundRect(ctx, x - w / 2, by - 14, w, 28, 14)
+  ctx.fill()
+  ctx.beginPath()
+  ctx.moveTo(x - 6, by + 13)
+  ctx.lineTo(x, by + 22)
+  ctx.lineTo(x + 6, by + 13)
+  ctx.fill()
+  text(label, x, by, 14, '#5a4636', 'center', 900, null)
+  ctx.globalAlpha = 1
+}
+
+/** Gold stars: the level of an upgrade (2 or 3), on the fields, pens and workshops. */
+function upgradeStars(level: number, x: number, y: number) {
+  if (level <= 1) return
+  for (let i = 0; i < level - 1; i++) {
+    const sx = x + i * 14
+    ctx.fillStyle = 'rgba(120, 70, 10, 0.5)'
+    star4(ctx, sx + 1, y + 1.5, 7)
+    ctx.fillStyle = '#ffd54a'
+    star4(ctx, sx, y, 7)
+  }
 }
 
 // --- world -----------------------------------------------------------------------------------
@@ -1011,7 +1320,7 @@ function drawPlaceBubble(place: Place) {
       )
     }
     const queued = farm.queue(place).length
-    if (queued > 1) text(`${queued}/${WORKSHOP_QUEUE}`, x, (place.y + place.h) * TILE + 6, 12, '#fff', 'center', 800)
+    if (queued > 1) text(`${queued}/${farm.queueMax()}`, x, (place.y + place.h) * TILE + 6, 12, '#fff', 'center', 800)
   } else if (place.kind === 'board') {
     const deliverable = farm.s.orders.filter((_, i) => farm.canDeliver(i)).length
     if (deliverable) bubble(x, y, 16, () => text('✓', x, y, 20, '#2e7d32', 'center', 900, null), 5)
@@ -1060,24 +1369,39 @@ function drawWorld() {
   if (farm.s.silo > 0) tall.push({ y: 3.7 * TILE, draw: () => drawSilo(ctx, 0.35 * TILE, 0.7 * TILE, 1.25 * TILE, 3 * TILE, farm.s.silo) })
   const farmerWalking = Math.hypot(farmer.tx - farmer.x, farmer.ty - farmer.y) > 2
   tall.push({ y: farmer.y, draw: () => drawFarmer(ctx, look(), farmer.x, farmer.y, 46, clock, farmer.facing, farmerWalking) })
-  if (farm.helperActive()) {
-    const walking = !!helper.task
+  if (myEmote) {
+    const e = myEmote
+    tall.push({ y: 1e9 - 1, draw: () => emoteBubble(e.text, farmer.x, farmer.y - 70, e.life) })
+  }
+  for (const id of WORKER_IDS) {
+    if (!farm.workerActive(id)) continue
+    const w = workers[id]
+    const walking = !!w.task
     tall.push({
-      y: helper.y,
+      y: w.y,
       draw: () => {
-        drawFarmer(ctx, HELPER_LOOK, helper.x, helper.y, 44, clock + 1.7, helper.facing, walking)
-        const label = `${t.helperTag} · ${Math.ceil(farm.helperLeft() / 60)} min`
-        ctx.font = '800 11px ' + FONT
-        const w = ctx.measureText(label).width + 14
-        ctx.fillStyle = 'rgba(70, 120, 40, 0.85)'
-        roundRect(ctx, helper.x - w / 2, helper.y + 4, w, 18, 9)
-        ctx.fill()
-        text(label, helper.x, helper.y + 13, 11, '#fff', 'center', 800, null)
+        drawFarmer(ctx, WORKER_LOOK[id], w.x, w.y, 44, clock + 1.7 + WORKER_IDS.indexOf(id), w.facing, walking)
+        const left = farm.workerLeft(id)
+        nameTag(`${t.workerTag[id]} · ${Number.isFinite(left) ? Math.ceil(left / 60) + ' min' : '∞'}`, w.x, w.y + 4, 'rgba(70, 120, 40, 0.85)', '#fff')
       },
     })
   }
+  for (const v of visitors.values()) {
+    tall.push({
+      y: v.y,
+      draw: () => {
+        const moving = v.walking || Math.hypot(v.tx - v.x, v.ty - v.y) > 2
+        drawFarmer(ctx, v.look, v.x, v.y, 46, clock + v.id.length, v.facing, moving)
+        nameTag(`${v.name} · ${t.level} ${v.level}`, v.x, v.y + 4, 'rgba(255, 250, 240, 0.92)', '#5a4636')
+      },
+    })
+    if (v.emote) {
+      const e = v.emote
+      tall.push({ y: 1e9 - 1, draw: () => emoteBubble(e.text, v.x, v.y - 70, e.life) })
+    }
+  }
   if (keyboard && started && !panel) {
-    const near = nearPlace() || null
+    const near = nearVisitor() || nearPlace() || null
     const zone = near ? null : nearZone()
     if (near || zone) {
       const hx = farmer.x
@@ -1144,7 +1468,13 @@ function drawWorld() {
       text(String(zone.price), cx + 8, cy - 9, 16, '#8a5a1a', 'center', 900, null)
     } else text('🔒 ' + t.levelNeeded + ' ' + zone.level, cx, cy - 9, 14, '#7a6a5a', 'center', 800, null)
   }
-  for (const place of PLACES) if (farm.usable(place)) drawPlaceBubble(place)
+  for (const place of PLACES) {
+    if (!farm.usable(place)) continue
+    drawPlaceBubble(place)
+    if (place.kind === 'field') upgradeStars(farm.upgradeLevel('fields'), (place.x + place.w) * TILE - 14 * (farm.upgradeLevel('fields') - 1), place.y * TILE + 4)
+    if (place.kind === 'pen') upgradeStars(farm.upgradeLevel('pens'), (place.x + place.w) * TILE - 18 - 14 * (farm.upgradeLevel('pens') - 1), place.y * TILE + 22)
+    if (place.kind === 'workshop') upgradeStars(farm.upgradeLevel('workshops'), place.x * TILE + 10, (place.y + place.h) * TILE - 6)
+  }
   // Cloud shadows drifting over the farm.
   for (let i = 0; i < 4; i++) {
     const cx = ((clock * 14 + i * 520) % (WORLD_PX_W + 600)) - 300
@@ -1223,6 +1553,19 @@ function drawHud() {
   ctx.fill()
   drawCoin(ctx, width - 128 * ui, ly + 21 * ui, 15 * ui * s)
   text(String(farm.s.coins), width - 24 * ui, ly + 21 * ui, 17 * ui * s, '#fff', 'right', 900)
+  // Farmers online (multiplayer).
+  if (room) {
+    const oy = ly + 40 * ui
+    ctx.fillStyle = visitors.size ? 'rgba(70, 120, 40, 0.8)' : 'rgba(40, 30, 60, 0.35)'
+    roundRect(ctx, width - 140 * ui, oy, 126 * ui, 24 * ui, 12 * ui)
+    ctx.fill()
+    ctx.fillStyle = visitors.size ? '#b8ff8a' : '#d0c8d8'
+    ctx.beginPath()
+    ctx.arc(width - 126 * ui, oy + 12 * ui, 4.5 * ui, 0, Math.PI * 2)
+    ctx.fill()
+    text(`${visitors.size + 1} ${t.online}`, width - 24 * ui, oy + 12 * ui, 13 * ui, '#fff', 'right', 800)
+    buttons.push({ x: width - 140 * ui, y: oy, w: 126 * ui, h: 24 * ui, enabled: true, action: () => (panel = 'online') })
+  }
 }
 
 function drawSeedBar() {
@@ -1485,22 +1828,99 @@ function bought(result: string, wx?: number, wy?: number) {
   persist()
 }
 
-function drawShopPanel() {
-  const box = panelFrame(t.shop, 600, 470)
-  // Tabs.
-  const tw = (box.w - 40 * ui) / 3
-  t.tabs.forEach((label, i) => {
-    const x = box.x + 20 * ui + i * tw
-    ctx.fillStyle = i === shopTab ? '#ffb627' : '#efe2c8'
-    roundRect(ctx, x + 4 * ui, box.y + 10 * ui, tw - 8 * ui, 34 * ui, 17 * ui)
+/** A row of the workers' tab: hire for 10 minutes, or for good. */
+function workerRow(id: WorkerId, x: number, y: number, w: number, h: number) {
+  const info = WORKERS[id]
+  ctx.fillStyle = '#f3ead9'
+  roundRect(ctx, x, y, w, h - 8 * ui, 14 * ui)
+  ctx.fill()
+  drawFarmer(ctx, WORKER_LOOK[id], x + h * 0.45, y + h * 0.78, h * 0.62, clock + WORKER_IDS.indexOf(id), 1, farm.workerActive(id))
+  const mid = y + (h - 8 * ui) / 2
+  const left = farm.workerLeft(id)
+  const name = Number.isFinite(left) && left > 0 ? `${t.workers[id]} · ${Math.ceil(left / 60)} min` : t.workers[id]
+  text(name, x + h * 1.05, mid - 10 * ui, 15 * ui, '#5a4636', 'left', 900, null)
+  text(t.workerHelp[id], x + h * 1.05, mid + 11 * ui, 12 * ui, '#8a7a6a', 'left', 600, null)
+  const bw = 92 * ui
+  const bh = 30 * ui
+  const bx2 = x + w - bw - 10 * ui
+  const bx1 = bx2 - bw - 8 * ui
+  if (farm.s.workers[id].forever) text(t.hiredForever + ' ✓', x + w - 14 * ui, mid, 13 * ui, '#5c9e3a', 'right', 900, null)
+  else if (farm.level < info.level) text('🔒 ' + t.levelNeeded + ' ' + info.level, bx2 + bw / 2, mid, 13 * ui, '#8a7a6a', 'center', 800, null)
+  else {
+    const atMax = left + WORKER.duration > WORKER.maxAhead
+    text(t.forHire, bx1 + bw / 2, mid - 23 * ui, 11 * ui, '#8a7a6a', 'center', 800, null)
+    text(t.forever, bx2 + bw / 2, mid - 23 * ui, 11 * ui, '#8a7a6a', 'center', 800, null)
+    if (atMax) text(t.max, bx1 + bw / 2, mid + 4 * ui, 14 * ui, '#5c9e3a', 'center', 900, null)
+    else {
+      button('    ' + info.price, bx1, mid - bh / 2 + 4 * ui, bw, bh, '#ffb627', farm.s.coins >= info.price, () => {
+        const result = farm.hireWorker(id)
+        bought(result)
+        if (result === 'ok' && !workers[id].task) Object.assign(workers[id], WORKER_HOME[id])
+      })
+      drawCoin(ctx, bx1 + 20 * ui, mid + 4 * ui, 8 * ui)
+    }
+    button('    ' + info.forever, bx2, mid - bh / 2 + 4 * ui, bw, bh, '#9b6bd1', farm.s.coins >= info.forever, () => bought(farm.hireWorkerForever(id)))
+    drawCoin(ctx, bx2 + 20 * ui, mid + 4 * ui, 8 * ui)
+  }
+}
+
+function upgradeIcon(id: UpgradeId, x: number, y: number, s: number) {
+  if (id === 'fields') {
+    drawPlot(ctx, x, y + s * 0.1, s * 0.8, 0, false)
+    drawPlant(ctx, 'carrot', x, y + s * 0.1, s * 0.8, 1, true, false, false, clock)
+  } else if (id === 'pens') drawAnimal(ctx, 'chicken', x, y + s * 0.35, s * 0.7, clock, 1, false)
+  else drawWorkshop(ctx, 'mill', x - s * 0.4, y - s * 0.45, s * 0.8, s * 0.8, clock, true)
+}
+
+function drawCoinsTab(x: number, y: number, w: number, h: number) {
+  if (!play.canPurchase) {
+    drawCoin(ctx, x + w / 2, y + h * 0.3, 26 * ui)
+    text(t.coinsUnavailable, x + w / 2, y + h * 0.55, 15 * ui, '#8a7a6a', 'center', 800, null)
+    return
+  }
+  if (!products) {
+    text(t.loading, x + w / 2, y + h * 0.45, 15 * ui, '#8a7a6a', 'center', 800, null)
+    return
+  }
+  const list = products.slice(0, 6)
+  const cols = Math.min(3, Math.max(1, list.length))
+  const cw = w / cols
+  const ch = Math.min(150 * ui, (h - 34 * ui) / Math.ceil(list.length / cols))
+  list.forEach((product, i) => {
+    const cx = x + (i % cols) * cw
+    const cy = y + Math.floor(i / cols) * ch
+    ctx.fillStyle = '#f3ead9'
+    roundRect(ctx, cx + 5 * ui, cy, cw - 10 * ui, ch - 10 * ui, 14 * ui)
     ctx.fill()
-    text(label, x + tw / 2, box.y + 27 * ui, 14 * ui, i === shopTab ? '#fff' : '#5a4636', 'center', 900, null)
+    // A pile of coins, bigger for bigger packs.
+    const pile = Math.min(5, 1 + i)
+    for (let k = 0; k < pile; k++) drawCoin(ctx, cx + cw / 2 + (k - (pile - 1) / 2) * 9 * ui, cy + ch * 0.24 - (k % 2) * 6 * ui, 12 * ui)
+    const coins = productCoins(product)
+    text(coins ? `+${coins}` : product.title, cx + cw / 2, cy + ch * 0.46, 20 * ui, '#b7791f', 'center', 900, null)
+    if (coins && product.title) text(product.title, cx + cw / 2, cy + ch * 0.6, 12 * ui, '#8a7a6a', 'center', 700, null)
+    const bw = cw * 0.7
+    const bh = 30 * ui
+    button(paying ? t.paying : String(product.price || t.buy), cx + (cw - bw) / 2, cy + ch * 0.68, bw, bh, '#5cbf3a', !paying, () => buyProduct(product))
+  })
+  text(t.coinsHelp, x + w / 2, y + h - 14 * ui, 12 * ui, '#8a7a6a', 'center', 700, null)
+}
+
+function drawShopPanel() {
+  const box = panelFrame(t.shop, 660, 480)
+  // Tabs.
+  const tw = (box.w - 24 * ui) / t.tabs.length
+  t.tabs.forEach((label, i) => {
+    const x = box.x + 12 * ui + i * tw
+    ctx.fillStyle = i === shopTab ? '#ffb627' : '#efe2c8'
+    roundRect(ctx, x + 3 * ui, box.y + 10 * ui, tw - 6 * ui, 34 * ui, 17 * ui)
+    ctx.fill()
+    text(label, x + tw / 2, box.y + 27 * ui, Math.min(13 * ui, ((tw - 10 * ui) / label.length) * 1.75), i === shopTab ? '#fff' : '#5a4636', 'center', 900, null)
     buttons.push({ x, y: box.y + 10 * ui, w: tw, h: 34 * ui, enabled: true, action: () => (shopTab = i) })
   })
   const x = box.x + 16 * ui
   const w = box.w - 32 * ui
   let y = box.y + 56 * ui
-  const rowH = Math.min(78 * ui, (box.h - 66 * ui) / (shopTab === 1 ? 5 : 4))
+  const rowH = Math.min(78 * ui, (box.h - 66 * ui) / (shopTab === 3 ? 5 : 4))
   if (shopTab === 0) {
     for (const zone of ZONES) {
       shopRow(x, y, w, rowH, () => {
@@ -1515,19 +1935,11 @@ function drawShopPanel() {
       y += rowH
     }
   } else if (shopTab === 1) {
-    const hy = y
-    const left = farm.helperLeft()
-    const helperName = left > 0 ? `${t.helperName} · ${Math.ceil(left / 60)} min` : t.helperName
-    const atMax = left + HELPER.duration > HELPER.maxAhead
-    shopRow(x, y, w, rowH, () => drawFarmer(ctx, HELPER_LOOK, x + rowH * 0.45, hy + rowH * 0.78, rowH * 0.62, clock, 1, false), helperName, t.helperHelp, HELPER.level, atMax ? null : HELPER.price, () => {
-      const result = farm.hireHelper()
-      bought(result)
-      if (result === 'ok') {
-        helper.x = HELPER_HOME.x
-        helper.y = HELPER_HOME.y
-      }
-    }, t.max)
-    y += rowH
+    for (const id of WORKER_IDS) {
+      workerRow(id, x, y, w, rowH)
+      y += rowH
+    }
+  } else if (shopTab === 2) {
     const machines: MachineId[] = ['truck', 'tractor']
     for (const id of machines) {
       const iy = y
@@ -1537,11 +1949,24 @@ function drawShopPanel() {
       }, t.machines[id], t.machineHelp[id], MACHINES[id].level, farm.s.machines[id] ? null : MACHINES[id].price, () => bought(farm.buyMachine(id)))
       y += rowH
     }
+  } else if (shopTab === 3) {
+    for (const id of UPGRADE_IDS) {
+      const uy = y
+      const level = farm.upgradeLevel(id)
+      const next = farm.nextUpgrade(id)
+      shopRow(x, y, w, rowH, () => {
+        upgradeIcon(id, x + rowH * 0.45, uy + rowH * 0.4, rowH * 0.7)
+        upgradeStars(Math.min(level + 0, MAX_UPGRADE), x + rowH * 0.2, uy + rowH * 0.12)
+      }, `${t.upgrades[id]} ${level}/${MAX_UPGRADE}`, t.upgradeHelp[id], next ? next.level : 0, next ? next.price : null, () => bought(farm.buyUpgrade(id)), t.max + ' ✓')
+      y += rowH
+    }
     const sy = y
     shopRow(x, y, w, rowH, () => drawSprinkler(ctx, x + rowH * 0.45, sy + rowH * 0.6, clock), `${t.machines.sprinkler} ${farm.s.sprinkler}/${SPRINKLER_PRICES.length}`, t.machineHelp.sprinkler, SPRINKLER_LEVEL, farm.s.sprinkler >= SPRINKLER_PRICES.length ? null : SPRINKLER_PRICES[farm.s.sprinkler], () => bought(farm.buySprinkler(SPRINKLER_LEVEL)))
     y += rowH
     const iy = y
     shopRow(x, y, w, rowH, () => drawSilo(ctx, x + rowH * 0.3, iy + rowH * 0.1, rowH * 0.32, rowH * 0.6, 0), `${t.machines.silo} ${farm.s.silo}/${SILO_PRICES.length}`, t.machineHelp.silo, SILO_LEVEL, farm.s.silo >= SILO_PRICES.length ? null : SILO_PRICES[farm.s.silo], () => bought(farm.buySilo(SILO_LEVEL)))
+  } else if (shopTab === 5) {
+    drawCoinsTab(x, y, w, box.h - 66 * ui)
   } else {
     const kinds = Object.keys(DECORS) as DecorKind[]
     const cols = 3
@@ -1636,6 +2061,76 @@ function drawAvatarPanel() {
   buttons.push(box.close)
 }
 
+/** A farmer's face: their picture from the website, or their farmer. */
+function visitorFace(v: Visitor, cx: number, cy: number, r: number) {
+  ctx.save()
+  ctx.beginPath()
+  ctx.arc(cx, cy, r, 0, Math.PI * 2)
+  ctx.fillStyle = '#bfe3ff'
+  ctx.fill()
+  ctx.clip()
+  if (v.image && v.image.complete && v.image.naturalWidth) ctx.drawImage(v.image, cx - r, cy - r, r * 2, r * 2)
+  else drawFarmerFace(ctx, v.look, cx, cy + r * 0.12, r * 1.7)
+  ctx.restore()
+}
+
+function drawOnlinePanel() {
+  const box = panelFrame(t.onlineTitle, 520, 420)
+  const list = [...visitors.values()].slice(0, 6)
+  if (!list.length) text(t.nobodyOnline, box.x + box.w / 2, box.y + box.h / 2, 15 * ui, '#8a7a6a', 'center', 700, null)
+  const rowH = Math.min(58 * ui, (box.h - 20 * ui) / 6)
+  list.forEach((v, i) => {
+    const x = box.x + 14 * ui
+    const y = box.y + 10 * ui + i * rowH
+    const w = box.w - 28 * ui
+    ctx.fillStyle = '#f3ead9'
+    roundRect(ctx, x, y, w, rowH - 6 * ui, 12 * ui)
+    ctx.fill()
+    const mid = y + (rowH - 6 * ui) / 2
+    visitorFace(v, x + 24 * ui, mid, 17 * ui)
+    text(v.name.length > 18 ? v.name.slice(0, 17) + '…' : v.name, x + 50 * ui, mid - 7 * ui, 14 * ui, '#5a4636', 'left', 900, null)
+    text(`${t.level} ${v.level}`, x + 50 * ui, mid + 10 * ui, 12 * ui, '#8a7a6a', 'left', 700, null)
+    const bw = 86 * ui
+    const bh = 28 * ui
+    button(t.wave, x + w - bw * 2 - 18 * ui, mid - bh / 2, bw, bh, '#4f8ff7', true, () => wave(v.id))
+    button(t.give, x + w - bw - 8 * ui, mid - bh / 2, bw, bh, '#ff8fab', true, () => (panel = { visitor: v.id }))
+  })
+  buttons.push(box.close)
+}
+
+function drawVisitorPanel(id: string) {
+  const v = visitors.get(id)
+  if (!v) {
+    panel = null
+    return
+  }
+  const box = panelFrame(v.name, 560, 400)
+  const left = box.x + box.w * 0.2
+  drawFarmer(ctx, v.look, left, box.y + box.h * 0.62, Math.min(box.h * 0.45, 130 * ui), clock, 1, false)
+  text(`${t.level} ${v.level}`, left, box.y + box.h * 0.72, 14 * ui, '#8a7a6a', 'center', 800, null)
+  const bw = Math.min(140 * ui, box.w * 0.3)
+  button('👋 ' + t.wave, left - bw / 2, box.y + box.h - 52 * ui, bw, 36 * ui, '#4f8ff7', true, () => wave(id))
+  // Gifts: one item of the barn at a time.
+  const x = box.x + box.w * 0.4
+  const w = box.w * 0.57
+  text(t.give, x + w / 2, box.y + 22 * ui, 15 * ui, '#5a4636', 'center', 900, null)
+  const items = (Object.keys(ITEMS) as ItemId[]).filter((item) => farm.count(item) > 0).slice(0, 8)
+  if (!items.length) text(t.nothingToGive, x + w / 2, box.y + box.h / 2, 13 * ui, '#8a7a6a', 'center', 700, null)
+  const cols = 4
+  const cell = w / cols
+  items.forEach((item, i) => {
+    const cx = x + (i % cols) * cell
+    const cy = box.y + 42 * ui + Math.floor(i / cols) * cell * 1.15
+    ctx.fillStyle = '#f3ead9'
+    roundRect(ctx, cx + 4 * ui, cy, cell - 8 * ui, cell * 1.05, 12 * ui)
+    ctx.fill()
+    drawItem(ctx, item, cx + cell / 2, cy + cell * 0.32, cell * 0.38)
+    text(`x${farm.count(item)}`, cx + cell - 12 * ui, cy + 10 * ui, 11 * ui, '#5a4636', 'right', 900, null)
+    button(t.give, cx + 10 * ui, cy + cell * 0.66, cell - 20 * ui, cell * 0.28, '#ff8fab', true, () => giveTo(id, item))
+  })
+  buttons.push(box.close)
+}
+
 function drawZonePanel(zone: Zone) {
   const box = panelFrame(t.zones[zone.id], 380, 260)
   const cx = box.x + box.w / 2
@@ -1664,7 +2159,8 @@ function drawPlacingBanner() {
   button(t.cancel, x + w - 100 * ui, y + 8 * ui, 90 * ui, 32 * ui, '#e8735a', true, () => (placing = null))
 }
 
-function drawOverlays() {
+/** Messages (welcome back, purchases, gifts): over everything, panels included. */
+function drawToast() {
   if (toast) {
     ctx.globalAlpha = Math.min(1, toast.life)
     const w = Math.min(width - 40, 420 * ui)
@@ -1674,9 +2170,12 @@ function drawOverlays() {
     roundRect(ctx, x, y, w, 64 * ui, 18 * ui)
     ctx.fill()
     text(toast.title, width / 2, y + 22 * ui, 18 * ui, '#5a4636', 'center', 900, null)
-    text(toast.text, width / 2, y + 45 * ui, Math.min(13 * ui, (w / toast.text.length) * 1.8), '#8a7a6a', 'center', 700, null)
+    text(toast.text, width / 2, y + 45 * ui, Math.min(13 * ui, (w / Math.max(1, toast.text.length)) * 1.8), '#8a7a6a', 'center', 700, null)
     ctx.globalAlpha = 1
   }
+}
+
+function drawOverlays() {
   if (levelBanner) {
     const k = Math.min(1, (3.5 - levelBanner.life) * 4, levelBanner.life * 2)
     ctx.globalAlpha = k
@@ -1741,8 +2240,11 @@ function draw() {
   else if (panel === 'orders') drawOrdersPanel()
   else if (panel === 'shop') drawShopPanel()
   else if (panel === 'avatar') drawAvatarPanel()
+  else if (panel === 'online') drawOnlinePanel()
+  else if (panel && 'visitor' in panel) drawVisitorPanel(panel.visitor)
   else if (panel && 'zone' in panel) drawZonePanel(panel.zone)
   else if (panel) drawBuyPanel(panel.buy)
+  drawToast()
   if (keyboard && !document.hasFocus() && !paused && !panel) {
     // Keys go to the page around the game until it is clicked.
     const w = Math.min(width - 40, 380 * ui)
@@ -1865,7 +2367,9 @@ function pointerEnd(event: PointerEvent) {
   if (!gesture) return
   const p = position(event)
   const w = toWorld(p.x, p.y)
+  const visitor = gesture.mode === 'pending' && !placing ? visitorAt(w.x, w.y) : null
   if (gesture.mode === 'farm') endSwipe(w.x, w.y)
+  else if (visitor) panel = { visitor: visitor.id }
   else if (gesture.mode === 'pending' && placing) placeDecorAt(w.x, w.y)
   else if (gesture.mode === 'pending' && gesture.place) tapPlace(gesture.place)
   else if (gesture.mode === 'pending') {
@@ -1968,7 +2472,12 @@ play
   })
   .catch((error) => play.logWarning(error))
   .finally(() => {
+    // The website's language and player are known now.
+    t = texts(play.language)
+    loadPlayer()
     farm.onLevelUp = levelUp
     if (!farm.crops().some((c) => c.id === selected)) selected = 'wheat'
     play.gameReady()
+    loadShop()
+    joinRoom()
   })

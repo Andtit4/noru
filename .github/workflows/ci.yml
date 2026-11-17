@@ -55,6 +55,7 @@ jobs:
       - name: noru play tests (SDK, <Playable> in a Next.js page, Cloud Acres)
         run: |
           node packages/noru-play/test/protocol.test.js
+          node packages/noru-play/test/multiplayer.test.js target/debug/noru${{ runner.os == 'Windows' && '.exe' || '' }}
           node scripts/e2e-play.mjs target/debug/noru${{ runner.os == 'Windows' && '.exe' || '' }}
 
       - name: npm package smoke test

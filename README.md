@@ -202,10 +202,16 @@ import { Playable } from 'noru-play/react'
 
 Build a game with `noru build my-game --base /games/my-game/ --no-offline` and copy its `dist/` to
 `public/games/my-game/` in the site (a `noru play build` command that does both is planned).
+The website can also **sell things in the game** (the page takes the payment, the game receives the
+result: `products` and `onPurchase` on `<Playable>`, `play.purchase()` in the game) and connect
+players in **multiplayer rooms** (`play.joinRoom()`; `noru dev` serves the rooms at `/@noru/play`,
+`noru play-server` runs them in production).
+
 [`examples/play/cloud-acres`](examples/play/cloud-acres) is a complete farm game made this way
 (no image files): fields planted and harvested with a swipe, animals, workshops, villagers' orders,
-levels, a farmer to customize, the website user's picture, a shop (land, tractor, delivery truck,
-sprinklers, silos, decorations), and a farm that keeps working while the game is closed.
+levels, a farmer to customize, the website user's picture, a shop (land, workers, tractor, delivery
+truck, upgrades, decorations, coins sold by the website), other players walking on the farm (wave,
+gifts), and a farm that keeps working while the game is closed.
 
 ## Commands
 
@@ -233,6 +239,12 @@ noru start [root]      Serve the production build (Brotli / gzip, long-term cach
   --host <host>          Host (default: 0.0.0.0)
 
 noru preview [root]    Same as start, on localhost:4173
+
+noru play-server       Multiplayer rooms server for noru-play games (WebSocket)
+  --port, -p <port>      Port (default: $PORT or 4040)
+  --host <host>          Host (default: 0.0.0.0)
+  --max-players <n>      Players per room (default: 16)
+  --allow-origin <url>   Only this website may connect (default: any)
 ```
 
 ## Project layout

@@ -111,6 +111,28 @@ export function buildSync(options?: BuildOptions): BuildResult
  * compilation), then only changed files are re-processed and browsers reload automatically.
  */
 export function startDevServer(options?: DevOptions): DevServer
+export interface PlayServerOptions {
+  /** Port. Default: 4040 (0 picks a free port). */
+  port?: number
+  /** Host. Default: "0.0.0.0". */
+  host?: string
+  /** Players per room. Default: 16. */
+  maxPlayers?: number
+  /** Origins of the websites allowed to connect, e.g. ["https://example.com"]. Default: any. */
+  allowedOrigins?: string[]
+}
+
+export interface PlayServer {
+  readonly port: number
+  /** Rooms open now. */
+  readonly rooms: number
+  /** Players connected now. */
+  readonly players: number
+  close(): void
+}
+
+/** Start the multiplayer rooms server of noru-play games (WebSocket; `webSocketTransport` in noru-play). */
+export function startPlayServer(options?: PlayServerOptions): PlayServer
 /** Serve the production build (with a SPA fallback, gzip and long-term caching of hashed assets). */
 export function preview(options?: PreviewOptions): Promise<PreviewServer>
 /** Version of the npm package. */

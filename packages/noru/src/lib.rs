@@ -186,6 +186,66 @@ pub fn build_sync(options: Option<BuildOptions>) -> Result<BuildResult> {
     run(&to_core(options)).map(to_js)
 }
 
+/// Options for `startPlayServer()`. Every field is optional.
+#[napi(object)]
+#[derive(Default)]
+pub struct PlayServerOptions {
+    /// Port. Default: 4040 (0 picks a free port).
+    pub port: Option<u32>,
+    /// Host. Default: "0.0.0.0".
+    pub host: Option<String>,
+    /// Players per room. Default: 16.
+    pub max_players: Option<u32>,
+    /// Origins of the websites allowed to connect, e.g. ["https://example.com"]. Default: any.
+    pub allowed_origins: Option<Vec<String>>,
+}
+
+/// A running multiplayer rooms server (noru play).
+#[napi]
+pub struct PlayServer {
+    inner: noru_core::PlayServer,
+}
+
+#[napi]
+impl PlayServer {
+    #[napi(getter)]
+    pub fn port(&self) -> u32 {
+        u32::from(self.inner.local_addr().port())
+    }
+
+    /// Number of rooms open now.
+    #[napi(getter)]
+    pub fn rooms(&self) -> u32 {
+        self.inner.counts().0 as u32
+    }
+
+    /// Number of players connected now.
+    #[napi(getter)]
+    pub fn players(&self) -> u32 {
+        self.inner.counts().1 as u32
+    }
+
+    #[napi]
+    pub fn close(&self) {
+        self.inner.close();
+    }
+}
+
+/// Starts the multiplayer rooms server of noru-play games (WebSocket, `webSocketTransport`).
+#[napi]
+pub fn start_play_server(options: Option<PlayServerOptions>) -> Result<PlayServer> {
+    let o = options.unwrap_or_default();
+    let port = u16::try_from(o.port.unwrap_or(4040)).map_err(|_| Error::from_reason("invalid port"))?;
+    let host = o.host.unwrap_or_else(|| "0.0.0.0".to_string());
+    let config = noru_core::RoomsConfig {
+        max_players: o.max_players.map_or(16, |n| n.max(1) as usize),
+        allowed_origins: o.allowed_origins.unwrap_or_default(),
+    };
+    let inner = noru_core::PlayServer::start(&host, port, config)
+        .map_err(|e| Error::from_reason(format!("cannot listen on {host}:{port}: {e}")))?;
+    Ok(PlayServer { inner })
+}
+
 /// Options for `startDevServer()`. Every field is optional.
 #[napi(object)]
 #[derive(Default)]
