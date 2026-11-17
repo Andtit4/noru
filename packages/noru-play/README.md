@@ -1,8 +1,8 @@
 # noru play
 
-**Embed web games in your website — Next.js, React or plain HTML.** A tiny SDK for games (≈2 kB compressed)
-and a host for pages: loading screen, pause when the game is not visible, sound on / off, saves,
-scores, language. No dependencies.
+**Embed web games in your website — Next.js, React or plain HTML.** A tiny SDK for games and a host
+for pages: loading screen, pause when the game is not visible, sound on / off, saves, scores,
+language, **things sold by your website** (coins...) and **multiplayer rooms**. No dependencies.
 
 ```bash
 npm install noru-play
@@ -72,9 +72,88 @@ export default function GamePage() {
 | `player` | — | the logged-in user `{ name, avatar }`, shown by the game (picture: same website or `data:` URL) |
 | `loading` | spinner | shown until the first frame |
 | `aspectRatio` | `"16 / 9"` | size of the game box (CSS aspect-ratio) |
+| `products`, `onPurchase(product)`, `purchaseStore` | — | sell things in the game, see below |
+| `multiplayer`, `room(name)` | — | multiplayer rooms, see below |
 | `sandbox`, `allow` | sensible defaults | iframe attributes |
 
 A ref gives `pause()`, `resume()` and `state`.
+
+## Selling things in a game (coins, packs...)
+
+**The website takes the payment, the game delivers.** The game never sees a card or a mobile money
+account: it asks, the page runs its own checkout and answers.
+
+```tsx
+<Playable
+  src="/games/cloud-acres/"
+  products={[
+    { id: 'coins-500', title: '500 coins', price: '500 FCFA', coins: 500 },
+    { id: 'coins-2000', title: '2 000 coins', price: '1 500 FCFA', coins: 2000 },
+  ]}
+  onPurchase={async (product) => {
+    const paid = await myCheckout(product)       // your payment (card, mobile money...)
+    return paid ? { purchaseId: paid.id } : null // truthy: paid; null / false: cancelled
+  }}
+/>
+```
+
+```js
+// In the game
+if (play.canPurchase) {
+  const products = await play.getProducts()
+  const purchase = await play.purchase('coins-500') // null if the player cancelled
+  if (purchase) {
+    coins += purchase.product.coins
+    await play.save(progress)                      // save first...
+    await play.consumePurchase(purchase.purchaseId) // ...then mark it as given
+  }
+}
+// At start: purchases paid while the game was closing
+for (const purchase of await play.getPendingPurchases()) { /* give, save, consume */ }
+```
+
+A paid purchase stays **pending** until the game consumes it, so a player never loses what they paid
+for if the game closes at the wrong moment (default store: `localStorage`; with accounts, give a
+`purchaseStore` `{ list(), add(purchase), remove(purchaseId) }` backed by your server). Keep the
+purchase id in the save to never give it twice. Opened on its own, a game can try its shop with
+`play.configure({ testProducts: [...] })` (bought for free).
+
+## Multiplayer rooms
+
+Players in the same **room** see each other's state (position, look...) and send each other messages.
+The game says what to share; a rooms server relays it.
+
+```js
+// In the game
+const room = await play.joinRoom('farm', { state: { x: 10, y: 20 } })
+room.me                                   // { id, name, avatar, state } — name and picture from the website
+room.players                              // Map of the other players
+room.on('join', (player) => addFarmer(player))
+room.on('leave', (player) => removeFarmer(player))
+room.on('state', (player) => moveFarmer(player.id, player.state))
+room.on('message', (data, from) => showGift(data, from))
+room.setState({ x: 12, y: 20 })            // up to 16 kB of JSON
+room.send({ type: 'gift', item: 'egg' })   // to everyone, or room.send(data, playerId)
+room.leave()
+```
+
+```tsx
+// In the page
+<Playable src="/games/cloud-acres/" multiplayer="/@noru/play" />
+```
+
+- **In development**, `noru dev` (and `noru preview`) serve a rooms server at `/@noru/play`.
+- **In production**, run the rooms server written in Rust: `noru play-server --port 4040
+  --allow-origin https://example.com`, then `multiplayer="wss://play.example.com/"`. It holds rooms
+  of up to 16 players (`--max-players`), limits messages to 16 kB and 60 per second per player, and
+  answers a plain GET with `{ rooms, players }` (health check).
+- `room={(name) => 'group-42:' + name}` puts groups of players apart (per page, per team...).
+- Any realtime backend works: `multiplayer` also takes a transport `{ join(room, me, events) }`
+  (see `noru-play/multiplayer`).
+- Opened on its own, a game meets the other tabs of the same browser (no server needed).
+
+The server only relays: it does not know the rules of the game. Anything worth money must be checked
+by your server, not trusted from a player.
 
 ## Without React
 
@@ -95,6 +174,8 @@ host.destroy()
   a host from its **own origin** (same website). `play.configure({ allowedOrigins: [...] })` to
   allow others.
 - The game runs in a sandboxed iframe. Saves over 1 MB and non-numeric scores are refused.
+- Payments happen in the page, never in the game; the game only receives the result.
+- In a room, the name and picture of a player come from the website (`player`), not from the game.
 - Games and site on the same origin share cookies: only embed games you trust (your own).
 
 MIT

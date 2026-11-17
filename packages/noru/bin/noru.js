@@ -11,6 +11,7 @@ const HELP = `
     $ noru build [root]      Build for production into dist/
     $ noru start [root]      Serve the production build (uses $PORT when set)
     $ noru preview [root]    Same as start, on localhost:4173
+    $ noru play-server       Multiplayer rooms server for noru-play games (uses $PORT when set)
 
   Dev options
     --port, -p <port>        Port (default: 3000)
@@ -34,6 +35,13 @@ const HELP = `
     --out-dir <dir>          Directory to serve (default: dist)
     --port, -p <port>        Port (default: $PORT or 3000 for start, 4173 for preview)
     --host <host>            Host (default: 0.0.0.0 for start, 127.0.0.1 for preview)
+
+  Play server options
+    --port, -p <port>        Port (default: $PORT or 4040)
+    --host <host>            Host (default: 0.0.0.0)
+    --max-players <n>        Players per room (default: 16)
+    --allow-origin <url>     Only this website may connect, e.g. https://example.com
+                             (comma-separated list; default: any)
 
   Other
     -v, --version            Print version
@@ -182,6 +190,31 @@ async function main() {
     } catch (error) {
       fail(error.message)
     }
+  } else if (command === 'play-server') {
+    const port = Number(args.port ?? process.env.PORT ?? 4040)
+    const host = args.host || '0.0.0.0'
+    let server
+    try {
+      server = noru.startPlayServer({
+        port,
+        host,
+        maxPlayers: args.maxPlayers !== undefined ? Number(args.maxPlayers) : undefined,
+        allowedOrigins: args.allowOrigin ? String(args.allowOrigin).split(',').map((o) => o.trim()).filter(Boolean) : undefined,
+      })
+    } catch (error) {
+      fail(error.message)
+    }
+    const shown = host === '0.0.0.0' || host === '127.0.0.1' ? 'localhost' : host
+    console.log(`\n  ${c('36;1', 'noru play')} multiplayer rooms server\n`)
+    console.log(`  ${c('32', '➜')}  Local:   ${c('36', `ws://${shown}:${server.port}/`)}\n`)
+    const keepAlive = setInterval(() => {}, 1 << 30)
+    const stop = () => {
+      clearInterval(keepAlive)
+      server.close()
+      process.exit(0)
+    }
+    process.on('SIGINT', stop)
+    process.on('SIGTERM', stop)
   } else {
     fail(`unknown command "${command}" — run \`noru --help\``)
   }

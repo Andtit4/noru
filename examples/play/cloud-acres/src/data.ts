@@ -168,10 +168,33 @@ export const MACHINES: Record<MachineId, { level: number; price: number }> = {
   tractor: { level: 4, price: 450 },
 }
 /**
- * A farmhand to hire for a while: harvests ripe fields (and replants them), collects the animals'
- * products and the workshops' goods. Each hire adds `duration` seconds of work.
+ * Workers to hire, each with a job: the field hand harvests ripe fields and replants them, the
+ * stockman feeds the animals and collects their products, the craftsman collects the workshops'
+ * goods and starts new productions. Hired for a while (each hire adds `WORKER.duration` seconds of
+ * work, up to `WORKER.maxAhead`) or for good (`forever` coins).
  */
-export const HELPER = { level: 3, price: 120, duration: 600, maxAhead: 3600, actionTime: 2 }
+export type WorkerId = 'field' | 'animal' | 'craft'
+export const WORKER_IDS: WorkerId[] = ['field', 'animal', 'craft']
+export const WORKERS: Record<WorkerId, { level: number; price: number; forever: number }> = {
+  field: { level: 3, price: 120, forever: 2500 },
+  animal: { level: 4, price: 150, forever: 3200 },
+  craft: { level: 5, price: 180, forever: 4000 },
+}
+export const WORKER = { duration: 600, maxAhead: 3600, actionTime: 2 }
+
+/**
+ * Upgrades of the farm, levels 1 to 3: fertile fields (each plot gives one more crop per level),
+ * comfortable pens (one more product per level), modern workshops (25 % faster and one more place
+ * in the queue per level). `levels` and `prices` are those of levels 2 and 3.
+ */
+export type UpgradeId = 'fields' | 'pens' | 'workshops'
+export const UPGRADE_IDS: UpgradeId[] = ['fields', 'pens', 'workshops']
+export const UPGRADES: Record<UpgradeId, { levels: number[]; prices: number[] }> = {
+  fields: { levels: [4, 7], prices: [400, 1200] },
+  pens: { levels: [4, 7], prices: [350, 1000] },
+  workshops: { levels: [5, 8], prices: [450, 1300] },
+}
+export const MAX_UPGRADE = 3
 
 /** Seconds of a delivery trip of the truck. */
 export const TRUCK_TRIP = 14
@@ -233,7 +256,7 @@ export interface WorkshopState {
 
 /** What is saved (noru play save). */
 export interface Save {
-  version: 2
+  version: 3
   clock: number
   savedAt: number // Date.now() at save time: time away keeps the farm working
   coins: number
@@ -252,8 +275,18 @@ export interface Save {
   decor: { kind: DecorKind; x: number; y: number }[]
   /** Delivery truck on the road (returnAt 0: at the farm). */
   truck: { returnAt: number; coins: number; xp: number }
-  /** Farmhand: works until this game clock. */
-  helper: { hiredUntil: number }
+  /** Workers: work until this game clock, or for good. */
+  workers: Record<WorkerId, { until: number; forever: boolean }>
+  /** Level (1-3) of each upgrade. */
+  upgrades: Record<UpgradeId, number>
+  /** Purchases (coins bought on the website) already given, so none is given twice. */
+  credited: string[]
+}
+
+/** The save of version 2 (one farmhand), loaded and turned into a version 3. */
+export interface SaveV2 extends Omit<Save, 'version' | 'workers' | 'upgrades' | 'credited'> {
+  version: 2
+  helper?: { hiredUntil: number }
 }
 
 export interface OrderState {
@@ -266,7 +299,7 @@ export interface OrderState {
 }
 
 export const NEW_SAVE = (): Save => ({
-  version: 2,
+  version: 3,
   clock: 0,
   savedAt: Date.now(),
   coins: 20,
@@ -284,7 +317,9 @@ export const NEW_SAVE = (): Save => ({
   silo: 0,
   decor: [],
   truck: { returnAt: 0, coins: 0, xp: 0 },
-  helper: { hiredUntil: 0 },
+  workers: { field: { until: 0, forever: false }, animal: { until: 0, forever: false }, craft: { until: 0, forever: false } },
+  upgrades: { fields: 1, pens: 1, workshops: 1 },
+  credited: [],
 })
 
 /** Time away that counts (the farm works up to 12 hours without the player). */

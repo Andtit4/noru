@@ -37,6 +37,12 @@ export const Playable = React.forwardRef(function Playable(props, ref) {
     autoFocus = false,
     autoPause = true,
     storage,
+    products,
+    onPurchase,
+    purchaseStore,
+    onPurchaseConsumed,
+    multiplayer,
+    room,
     loading,
     aspectRatio = '16 / 9',
     className,
@@ -57,6 +63,12 @@ export const Playable = React.forwardRef(function Playable(props, ref) {
   const [shown, setShown] = React.useState(false)
   const callbacks = {
     storage,
+    products,
+    onPurchase,
+    purchaseStore,
+    onPurchaseConsumed,
+    multiplayer,
+    room,
     autoFocus,
     onConnect: () => {
       setShown(false)

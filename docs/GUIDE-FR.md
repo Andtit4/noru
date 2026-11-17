@@ -268,6 +268,30 @@ Il a deux côtés :
 Ouvert tout seul (pendant que tu le développes avec `noru dev`), un jeu marche aussi : les
 sauvegardes vont dans le navigateur et les scores dans la console.
 
+**Vendre des choses dans un jeu (pièces, packs…)** : c'est le site qui encaisse, le jeu ne voit
+jamais le paiement. Sur `<Playable>`, `products={[{ id: 'coins-500', title: '500 pièces', price:
+'500 FCFA', coins: 500 }]}` (la liste de ce qui est vendu) et `onPurchase={async (product) => …}`
+(ton paiement : carte, mobile money… ; renvoie quelque chose de vrai une fois payé, `null` si le
+joueur annule). Dans le jeu : `play.purchase('coins-500')`, puis le jeu donne les pièces,
+sauvegarde, et appelle `play.consumePurchase(id)`. Un achat payé reste « en attente » tant que le
+jeu ne l'a pas donné : si le jeu se ferme au mauvais moment, il le retrouve au démarrage
+(`play.getPendingPurchases()`), le joueur ne perd jamais ce qu'il a payé.
+
+**Le multijoueur** : les joueurs d'un même « salon » (room) voient la position et l'apparence des
+autres et s'envoient des messages. Dans le jeu : `const room = await play.joinRoom('ferme')`, puis
+`room.setState({ x, y })`, `room.send(message)`, `room.on('join' | 'leave' | 'state' | 'message')`.
+Sur la page : `<Playable multiplayer="/@noru/play" />`. Le nom et la photo du joueur viennent du
+site, pas du jeu. Le serveur des salons est écrit en Rust :
+
+- en développement, `noru dev` le sert tout seul à l'adresse `/@noru/play` ;
+- en production, lance `noru play-server --port 4040 --allow-origin https://ton-site.com` sur un
+  serveur (16 joueurs par salon, messages limités à 16 Ko et 60 par seconde), puis
+  `multiplayer="wss://play.ton-site.com/"` ;
+- un jeu ouvert tout seul retrouve les autres onglets du même navigateur (pratique pour essayer).
+
+Le serveur ne fait que relayer : il ne connaît pas les règles du jeu. Tout ce qui vaut de l'argent
+doit être vérifié par ton serveur.
+
 Faire un jeu et le mettre dans un site :
 
 ```bash
@@ -296,10 +320,21 @@ Le premier jeu, **Cloud Acres** (`examples/play/cloud-acres/`), est une ferme vu
   livraison** (il livre les commandes prêtes tout seul, même pendant l'absence), arrosage (pousse
   plus rapide), silos (grange plus grande, elle a maintenant une limite) et décorations à placer où
   l'on veut (fleurs, botte de foin, banc, lampadaire, épouvantail, fontaine).
-- **l'ouvrier agricole** (boutique, onglet Machines, dès le niveau 3) : on le paie 120 pièces pour
-  10 minutes de travail (jusqu'à une heure d'avance) ; il va tout seul récolter et replanter les
-  champs mûrs, ramasser œufs, lait, laine, truffes et les produits des ateliers, même pendant
-  l'absence du joueur.
+- **les ouvriers** (boutique, onglet Ouvriers) : l'**ouvrier des champs** (niveau 3) récolte et
+  replante, l'**éleveur** (niveau 4) nourrit les animaux et ramasse œufs, lait, laine, truffes,
+  l'**artisan** (niveau 5) vide les ateliers et relance la production. On les paie pour 10 minutes
+  (jusqu'à une heure d'avance) ou **pour toujours** (2 500, 3 200 et 4 000 pièces). Ils travaillent
+  aussi pendant l'absence du joueur : la ferme revit ce temps pas à pas (les cultures repoussent et
+  sont récoltées plusieurs fois) ;
+- **les améliorations** (onglet Améliorer), niveaux 1 à 3 : champs fertiles (+1 récolte par
+  parcelle), enclos confortables (+1 produit), ateliers modernes (25 % plus rapides, +1 dans la
+  file), plus l'arrosage et les silos. Des étoiles dorées apparaissent sur les bâtiments améliorés ;
+- **les pièces** (onglet Pièces) : les packs vendus par le site (voir plus haut). Pour essayer
+  sans site : `?shop=test` dans l'adresse du jeu (packs gratuits) ;
+- **les autres joueurs** : quand le site propose le multijoueur, les fermiers connectés marchent
+  sur ta ferme avec leur nom et leur niveau, « N en ligne » s'affiche en haut à droite. En touchant
+  un fermier (ou Espace à côté de lui) : **Saluer** (une bulle « 👋 Salut ! ») ou **Offrir** un
+  produit de ta grange (il le reçoit dans la sienne).
 
 Tout est dessiné par le code (aucune image). **Au clavier** : les flèches (ou ZQSD / WASD)
 font marcher le fermier, qui plante et récolte en passant sur les champs ; Espace utilise ce qui

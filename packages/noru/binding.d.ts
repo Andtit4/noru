@@ -18,6 +18,31 @@ export declare class DevServer {
   close(): void
 }
 
+/** A running multiplayer rooms server (noru play). */
+export declare class PlayServer {
+  get port(): number
+  /** Number of rooms open now. */
+  get rooms(): number
+  /** Number of players connected now. */
+  get players(): number
+  close(): void
+}
+
+/** Options for `startPlayServer()`. Every field is optional. */
+export interface PlayServerOptions {
+  /** Port. Default: 4040 (0 picks a free port). */
+  port?: number
+  /** Host. Default: "0.0.0.0". */
+  host?: string
+  /** Players per room. Default: 16. */
+  maxPlayers?: number
+  /** Origins of the websites allowed to connect, e.g. ["https://example.com"]. Default: any. */
+  allowedOrigins?: Array<string>
+}
+
+/** Starts the multiplayer rooms server of noru-play games (WebSocket, `webSocketTransport`). */
+export declare function startPlayServer(options?: PlayServerOptions | undefined | null): PlayServer
+
 /** Builds the app for production on a background thread. Rejects with the build errors on failure. */
 export declare function build(options?: BuildOptions | undefined | null): Promise<BuildResult>
 

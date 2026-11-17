@@ -21,6 +21,7 @@ mod module;
 mod next;
 mod options;
 mod pkg;
+mod play_server;
 mod postcss;
 mod production;
 mod resolve;
@@ -30,6 +31,7 @@ mod treeshake;
 pub use build::{build, BuildError, BuildResult, OutputFile};
 pub use dev::{DevOptions, DevServer};
 pub use options::BuildOptions;
+pub use play_server::{PlayServer, RoomsConfig};
 pub use production::PageWeight;
 pub use serve::PreviewServer;
 

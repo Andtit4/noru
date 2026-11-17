@@ -2,7 +2,7 @@
 import { play } from '../../../packages/noru-play/index.js'
 
 const $ = (id) => document.getElementById(id)
-const state = { pauses: 0, resumes: 0, audio: [] }
+const state = { pauses: 0, resumes: 0, audio: [], joins: [], leaves: [], states: [], messages: [] }
 
 play.onPause(() => {
   state.pauses++
@@ -34,6 +34,22 @@ window.game = {
   crash: () => setTimeout(() => {
     throw new Error('boom from the game')
   }),
+  // Purchases (the website takes the payment).
+  products: () => play.getProducts(),
+  buy: (id) => play.purchase(id),
+  pending: () => play.getPendingPurchases(),
+  consume: (id) => play.consumePurchase(id),
+  // Multiplayer.
+  room: null,
+  async join(name) {
+    const room = await play.joinRoom('lobby', { state: { name } })
+    window.game.room = room
+    room.on('join', (p) => state.joins.push(p.name))
+    room.on('leave', (p) => state.leaves.push(p.name))
+    room.on('state', (p) => state.states.push(p.state))
+    room.on('message', (data, from) => state.messages.push([data, from.name]))
+    return { me: room.me, players: [...room.players.values()] }
+  },
 }
 
 requestAnimationFrame(() => {

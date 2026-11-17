@@ -62,6 +62,11 @@ export default function PlayPage() {
         onReady={() => log('ready')}
         onScore={(score) => log('score:' + score)}
         onError={(error) => log('error:' + error.message)}
+        products={[{ id: 'coins-100', title: '100 coins', price: '100 FCFA', coins: 100 }]}
+        onPurchase={async (product) => {
+          log('pay:' + product.id)
+          return (window as any).__cancelPurchase ? false : { purchaseId: 'pay-' + Date.now() }
+        }}
       />
     </section>
   )
@@ -84,10 +89,26 @@ export default function FarmPage() {
         style={{ maxWidth: 800 }}
         onReady={() => { (window as any).__farmReady = true }}
         onError={(error) => { (window as any).__farmError = error.message }}
+        products={[{ id: 'coins-500', title: '500 coins', price: '500 FCFA', coins: 500 }]}
+        onPurchase={() => true}
+        multiplayer="/@noru/play"
         onPause={() => { (window as any).__farmPaused = true }}
         onResume={() => { (window as any).__farmPaused = false }}
       />
       <div style={{ height: 3000 }} />
+    </section>
+  )
+}
+`
+
+const DUO_PAGE = `'use client'
+import { Playable } from '../../lib/noru-play/react.js'
+
+export default function DuoPage() {
+  return (
+    <section style={{ display: 'flex', gap: 8 }}>
+      <Playable src="/games/test/" title="Game A" player={{ name: 'Ama' }} multiplayer="/@noru/play" room={(name) => 'duo-' + name} autoPause={false} style={{ width: 300 }} />
+      <Playable src="/games/test/" title="Game B" player={{ name: 'Kofi' }} multiplayer="/@noru/play" room={(name) => 'duo-' + name} autoPause={false} style={{ width: 300 }} />
     </section>
   )
 }
@@ -106,6 +127,8 @@ async function main() {
   writeFileSync(join(project, 'app', 'play', 'page.tsx'), PLAY_PAGE)
   mkdirSync(join(project, 'app', 'farm'), { recursive: true })
   writeFileSync(join(project, 'app', 'farm', 'page.tsx'), FARM_PAGE)
+  mkdirSync(join(project, 'app', 'duo'), { recursive: true })
+  writeFileSync(join(project, 'app', 'duo', 'page.tsx'), DUO_PAGE)
   buildGame(join(root, 'fixtures', 'play', 'game'), join(project, 'public', 'games', 'test'), '/games/test/')
   buildGame(join(root, 'examples', 'play', 'cloud-acres'), join(project, 'public', 'games', 'cloud-acres'), '/games/cloud-acres/')
 
@@ -151,8 +174,43 @@ async function main() {
     await page.evaluate(`document.getElementById('host-mute').click()`)
     check('host mute → onAudioChange(false)', await page.waitFor(`${game}.state.audio.join() === 'false' && !${game}.play.isAudioEnabled`))
 
+    console.log('\n— purchases (the website takes the payment)')
+    check('canPurchase in a host that sells', await page.evaluate(`${game}.play.canPurchase === true`))
+    await page.evaluate(`${game}.products().then((p) => { window.__products = p })`)
+    check('getProducts() returns the products of the website', await page.waitFor(`window.__products && window.__products[0].id === 'coins-100' && window.__products[0].coins === 100`))
+    await page.evaluate(`${game}.buy('coins-100').then((p) => { window.__bought = p })`)
+    check('purchase() → onPurchase on the host → the purchase', await page.waitFor(`window.__bought && window.__bought.purchaseId.startsWith('pay-') && window.__bought.product.coins === 100 && ${events}.includes('pay:coins-100')`))
+    await page.evaluate(`${game}.pending().then((p) => { window.__pending = p })`)
+    check('  … kept as pending until consumed', await page.waitFor(`window.__pending && window.__pending.length === 1 && window.__pending[0].purchaseId === window.__bought.purchaseId`))
+    await page.evaluate(`${game}.consume(window.__bought.purchaseId).then(() => ${game}.pending()).then((p) => { window.__pending2 = p })`)
+    check('  … and gone once consumed', await page.waitFor(`window.__pending2 && window.__pending2.length === 0`))
+    await page.evaluate(`window.__cancelPurchase = true; ${game}.buy('coins-100').then((p) => { window.__cancelled = p === null })`)
+    check('a cancelled payment gives null', await page.waitFor(`window.__cancelled === true`))
+    await page.evaluate(`${game}.buy('nope').catch((e) => { window.__unknown = e.message })`)
+    check('unknown products are refused', await page.waitFor(`typeof window.__unknown === 'string' && window.__unknown.includes('unknown product')`))
+    check('no multiplayer when the website does not offer it', await page.evaluate(`${game}.play.canJoinRooms === false`))
+
     await page.evaluate(`${game}.crash()`)
     check('uncaught errors of the game reach onError', await page.waitFor(`${events}.some((e) => e.includes('boom from the game'))`))
+
+    console.log('\n— multiplayer: two games in rooms of noru dev (/@noru/play)')
+    await page.navigate(`${base}/duo`)
+    const gameA = `document.querySelector('iframe[title="Game A"]')?.contentWindow?.game`
+    const gameB = `document.querySelector('iframe[title="Game B"]')?.contentWindow?.game`
+    check('both games ready, multiplayer offered', await page.waitFor(`${gameA} && ${gameB} && ${gameA}.play.inHost && ${gameB}.play.inHost && ${gameA}.play.canJoinRooms`))
+    await page.evaluate(`${gameA}.join('a').then((r) => { window.__a = r })`)
+    check('game A joins a room (its name comes from the website)', await page.waitFor(`window.__a && window.__a.me.name === 'Ama' && window.__a.players.length === 0`))
+    await page.evaluate(`${gameB}.join('b').then((r) => { window.__b = r })`)
+    check('game B joins and sees A with its state', await page.waitFor(`window.__b && window.__b.players.length === 1 && window.__b.players[0].name === 'Ama' && window.__b.players[0].state.name === 'a'`))
+    check('  … A is told that Kofi joined', await page.waitFor(`${gameA}.state.joins.includes('Kofi')`))
+    await page.evaluate(`${gameA}.room.send({ hi: 1 })`)
+    check('a message from A reaches B', await page.waitFor(`${gameB}.state.messages.some(([d, from]) => d.hi === 1 && from === 'Ama')`))
+    await page.evaluate(`${gameB}.room.setState({ x: 42 })`)
+    check('a state change of B reaches A', await page.waitFor(`${gameA}.state.states.some((s) => s && s.x === 42)`))
+    await page.evaluate(`fetch('/@noru/play').then((r) => r.json()).then((j) => { window.__duoRooms = j })`)
+    check('the rooms server counts the players', await page.waitFor(`window.__duoRooms && window.__duoRooms.players >= 2`), await page.evaluate('JSON.stringify(window.__duoRooms)'))
+    await page.evaluate(`${gameB}.room.leave()`)
+    check('B leaves: A is told', await page.waitFor(`${gameA}.state.leaves.includes('Kofi')`))
 
     console.log('\n— Cloud Acres example')
     await page.navigate(`${base}/farm`)
@@ -174,6 +232,8 @@ async function main() {
     check('game scrolled out of view: paused automatically', await page.waitFor('window.__farmPaused === true'))
     await page.evaluate('window.scrollTo(0, 0)')
     check('  … and resumed when visible again', await page.waitFor('window.__farmPaused === false'))
+    await page.evaluate(`setInterval(() => fetch('/@noru/play').then((r) => r.json()).then((j) => { window.__rooms = j }), 300)`)
+    check('Cloud Acres joins the multiplayer room', await page.waitFor(`window.__rooms && window.__rooms.players >= 1`))
     check('no errors from Cloud Acres', !(await page.evaluate('window.__farmError')), await page.evaluate('window.__farmError'))
     const errors = page.takeErrors().filter((e) => !/boom from the game|fonts\.googleapis/.test(e))
     check('no unexpected errors in the console', errors.length === 0, errors.slice(0, 3).join(' | '))
