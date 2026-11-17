@@ -31,6 +31,8 @@ import {
   WORKER_IDS,
   UPGRADE_IDS,
   MAX_UPGRADE,
+  NAME_MAX,
+  randomFarmId,
   type WorkerId,
   type UpgradeId,
   type DecorKind,
@@ -42,8 +44,8 @@ import {
   type Save,
 } from './data'
 import { drawAnimal, drawBarn, drawBoard, drawFence, drawItem, drawPond, drawTree, drawTrough, drawWorkshop } from './art'
-import { VILLAGERS, drawCloud, drawCoin, drawPlant, drawPlot, drawVillager, roundRect, star4 } from './draw'
-import { Farm, ORDER_SLOTS, type WorkerTask, type Missing } from './farm'
+import { C, VILLAGERS, drawCloud, drawCoin, drawPlant, drawPlot, drawVillager, ellipse, leaf, paint, roundRect, star4 } from './draw'
+import { Farm, ORDER_SLOTS, type FarmSnapshot, type WorkerTask, type Missing } from './farm'
 import { texts } from './i18n'
 import { drawDecor, drawFarmer, drawFarmerFace, drawForest, drawSilo, drawSprinkler, drawTractor, drawTruck, type Look } from './extras'
 
@@ -52,13 +54,16 @@ const ctx = canvas.getContext('2d') as CanvasRenderingContext2D
 const sound = new Sound()
 // Language and player come from the website once noru play is connected (see the end of the file).
 let t = texts(play.language)
-const FONT = '"Trebuchet MS", "Segoe UI", system-ui, -apple-system, sans-serif'
+const FONT = '"Nunito", "Arial Rounded MT Bold", "Trebuchet MS", "Segoe UI", system-ui, -apple-system, sans-serif'
 const WORLD_PX_W = WORLD_W * TILE
 const WORLD_PX_H = WORLD_H * TILE
 // ?speed=10 makes time go faster (to try the game quickly).
 const speedUp = Math.min(Math.max(Number(new URLSearchParams(location.search).get('speed')) || 1, 1), 50)
 
-let farm = new Farm(null)
+/** Your farm (the one saved). */
+let home = new Farm(null)
+/** The farm on screen: yours, or the one of a friend you visit. */
+let farm = home
 let width = 0
 let height = 0
 let dpr = 1
@@ -70,9 +75,9 @@ let clock = 0
 let dirty = false
 let saveTimer = 0
 let selected: CropId = 'wheat'
-type Panel = null | 'barn' | 'orders' | 'shop' | 'avatar' | 'online' | { buy: Place } | { zone: Zone } | { visitor: string }
+type Panel = null | 'barn' | 'orders' | 'shop' | 'avatar' | 'online' | 'settings' | { buy: Place } | { zone: Zone } | { visitor: string } | { person: string }
 let panel: Panel = null
-let toast: { title: string; text: string; life: number } | null = null
+let toast: { title: string; text: string; life: number; max?: number } | null = null
 let levelBanner: { level: number; news: string[]; life: number } | null = null
 let coinBump = 0
 let seedBarRight = 0
@@ -190,7 +195,7 @@ function lookOf(a: { skin: number; hat: number; shirt: number; pants: number }):
 }
 
 function look(): Look {
-  return lookOf(farm.s.avatar)
+  return lookOf(home.s.avatar)
 }
 
 // --- coins sold by the website (noru play purchases) -----------------------------------------
@@ -213,10 +218,10 @@ const productCoins = (product: Product) => Math.max(0, Math.floor(Number(product
 /** Gives the coins of a paid purchase, saves, then tells the website it was given. */
 async function deliverPurchase(purchase: Purchase) {
   const coins = productCoins(purchase.product)
-  if (farm.creditPurchase(purchase.purchaseId, coins)) {
+  if (home.creditPurchase(purchase.purchaseId, coins)) {
     // Saved before the website forgets the purchase: never lost, never given twice.
     dirty = false
-    await play.save(farm.toSave())
+    await play.save(home.toSave())
     toast = { title: t.thanksPurchase, text: `+${coins} ${t.coinsAdded}`, life: 3.5 }
     flyCoins(width / 2, height / 2, coins)
     burst(width / 2, height / 2, 50, ['#ffd54a', '#ffe08a', '#fff'], 1.6, true, true)
@@ -253,92 +258,179 @@ function buyProduct(product: Product) {
     .finally(() => (paying = false))
 }
 
-// --- multiplayer (noru play rooms): the other farmers walk on your farm -------------------------
+// --- multiplayer (noru play rooms) ------------------------------------------------------------
+// Everyone online meets in the lobby room ('cloud-acres'): who is there, invitations, waves and
+// gifts. Each farm also has its own room ('farm.<id>', a new id each session): its owner and the
+// friends they invited. A friend sees the owner's real farm (snapshots sent by the owner) and helps
+// on it: their actions are sent to the owner, whose game applies them, so the crops go to the
+// owner's barn. The name and picture of a player come from the website when it has accounts.
 
-/** What each farmer shares: position, facing, walking, look and level. */
-interface Shared { x: number; y: number; f: number; w: boolean; a: number[]; l: number }
-type RoomMessage = { type: 'wave' } | { type: 'gift'; item: ItemId; count: number }
-interface Visitor { id: string; name: string; image: HTMLImageElement | null; look: Look; level: number; x: number; y: number; tx: number; ty: number; facing: number; walking: boolean; emote: { text: string; life: number } | null }
+const myFarmId = randomFarmId()
+const ROOM_LOBBY = 'cloud-acres'
+const farmRoomName = (id: string) => 'farm.' + id
+const FARM_ID = /^[a-z0-9]{6,24}$/
 
-let room: Room<Shared, RoomMessage> | null = null
+/** In the lobby: level, look, farm room, farm room visited ('' at home). */
+interface LobbyState { l: number; a: number[]; f: string; at: string }
+type LobbyMessage =
+  | { type: 'wave' }
+  | { type: 'gift'; item: ItemId; count: number }
+  | { type: 'invite'; farm: string; token: string }
+  | { type: 'answer'; token: string; yes: boolean; busy?: boolean }
+/** On a farm: position, facing, walking, look, level, and the invitation's token (friends). */
+interface Shared { x: number; y: number; f: number; w: boolean; a: number[]; l: number; k?: string }
+/** What a friend does on the farm they visit: a plot (harvest / plant), or a pen / workshop. */
+type Act = { a: 'plot'; p: string; i: number; c: CropId } | { a: 'place'; p: string }
+type FarmMessage =
+  | { type: 'welcome'; token: string; snap: FarmSnapshot }
+  | { type: 'snap'; snap: FarmSnapshot }
+  | { type: 'act'; act: Act }
+  | { type: 'wave' }
+  | { type: 'bye' }
+  | { type: 'hello'; token: string }
+
+interface Person { id: string; name: string; image: HTMLImageElement | null; look: Look; level: number }
+interface Lobbyist extends Person { farmId: string; at: string }
+interface Visitor extends Person { x: number; y: number; tx: number; ty: number; facing: number; walking: boolean; emote: { text: string; life: number } | null; host: boolean }
+
+let lobby: Room<LobbyState, LobbyMessage> | null = null
+let lobbyJoining = false
+/** The other players online (lobby ids). */
+const online = new Map<string, Lobbyist>()
+/** The room of the farm on screen: yours, or the one of the friend you visit. */
+let farmRoom: Room<Shared, FarmMessage> | null = null
+let farmJoining = false
+/** People on the farm on screen: your guests, or the owner and their other guests. */
 const visitors = new Map<string, Visitor>()
+/** Invitations you sent: token -> friend (lobby id). */
+const invitesSent = new Map<string, { to: string; until: number }>()
+/** Friends on your farm (farm room ids), with a limit of actions per second. */
+const guests = new Map<string, { token: string; acts: number; second: number }>()
+/** An invitation you received. */
+let invitation: { from: Lobbyist; farm: string; token: string; life: number; max: number } | null = null
+/** The farm you visit (host: the owner's id in their farm room, once they welcomed you). */
+let visit: { farmId: string; token: string; name: string; host: string; since: number; waiting: number } | null = null
+/** The cloud curtain between two farms: k goes 0 -> 1 (covered), then back to 0. */
+let travel: { k: number; dir: 1 | -1; mid: (() => void) | null; ready: () => boolean } | null = null
 let sentState = ''
+let sentLobby = ''
 let stateTimer = 0
+let snapTimer = 0
+let snapDirty = false
+let helloTimer = 0
 let myEmote: { text: string; life: number } | null = null
 let roomWarned = false
 const giftsFrom = new Map<string, number>()
+const pendingActs: { act: Act; at: number }[] = []
 
-function sharedState(): Shared {
-  const a = farm.s.avatar
-  const walking = Math.hypot(farmer.tx - farmer.x, farmer.ty - farmer.y) > 2 || [...held].some((k) => KEYS[k])
-  return { x: Math.round(farmer.x), y: Math.round(farmer.y), f: farmer.facing, w: walking, a: [a.skin, a.hat, a.shirt, a.pants], l: farm.level }
+const num = (value: unknown, fallback: number) => (typeof value === 'number' && Number.isFinite(value) ? value : fallback)
+const avatarOf = (f: Farm) => [f.s.avatar.skin, f.s.avatar.hat, f.s.avatar.shirt, f.s.avatar.pants]
+
+function lookFrom(a: unknown): Look | null {
+  return Array.isArray(a) ? lookOf({ skin: num(a[0], 0), hat: num(a[1], 0), shirt: num(a[2], 0), pants: num(a[3], 0) }) : null
 }
 
-function applyShared(v: Visitor, s: Shared | null) {
-  if (!s || typeof s !== 'object') return
-  const n = (value: unknown, fallback: number) => (typeof value === 'number' && Number.isFinite(value) ? value : fallback)
-  v.tx = Math.min(Math.max(n(s.x, v.tx), 0), WORLD_PX_W)
-  v.ty = Math.min(Math.max(n(s.y, v.ty), 0), WORLD_PX_H)
-  v.facing = s.f === -1 ? -1 : 1
-  v.walking = !!s.w
-  if (Array.isArray(s.a)) v.look = lookOf({ skin: n(s.a[0], 0), hat: n(s.a[1], 0), shirt: n(s.a[2], 0), pants: n(s.a[3], 0) })
-  v.level = Math.max(1, Math.floor(n(s.l, 1)))
+/** Your name for the others: the website's account, or your nickname. */
+function myName() {
+  return (player && player.name) || home.s.name || `${t.farmer} ${myFarmId.slice(0, 3).toUpperCase()}`
 }
 
-function visitorOf(p: RoomPlayer<Shared>): Visitor {
-  const v: Visitor = { id: p.id, name: p.name || `${t.farmer} ${p.id.slice(-3)}`, image: null, look: lookOf({ skin: 2, hat: 1, shirt: 1, pants: 0 }), level: 1, x: HOME.x, y: HOME.y, tx: HOME.x, ty: HOME.y, facing: 1, walking: false, emote: null }
-  applyShared(v, p.state)
-  v.x = v.tx
-  v.y = v.ty
-  // Pictures of the website only (same origin, or data: URLs).
-  if (p.avatar && (p.avatar.startsWith('/') || p.avatar.startsWith('data:image/'))) {
-    v.image = new Image()
-    v.image.src = p.avatar
-  }
-  return v
-}
+const canGoOnline = () => play.canJoinRooms && home.s.online
 
-async function joinRoom() {
-  if (room || !play.canJoinRooms) return
+/** Sends without throwing (a message too large, a room closing...). */
+function safely(send: () => void) {
   try {
-    const joined = await play.joinRoom<Shared, RoomMessage>('cloud-acres', { state: sharedState() })
-    room = joined
+    send()
+  } catch (error) {
+    play.logWarning(error)
+  }
+}
+
+function personOf(p: RoomPlayer<unknown>): Person {
+  // Pictures of the website only (same origin, or data: URLs).
+  const image = p.avatar && (p.avatar.startsWith('/') || p.avatar.startsWith('data:image/')) ? Object.assign(new Image(), { src: p.avatar }) : null
+  return { id: p.id, name: (p.name || `${t.farmer} ${p.id.slice(-3).toUpperCase()}`).slice(0, 40), image, look: lookOf({ skin: 2, hat: 1, shirt: 1, pants: 0 }), level: 1 }
+}
+
+// The lobby.
+
+function lobbyState(): LobbyState {
+  return { l: home.level, a: avatarOf(home), f: myFarmId, at: visit && visit.host ? visit.farmId : '' }
+}
+
+function applyLobby(o: Lobbyist, s: LobbyState | null) {
+  if (!s || typeof s !== 'object') return
+  o.level = Math.max(1, Math.floor(num(s.l, 1)))
+  o.look = lookFrom(s.a) || o.look
+  o.farmId = typeof s.f === 'string' && FARM_ID.test(s.f) ? s.f : ''
+  o.at = typeof s.at === 'string' && FARM_ID.test(s.at) ? s.at : ''
+}
+
+function lobbyistOf(p: RoomPlayer<LobbyState>): Lobbyist {
+  const o: Lobbyist = { ...personOf(p), farmId: '', at: '' }
+  applyLobby(o, p.state)
+  return o
+}
+
+async function joinLobby() {
+  if (lobby || lobbyJoining || !canGoOnline()) return
+  lobbyJoining = true
+  try {
+    const joined = await play.joinRoom<LobbyState, LobbyMessage>(ROOM_LOBBY, { state: lobbyState(), name: myName() })
+    if (!canGoOnline()) {
+      joined.leave()
+      return
+    }
+    lobby = joined
     roomWarned = false
-    visitors.clear()
-    for (const p of joined.players.values()) visitors.set(p.id, visitorOf(p))
-    joined.on('join', (p) => {
-      const v = visitorOf(p)
-      visitors.set(p.id, v)
-      floatText(v.x, v.y - 74, `${v.name} ${t.arrived}`, '#ffffff', 14)
-      sound.coin()
-    })
+    sentLobby = JSON.stringify(lobbyState())
+    online.clear()
+    for (const p of joined.players.values()) online.set(p.id, lobbyistOf(p))
+    joined.on('join', (p) => online.set(p.id, lobbyistOf(p)))
     joined.on('leave', (p) => {
-      visitors.delete(p.id)
-      if (panel && typeof panel === 'object' && 'visitor' in panel && panel.visitor === p.id) panel = null
+      online.delete(p.id)
+      if (invitation && invitation.from.id === p.id) invitation = null
+      if (panel && typeof panel === 'object' && 'person' in panel && panel.person === p.id) panel = null
     })
     joined.on('state', (p) => {
-      const v = visitors.get(p.id)
-      if (v) applyShared(v, p.state)
+      const o = online.get(p.id)
+      if (o) applyLobby(o, p.state)
     })
-    joined.on('message', receiveFromVisitor)
+    joined.on('message', onLobbyMessage)
     joined.on('close', (reason) => {
-      room = null
-      visitors.clear()
+      if (lobby === joined) {
+        lobby = null
+        online.clear()
+        invitation = null
+      }
       // Lost connection: try again a bit later.
-      if (reason !== 'left') setTimeout(joinRoom, 5000)
+      if (reason !== 'left') setTimeout(joinLobby, 5000)
     })
   } catch (error) {
     if (!roomWarned) play.logWarning(error)
     roomWarned = true
-    setTimeout(joinRoom, 15000)
+    setTimeout(joinLobby, 15000)
+  } finally {
+    lobbyJoining = false
   }
 }
 
-function receiveFromVisitor(data: RoomMessage, from: RoomPlayer<Shared>) {
-  const v = visitors.get(from.id)
-  if (!v || !data || typeof data !== 'object') return
+function leaveLobby() {
+  const room = lobby
+  lobby = null
+  online.clear()
+  invitation = null
+  invitesSent.clear()
+  if (room) room.leave()
+}
+
+function onLobbyMessage(data: LobbyMessage, from: RoomPlayer<LobbyState>) {
+  const o = online.get(from.id)
+  if (!o || !data || typeof data !== 'object') return
   if (data.type === 'wave') {
-    v.emote = { text: '👋 ' + t.hello, life: 2.5 }
+    toast = { title: `👋 ${o.name}`, text: t.hello, life: 2.5 }
+    const v = [...visitors.values()].find((x) => x.name === o.name)
+    if (v) v.emote = { text: '👋 ' + t.hello, life: 2.5 }
     sound.coin()
   } else if (data.type === 'gift') {
     const count = Math.floor(Number(data.count))
@@ -347,36 +439,410 @@ function receiveFromVisitor(data: RoomMessage, from: RoomPlayer<Shared>) {
     const given = giftsFrom.get(from.id) || 0
     if (given >= 30) return
     giftsFrom.set(from.id, given + count)
-    const got = farm.receiveGift(data.item, count)
+    const got = home.receiveGift(data.item, count)
     if (!got) {
       barnFull(farmer.x, farmer.y - 60)
       return
     }
-    v.emote = { text: '🎁', life: 2.5 }
-    flyToBarn(data.item, v.x, v.y - 30, got)
-    toast = { title: `🎁 ${v.name}`, text: `${t.offers} ${got} ${t.items[data.item].toLowerCase()}`, life: 3.5 }
+    if (farm === home) flyToBarn(data.item, farmer.x, farmer.y - 40, got)
+    toast = { title: `🎁 ${o.name}`, text: `${t.offers} ${got} ${t.items[data.item].toLowerCase()}`, life: 3.5 }
     sound.order()
     persist()
+  } else if (data.type === 'invite') {
+    if (typeof data.farm !== 'string' || !FARM_ID.test(data.farm) || typeof data.token !== 'string' || data.token.length > 48) return
+    if (visit || travel || invitation || !started) {
+      safely(() => lobby?.send({ type: 'answer', token: data.token, yes: false, busy: true }, from.id))
+      return
+    }
+    invitation = { from: o, farm: data.farm, token: data.token, life: 30, max: 30 }
+    sound.order()
+  } else if (data.type === 'answer') {
+    const sent = invitesSent.get(data.token)
+    if (!sent || sent.to !== from.id || data.yes) return
+    invitesSent.delete(data.token)
+    toast = { title: o.name, text: data.busy ? t.busy : t.declined, life: 3 }
+    sound.denied()
   }
 }
 
-function wave(id: string) {
-  if (!room) return
-  room.send({ type: 'wave' }, id)
+function invitedAlready(id: string) {
+  for (const sent of invitesSent.values()) if (sent.to === id) return true
+  return false
+}
+
+function invite(o: Lobbyist) {
+  if (!lobby || visit || invitedAlready(o.id)) return
+  const token = randomFarmId() + randomFarmId()
+  invitesSent.set(token, { to: o.id, until: clock + 60 })
+  safely(() => lobby?.send({ type: 'invite', farm: myFarmId, token }, o.id))
+  toast = { title: t.inviteSent, text: o.name, life: 2.5 }
+  sound.coin()
+  joinFarmRoom()
+}
+
+function acceptInvitation() {
+  const inv = invitation
+  if (!inv || !lobby || travel) return
+  invitation = null
+  safely(() => lobby?.send({ type: 'answer', token: inv.token, yes: true }, inv.from.id))
+  panel = null
+  placing = null
+  tool = 'seed'
+  if (dirty) persist()
+  sound.buy()
+  startTravel(
+    () => {
+      leaveFarmRoom()
+      visit = { farmId: inv.farm, token: inv.token, name: inv.from.name, host: '', since: clock, waiting: 10 }
+      joinFarmRoom()
+    },
+    () => !visit || !!visit.host,
+  )
+}
+
+function declineInvitation() {
+  const inv = invitation
+  if (!inv) return
+  invitation = null
+  safely(() => lobby?.send({ type: 'answer', token: inv.token, yes: false }, inv.from.id))
+}
+
+function wavePerson(id: string) {
+  if (!lobby) return
+  safely(() => lobby?.send({ type: 'wave' }, id))
   myEmote = { text: '👋 ' + t.hello, life: 2.5 }
   sound.coin()
 }
 
 function giveTo(id: string, item: ItemId) {
-  const v = visitors.get(id)
-  if (!room || !v || !farm.giveGift(item, 1)) return
-  room.send({ type: 'gift', item, count: 1 }, id)
-  floatText(v.x, v.y - 74, `${t.giftSent} 1 ${t.items[item].toLowerCase()}`, '#fff6b3', 15)
+  if (!lobby || !online.has(id) || !home.giveGift(item, 1)) return
+  safely(() => lobby?.send({ type: 'gift', item, count: 1 }, id))
+  floatText(farmer.x, farmer.y - 74, `${t.giftSent} 1 ${t.items[item].toLowerCase()}`, '#fff6b3', 15)
   sound.harvest(1)
   changed()
 }
 
-function updateVisitors(dt: number) {
+// The farm room: friends on your farm, or you on a friend's farm.
+
+function sharedState(): Shared {
+  const walking = Math.hypot(farmer.tx - farmer.x, farmer.ty - farmer.y) > 2 || [...held].some((k) => KEYS[k])
+  const s: Shared = { x: Math.round(farmer.x), y: Math.round(farmer.y), f: farmer.facing, w: walking, a: avatarOf(home), l: home.level }
+  if (visit) s.k = visit.token
+  return s
+}
+
+function applyShared(v: Visitor, s: Shared | null) {
+  if (!s || typeof s !== 'object') return
+  v.tx = Math.min(Math.max(num(s.x, v.tx), 0), WORLD_PX_W)
+  v.ty = Math.min(Math.max(num(s.y, v.ty), 0), WORLD_PX_H)
+  v.facing = s.f === -1 ? -1 : 1
+  v.walking = !!s.w
+  v.look = lookFrom(s.a) || v.look
+  v.level = Math.max(1, Math.floor(num(s.l, 1)))
+}
+
+function visitorOf(p: RoomPlayer<Shared>): Visitor {
+  const v: Visitor = { ...personOf(p), x: HOME.x, y: HOME.y, tx: HOME.x, ty: HOME.y, facing: 1, walking: false, emote: null, host: false }
+  applyShared(v, p.state)
+  v.x = v.tx
+  v.y = v.ty
+  return v
+}
+
+async function joinFarmRoom() {
+  if (farmRoom || farmJoining || !canGoOnline()) return
+  const target = visit ? visit.farmId : myFarmId
+  farmJoining = true
+  try {
+    const joined = await play.joinRoom<Shared, FarmMessage>(farmRoomName(target), { state: sharedState(), name: myName() })
+    if (!canGoOnline() || (visit ? visit.farmId : myFarmId) !== target) {
+      joined.leave()
+      return
+    }
+    farmRoom = joined
+    sentState = JSON.stringify(sharedState())
+    visitors.clear()
+    for (const p of joined.players.values()) onFarmJoin(p)
+    joined.on('join', onFarmJoin)
+    joined.on('leave', onFarmLeave)
+    joined.on('state', (p) => {
+      const v = visitors.get(p.id)
+      if (v) applyShared(v, p.state)
+      else onFarmJoin(p)
+    })
+    joined.on('message', onFarmMessage)
+    joined.on('close', (reason) => {
+      if (farmRoom !== joined) return
+      farmRoom = null
+      visitors.clear()
+      guests.clear()
+      if (reason === 'left') return
+      if (visit) goHome(null)
+      else setTimeout(joinFarmRoom, 5000)
+    })
+  } catch (error) {
+    if (!roomWarned) play.logWarning(error)
+    roomWarned = true
+    if (visit) returnHome(t.inviteExpired)
+    else setTimeout(joinFarmRoom, 15000)
+  } finally {
+    farmJoining = false
+  }
+}
+
+function leaveFarmRoom() {
+  const room = farmRoom
+  farmRoom = null
+  visitors.clear()
+  guests.clear()
+  if (room) room.leave()
+}
+
+function onFarmJoin(p: RoomPlayer<Shared>) {
+  if (visitors.has(p.id)) return
+  if (visit) {
+    // On a friend's farm: everyone there (the owner is the one who welcomed you).
+    const v = visitorOf(p)
+    v.host = p.id === visit.host
+    visitors.set(p.id, v)
+    return
+  }
+  // On your farm: only the friends you invited come in.
+  const token = p.state && typeof p.state === 'object' ? p.state.k : undefined
+  if (typeof token === 'string') admitGuest(p, token)
+}
+
+/** A friend arrives with the token of your invitation: welcome, with your farm. */
+function admitGuest(p: RoomPlayer<Shared>, token: string) {
+  if (!invitesSent.has(token) || !farmRoom || guests.has(p.id)) return
+  invitesSent.delete(token)
+  guests.set(p.id, { token, acts: 0, second: 0 })
+  const v = visitorOf(p)
+  visitors.set(p.id, v)
+  const room = farmRoom
+  safely(() => room.send({ type: 'welcome', token, snap: home.snapshot() }, p.id))
+  toast = { title: v.name, text: t.guestArrived, life: 3.5 }
+  burst(v.x, v.y - 30, 24, ['#ffd54a', '#7fd6c8', '#ff9db0', '#fff'], 1, true)
+  sound.golden()
+}
+
+function onFarmLeave(p: RoomPlayer<Shared>) {
+  const v = visitors.get(p.id)
+  visitors.delete(p.id)
+  if (panel && typeof panel === 'object' && 'visitor' in panel && panel.visitor === p.id) panel = null
+  if (visit && p.id === visit.host) {
+    goHome(`${visit.name} ${t.hostLeft}`)
+    return
+  }
+  if (guests.delete(p.id) && v) toast = { title: v.name, text: t.guestLeft, life: 3 }
+}
+
+function onFarmMessage(data: FarmMessage, from: RoomPlayer<Shared>) {
+  if (!data || typeof data !== 'object') return
+  if (data.type === 'wave') {
+    const v = visitors.get(from.id)
+    if (v && (visit || guests.has(from.id))) {
+      v.emote = { text: '👋 ' + t.hello, life: 2.5 }
+      sound.coin()
+    }
+    return
+  }
+  if (visit) {
+    if (data.type === 'welcome' && data.token === visit.token && !visit.host) {
+      const view = Farm.view(data.snap)
+      if (!view) return
+      visit.host = from.id
+      farm = view
+      const v = visitors.get(from.id)
+      if (v) v.host = true
+      placeFarmer(HOME.x + 1.6 * TILE, HOME.y + 0.2 * TILE)
+      burst(farmer.x, farmer.y - 30, 30, ['#ffd54a', '#7fd6c8', '#ff9db0', '#fff'], 1.1, true)
+      sound.golden()
+    } else if (data.type === 'snap' && visit.host && from.id === visit.host && farm !== home) {
+      if (farm.applySnapshot(data.snap)) replayPending()
+    } else if (data.type === 'bye' && from.id === visit.host) goHome(t.sentHome)
+    return
+  }
+  const guest = guests.get(from.id)
+  if (data.type === 'hello' && typeof data.token === 'string') {
+    // A friend still waiting for the welcome (it may have been lost): sent again.
+    const room = farmRoom
+    if (!guest) admitGuest(from, data.token)
+    else if (guest.token === data.token && room) safely(() => room.send({ type: 'welcome', token: data.token, snap: home.snapshot() }, from.id))
+    return
+  }
+  if (!guest || data.type !== 'act') return
+  // At most 12 actions a second per friend.
+  const second = Math.floor(clock)
+  if (guest.second !== second) {
+    guest.second = second
+    guest.acts = 0
+  }
+  if (++guest.acts <= 12) runGuestAct(from.id, data.act)
+}
+
+/** Sends a friend back home (from your farm). */
+function sendHome(id: string) {
+  if (!farmRoom || !guests.has(id)) return
+  const room = farmRoom
+  safely(() => room.send({ type: 'bye' }, id))
+  guests.delete(id)
+  visitors.delete(id)
+  panel = null
+}
+
+// Visiting.
+
+type ActResult =
+  | { kind: 'harvest'; item: CropId; count: number }
+  | { kind: 'collect'; item: ItemId; count: number }
+  | { kind: 'plant' }
+  | { kind: 'fed' }
+  | { kind: 'started'; item: ItemId }
+  | { kind: 'full' }
+  | null
+
+/** The rules of an action of a friend, on a farm (yours when they send it, theirs to predict it). */
+function doAct(f: Farm, act: Act): ActResult {
+  if (!act || typeof act !== 'object') return null
+  const place = PLACES.find((p) => p.id === act.p)
+  if (!place || !f.usable(place)) return null
+  if (act.a === 'plot') {
+    if (place.kind !== 'field') return null
+    const i = Math.floor(Number(act.i))
+    if (!(i >= 0 && i < place.w * place.h)) return null
+    const plot = f.plots(place)[i]
+    if (!plot.crop) {
+      const crop = CROPS.find((c) => c.id === act.c)
+      if (!crop || crop.level > f.level) return null
+      return f.plant(place, i, crop.id) === 'ok' ? { kind: 'plant' } : null
+    }
+    if (plot.readyAt > f.clock) return null
+    const count = Math.min(f.harvestYield(), f.space())
+    const crop = f.harvest(place, i)
+    if (crop === 'full') return { kind: 'full' }
+    return crop ? { kind: 'harvest', item: crop, count } : null
+  }
+  if (act.a === 'place' && place.kind === 'pen') {
+    const status = f.penStatus(place)
+    if (status === 'ready') {
+      const product = f.collectPen(place)
+      if (product === 'full') return { kind: 'full' }
+      return product ? { kind: 'collect', item: product.item, count: product.count } : null
+    }
+    if (status === 'hungry') return f.feed(place) === 'ok' ? { kind: 'fed' } : null
+  }
+  if (act.a === 'place' && place.kind === 'workshop') {
+    const output = WORKSHOPS[place.workshop!].output
+    const collected = f.collectWorkshop(place)
+    if (collected === 'full') return { kind: 'full' }
+    if (collected) return { kind: 'collect', item: output, count: collected }
+    return f.startWorkshop(place) === 'ok' ? { kind: 'started', item: output } : null
+  }
+  return null
+}
+
+/** On your farm: what a friend did, applied for real (crops go to your barn). */
+function runGuestAct(id: string, act: Act) {
+  const v = visitors.get(id)
+  const result = doAct(home, act)
+  if (!v || !result) return
+  const place = PLACES.find((p) => p.id === act.p)!
+  let wx = (place.x + place.w / 2) * TILE
+  let wy = place.y * TILE + TILE * 0.5
+  if (act.a === 'plot') {
+    wx = (place.x + (act.i % place.w) + 0.5) * TILE
+    wy = (place.y + Math.floor(act.i / place.w) + 0.5) * TILE
+    popPlot(place, act.i)
+  } else bumpPlace(place)
+  if (result.kind === 'harvest' || result.kind === 'collect') {
+    flyToBarn(result.item, wx, wy, result.count)
+    floatText(wx, wy - 26, `${v.name} +${result.count} ${t.items[result.item]}`, '#fff6b3', 14)
+    burst(wx, wy, 8, ['#ffe08a', '#9ee07a', '#fff'], 0.5)
+    sound.harvest(1)
+  } else if (result.kind === 'plant') burst(wx, wy + 10, 4, ['#b5774a', '#d49a62'], 0.4)
+  else if (result.kind === 'fed') floatText(wx, wy - 26, `${v.name} · ${t.fed}`, '#e8ffd6', 14)
+  else if (result.kind === 'started') floatText(wx, wy - 26, `${v.name} · +1 ${t.items[result.item]}…`, '#e8ffd6', 14)
+  changed()
+}
+
+/** On a friend's farm: sends an action to the owner (it is already shown, predicted). */
+function sendAct(act: Act) {
+  if (!visit || !visit.host || !farmRoom) return
+  const room = farmRoom
+  const host = visit.host
+  safely(() => room.send({ type: 'act', act }, host))
+  pendingActs.push({ act, at: clock })
+  while (pendingActs.length > 40) pendingActs.shift()
+}
+
+/** A snapshot from the owner may not include your last actions yet: they are applied again. */
+function replayPending() {
+  while (pendingActs.length && clock - pendingActs[0].at > 1.5) pendingActs.shift()
+  for (const { act } of pendingActs) if (act.a === 'plot') doAct(farm, act)
+}
+
+/** Back to your own farm (the cloud curtain is already closed, or there is no curtain). */
+function returnHome(message: string | null) {
+  if (!visit) return
+  const away = clock - visit.since
+  leaveFarmRoom()
+  visit = null
+  farm = home
+  home.fastForward(away * speedUp)
+  pendingActs.length = 0
+  placeFarmer(HOME.x, HOME.y)
+  joinFarmRoom()
+  if (message) toast = { title: message, text: '', life: 3 }
+}
+
+function goHome(message: string | null) {
+  if (!visit || (travel && travel.dir === 1)) return
+  panel = null
+  startTravel(() => returnHome(message), () => true)
+}
+
+function startTravel(mid: () => void, ready: () => boolean) {
+  travel = { k: 0, dir: 1, mid, ready }
+  sound.shoo()
+}
+
+function placeFarmer(x: number, y: number) {
+  Object.assign(farmer, { x, y, tx: x, ty: y, idle: 0 })
+  cam.x = x
+  cam.y = y - 40
+  followCamera = keyboard
+  walkPlot = ''
+  clampCamera()
+}
+
+/** Turns online play on or off (settings). */
+function setOnline(on: boolean) {
+  home.s.online = on
+  persist()
+  if (on) {
+    joinLobby()
+    joinFarmRoom()
+    return
+  }
+  if (visit) returnHome(null)
+  leaveFarmRoom()
+  leaveLobby()
+}
+
+/** After a new nickname: the others see it once the rooms are joined again. */
+function renameInRooms() {
+  if (lobby) {
+    leaveLobby()
+    joinLobby()
+  }
+  if (farmRoom && !visit && guests.size === 0) {
+    leaveFarmRoom()
+    joinFarmRoom()
+  }
+}
+
+function updateRooms(dt: number) {
   for (const v of visitors.values()) {
     const dx = v.tx - v.x
     const dy = v.ty - v.y
@@ -393,14 +859,61 @@ function updateVisitors(dt: number) {
     if (v.emote && (v.emote.life -= dt) <= 0) v.emote = null
   }
   if (myEmote && (myEmote.life -= dt) <= 0) myEmote = null
+  if (invitation && (invitation.life -= dt) <= 0) declineInvitation()
+  for (const [token, sent] of invitesSent) if (clock > sent.until) invitesSent.delete(token)
+  // The owner did not welcome you: back home. Until then, say hello every second.
+  if (visit && !visit.host) {
+    const room = farmRoom
+    const token = visit.token
+    helloTimer -= dt
+    if (room && helloTimer <= 0) {
+      helloTimer = 1
+      safely(() => room.send({ type: 'hello', token }))
+    }
+    if ((visit.waiting -= dt) <= 0) returnHome(t.inviteExpired)
+  }
   stateTimer += dt
-  if (room && stateTimer > 0.15) {
+  if (stateTimer > 0.15) {
     stateTimer = 0
-    const state = sharedState()
-    const text = JSON.stringify(state)
-    if (text !== sentState) {
-      sentState = text
-      room.setState(state)
+    const room = farmRoom
+    if (room) {
+      const state = sharedState()
+      const text = JSON.stringify(state)
+      if (text !== sentState) {
+        sentState = text
+        safely(() => room.setState(state))
+      }
+    }
+    const hall = lobby
+    if (hall) {
+      const state = lobbyState()
+      const text = JSON.stringify(state)
+      if (text !== sentLobby) {
+        sentLobby = text
+        safely(() => hall.setState(state))
+      }
+    }
+  }
+  // Your farm, sent to your guests: soon after a change, and every 2 seconds.
+  snapTimer += dt
+  if (farmRoom && !visit && guests.size && ((snapDirty && snapTimer > 0.25) || snapTimer > 2)) {
+    const room = farmRoom
+    snapTimer = 0
+    snapDirty = false
+    safely(() => room.send({ type: 'snap', snap: home.snapshot() }))
+  }
+  if (travel) {
+    if (travel.dir === 1) {
+      travel.k = Math.min(1, travel.k + dt * 2.4)
+      if (travel.k >= 1) {
+        const mid = travel.mid
+        travel.mid = null
+        if (mid) mid()
+        if (travel && travel.ready()) travel.dir = -1
+      }
+    } else {
+      travel.k -= dt * 1.7
+      if (travel.k <= 0) travel = null
     }
   }
 }
@@ -424,8 +937,8 @@ function nearVisitor() {
 }
 
 function goTo(x: number, y: number) {
-  farmer.tx = x
-  farmer.ty = y
+  farmer.tx = Math.min(Math.max(x, 20), WORLD_PX_W - 20)
+  farmer.ty = Math.min(Math.max(y, 40), WORLD_PX_H - 10)
   farmer.idle = 0
 }
 
@@ -492,13 +1005,13 @@ function useNearby() {
     return
   }
   const zone = nearZone()
-  if (zone) panel = { zone }
+  if (zone && !visit) panel = { zone }
 }
 let barnBump = 0
 
 // --- effects ---------------------------------------------------------------------------------
 
-interface Particle { x: number; y: number; vx: number; vy: number; life: number; max: number; size: number; color: string; star: boolean; screen: boolean }
+interface Particle { x: number; y: number; vx: number; vy: number; life: number; max: number; size: number; color: string; star: boolean; screen: boolean; puff?: boolean }
 interface FloatText { x: number; y: number; text: string; life: number; color: string; size: number }
 interface Flyer { item: ItemId | 'coin'; x0: number; y0: number; x1: number; y1: number; t: number; duration: number; arrive: () => void }
 let particles: Particle[] = []
@@ -517,22 +1030,29 @@ function burst(x: number, y: number, count: number, colors: string[], power = 1,
   }
 }
 
+function dust(x: number, y: number) {
+  particles.push({ x: x + rand(-6, 6), y: y - 2, vx: rand(-12, 12), vy: rand(-14, -4), life: 0.5, max: 0.5, size: rand(4, 7), color: 'rgba(240, 225, 190, 0.8)', star: false, screen: false, puff: true })
+}
+
 function floatText(wx: number, wy: number, text: string, color = '#ffffff', size = 18) {
   floats.push({ x: wx, y: wy, text, life: 1, color, size })
 }
 
 // --- camera ----------------------------------------------------------------------------------
 
+/** Sky around the island that the camera can show (the cliff hangs under it). */
+const MARGIN = { side: 1.6 * TILE, top: 1.2 * TILE, bottom: 3.2 * TILE }
+
 function minZoom() {
-  return Math.max(width / WORLD_PX_W, height / WORLD_PX_H)
+  return Math.max(width / (WORLD_PX_W + MARGIN.side * 2), height / (WORLD_PX_H + MARGIN.top + MARGIN.bottom))
 }
 
 function clampCamera() {
   cam.zoom = Math.min(Math.max(cam.zoom, minZoom()), 2.4)
   const halfW = width / 2 / cam.zoom
   const halfH = height / 2 / cam.zoom
-  cam.x = Math.min(Math.max(cam.x, halfW), WORLD_PX_W - halfW)
-  cam.y = Math.min(Math.max(cam.y, halfH), WORLD_PX_H - halfH)
+  cam.x = Math.min(Math.max(cam.x, halfW - MARGIN.side), WORLD_PX_W + MARGIN.side - halfW)
+  cam.y = Math.min(Math.max(cam.y, halfH - MARGIN.top), WORLD_PX_H + MARGIN.bottom - halfH)
 }
 
 const toScreen = (wx: number, wy: number) => ({ x: (wx - cam.x) * cam.zoom + width / 2, y: (wy - cam.y) * cam.zoom + height / 2 })
@@ -548,7 +1068,7 @@ function resize() {
   canvas.style.height = height + 'px'
   ui = Math.min(Math.max(Math.min(width, height) / 420, 0.75), 1.5)
   // About 15 tiles across in landscape (the whole barn and the first fields).
-  cam.zoom = Math.max(Math.min(width / (15 * TILE), height / (9 * TILE)), minZoom())
+  cam.zoom = Math.max(Math.min(width / (15 * TILE), height / (9 * TILE)), Math.max(width / WORLD_PX_W, height / WORLD_PX_H) * 0.9, minZoom())
   clampCamera()
 }
 
@@ -559,38 +1079,61 @@ function paintGround() {
   ground.width = WORLD_PX_W
   ground.height = WORLD_PX_H
   const g = ground.getContext('2d') as CanvasRenderingContext2D
-  g.fillStyle = '#86c95a'
+  g.fillStyle = C.grass
   g.fillRect(0, 0, WORLD_PX_W, WORLD_PX_H)
-  // Soft checker of grass shades.
-  for (let y = 0; y < WORLD_H; y++) {
-    for (let x = 0; x < WORLD_W; x++) {
-      const n = Math.sin(x * 12.9898 + y * 78.233) * 43758.5453
-      const v = n - Math.floor(n)
-      g.fillStyle = v < 0.33 ? '#8fd062' : v < 0.66 ? '#82c455' : '#7cbf50'
-      g.fillRect(x * TILE, y * TILE, TILE, TILE)
-    }
-  }
-  // Grass tufts and flowers.
-  for (let i = 0; i < 900; i++) {
+  // Soft patches of lighter and deeper grass, like brush strokes.
+  for (let i = 0; i < 160; i++) {
     const x = Math.random() * WORLD_PX_W
     const y = Math.random() * WORLD_PX_H
-    if (Math.random() < 0.12) {
-      g.fillStyle = pick(['#ffffff', '#ffe066', '#ffadc6', '#b9d8ff'])
+    g.fillStyle = Math.random() < 0.5 ? 'rgba(200, 235, 140, 0.28)' : 'rgba(110, 170, 70, 0.18)'
+    g.beginPath()
+    g.ellipse(x, y, rand(40, 120), rand(20, 60), rand(0, Math.PI), 0, Math.PI * 2)
+    g.fill()
+  }
+  // Clover, grass tufts, little flowers and pebbles.
+  for (let i = 0; i < 1100; i++) {
+    const x = Math.random() * WORLD_PX_W
+    const y = Math.random() * WORLD_PX_H
+    const r = Math.random()
+    if (r < 0.08) {
+      const color = pick(['#ffffff', '#ffe27a', '#ffb3c6', '#c9b6ff'])
+      for (let k = 0; k < 5; k++) {
+        g.fillStyle = color
+        g.beginPath()
+        g.arc(x + Math.cos(k * 1.26) * 2.6, y + Math.sin(k * 1.26) * 2.6, 2, 0, Math.PI * 2)
+        g.fill()
+      }
+      g.fillStyle = '#ffb300'
       g.beginPath()
-      g.arc(x, y, 2.4, 0, Math.PI * 2)
+      g.arc(x, y, 1.4, 0, Math.PI * 2)
+      g.fill()
+    } else if (r < 0.2) {
+      g.fillStyle = 'rgba(95, 160, 60, 0.45)'
+      for (let k = 0; k < 3; k++) {
+        g.beginPath()
+        g.arc(x + Math.cos(k * 2.1) * 3, y + Math.sin(k * 2.1) * 3, 3, 0, Math.PI * 2)
+        g.fill()
+      }
+    } else if (r < 0.23) {
+      g.fillStyle = 'rgba(160, 150, 175, 0.6)'
+      g.beginPath()
+      g.ellipse(x, y, 4, 3, 0, 0, Math.PI * 2)
       g.fill()
     } else {
-      g.strokeStyle = 'rgba(60, 120, 40, 0.35)'
-      g.lineWidth = 1.5
+      g.strokeStyle = 'rgba(70, 130, 45, 0.4)'
+      g.lineWidth = 1.6
+      g.lineCap = 'round'
       g.beginPath()
       g.moveTo(x, y)
-      g.lineTo(x - 2, y - 5)
+      g.quadraticCurveTo(x - 1, y - 4, x - 3, y - 6)
       g.moveTo(x, y)
-      g.lineTo(x + 2, y - 5)
+      g.lineTo(x, y - 7)
+      g.moveTo(x, y)
+      g.quadraticCurveTo(x + 1, y - 4, x + 3, y - 6)
       g.stroke()
     }
   }
-  // Dirt paths.
+  // Sand paths with stepping stones.
   const paths: [number, number][][] = [
     [[0.6, 4.5], [31.6, 4.5]],
     [[10.1, 0.4], [10.1, 14.6]],
@@ -602,8 +1145,9 @@ function paintGround() {
   g.lineCap = 'round'
   g.lineJoin = 'round'
   for (const [color, w] of [
-    ['#c9a26f', 44],
-    ['#dcbb88', 36],
+    ['rgba(61, 42, 69, 0.55)', 46],
+    [C.sandEdge, 43],
+    [C.sand, 35],
   ] as [string, number][]) {
     g.strokeStyle = color
     g.lineWidth = w
@@ -613,14 +1157,30 @@ function paintGround() {
       g.stroke()
     }
   }
-  for (let i = 0; i < 260; i++) {
+  for (const path of paths) {
+    const length = Math.hypot(path[1][0] - path[0][0], path[1][1] - path[0][1]) * TILE
+    for (let d = 20; d < length; d += 34) {
+      const k = d / length
+      const x = (path[0][0] + (path[1][0] - path[0][0]) * k) * TILE + rand(-5, 5)
+      const y = (path[0][1] + (path[1][1] - path[0][1]) * k) * TILE + rand(-5, 5)
+      g.fillStyle = 'rgba(200, 165, 110, 0.45)'
+      g.beginPath()
+      g.ellipse(x + 1, y + 2, rand(7, 10), rand(5, 7), rand(0, 1), 0, Math.PI * 2)
+      g.fill()
+      g.fillStyle = '#fbeccb'
+      g.beginPath()
+      g.ellipse(x, y, rand(7, 10), rand(5, 7), rand(0, 1), 0, Math.PI * 2)
+      g.fill()
+    }
+  }
+  for (let i = 0; i < 220; i++) {
     const path = pick(paths)
     const k = Math.random()
     const x = (path[0][0] + (path[1][0] - path[0][0]) * k) * TILE + rand(-14, 14)
     const y = (path[0][1] + (path[1][1] - path[0][1]) * k) * TILE + rand(-14, 14)
-    g.fillStyle = 'rgba(150, 110, 70, 0.35)'
+    g.fillStyle = 'rgba(170, 130, 80, 0.35)'
     g.beginPath()
-    g.arc(x, y, rand(1, 2.5), 0, Math.PI * 2)
+    g.arc(x, y, rand(1, 2.2), 0, Math.PI * 2)
     g.fill()
   }
 }
@@ -669,22 +1229,25 @@ function updateWalkers(dt: number) {
 
 function changed() {
   dirty = true
+  snapDirty = true
 }
 
 function persist() {
   dirty = false
   saveTimer = 0
-  play.save(farm.toSave()).catch((error) => play.logWarning(error))
+  play.save(home.toSave()).catch((error) => play.logWarning(error))
 }
 
 let menuY = 0
 function screenOfBarnButton() {
-  return { x: width - 46 * ui, y: menuY || height - 46 * ui }
+  return barnButton.x ? { x: barnButton.x, y: barnButton.y } : { x: width - 46 * ui, y: menuY || height - 46 * ui }
 }
 
 function flyToBarn(item: ItemId, wx: number, wy: number, count = 1) {
   const from = toScreen(wx, wy)
-  const to = screenOfBarnButton()
+  // On a friend's farm, things go to their barn (on the map).
+  const barn = PLACES[0]
+  const to = farm === home ? screenOfBarnButton() : toScreen((barn.x + barn.w / 2) * TILE, (barn.y + barn.h * 0.6) * TILE)
   for (let i = 0; i < Math.min(count, 4); i++) {
     flyers.push({ item, x0: from.x + rand(-6, 6), y0: from.y + rand(-6, 6), x1: to.x, y1: to.y, t: -i * 0.08, duration: 0.65, arrive: () => (barnBump = 1) })
   }
@@ -697,8 +1260,8 @@ function flyCoins(sx: number, sy: number, amount: number) {
       item: 'coin',
       x0: sx + rand(-10, 10),
       y0: sy + rand(-10, 10),
-      x1: width - 128 * ui,
-      y1: 33 * ui,
+      x1: coinChip.x || width - 128 * ui,
+      y1: coinChip.y || 33 * ui,
       t: -i * 0.06,
       duration: 0.6,
       arrive: () => {
@@ -745,6 +1308,15 @@ function tapPlace(place: Place) {
   const cx = (place.x + place.w / 2) * TILE
   const top = place.y * TILE
   goTo(cx, (place.y + place.h) * TILE + 12)
+  bumpPlace(place)
+  if (visit) {
+    // On a friend's farm: only pens and workshops (their barn, orders and shop are theirs).
+    if (!farm.usable(place) || (place.kind !== 'pen' && place.kind !== 'workshop')) {
+      floatText(cx, top, t.notYourFarm, '#ffe0e0', 15)
+      return
+    }
+    sendAct({ a: 'place', p: place.id })
+  }
   if (!farm.owns(place.id)) {
     panel = { buy: place }
     return
@@ -827,6 +1399,8 @@ function actOnPlot(hit: { place: Place; index: number }) {
   if (!plot.crop) {
     const result = farm.plant(hit.place, hit.index, selected)
     if (result === 'ok') {
+      sendAct({ a: 'plot', p: hit.place.id, i: hit.index, c: selected })
+      popPlot(hit.place, hit.index)
       sound.plant()
       burst(wx, wy + 10, 5, ['#8a5a36', '#a87148'], 0.4)
       changed()
@@ -843,6 +1417,8 @@ function actOnPlot(hit: { place: Place; index: number }) {
         barnFull(wx, wy - 20)
       }
     } else if (crop) {
+      sendAct({ a: 'plot', p: hit.place.id, i: hit.index, c: selected })
+      popPlot(hit.place, hit.index)
       chain++
       sound.harvest(chain - 1)
       burst(wx, wy, 8, [CROPS.find((c) => c.id === crop)!.color, '#7bc950', '#fff'], 0.5)
@@ -855,7 +1431,7 @@ function actOnPlot(hit: { place: Place; index: number }) {
 function endSwipe(wx: number, wy: number) {
   if (chain >= 4) {
     const bonus = chain
-    farm.s.coins += bonus
+    home.s.coins += bonus
     floatText(wx, wy - 30, `COMBO x${chain} +${bonus}`, '#ffffff', 20)
     const s = toScreen(wx, wy)
     flyCoins(s.x, s.y, bonus)
@@ -911,7 +1487,7 @@ function updateTractor(dt: number) {
 function updateFarmer(dt: number) {
   let kx = 0
   let ky = 0
-  if (!panel && !paused && started) {
+  if (!panel && !paused && started && !travel) {
     for (const key of held) {
       const dir = KEYS[key]
       if (dir) {
@@ -992,7 +1568,9 @@ function placeDecorAt(wx: number, wy: number) {
 }
 
 function handleFarmEvents() {
-  for (const event of farm.events.splice(0)) {
+  const events = farm.events.splice(0)
+  if (farm !== home) return
+  for (const event of events) {
     if (event.type === 'truck-out') {
       sound.coin()
       floatText(TRUCK_HOME.x, TRUCK_HOME.y - 50, t.delivery + '…', '#e8f4ff', 15)
@@ -1027,13 +1605,23 @@ function levelUp(level: number) {
 
 // --- update ----------------------------------------------------------------------------------
 
+let dustTimer = 0
+
 function update(dt: number) {
   clock += dt
   if (started && !paused) farm.advance(dt * speedUp)
   updateWalkers(dt)
   updateFarmer(dt)
-  if (started && !paused) for (const id of WORKER_IDS) updateWorker(id, dt)
-  updateVisitors(dt)
+  if (started && !paused && farm === home) for (const id of WORKER_IDS) updateWorker(id, dt)
+  updateRooms(dt)
+  updateLife(dt)
+  for (const r of rings) r.life -= dt * 2
+  rings = rings.filter((r) => r.life > 0)
+  dustTimer -= dt
+  if (dustTimer <= 0 && started && (Math.hypot(farmer.tx - farmer.x, farmer.ty - farmer.y) > 2 || (!panel && [...held].some((k) => KEYS[k])))) {
+    dustTimer = 0.14
+    dust(farmer.x, farmer.y)
+  }
   if (followCamera) {
     const k = Math.min(1, dt * 4)
     cam.x += (farmer.x - cam.x) * k
@@ -1045,7 +1633,7 @@ function update(dt: number) {
   coinBump = Math.max(0, coinBump - dt * 4)
   barnBump = Math.max(0, barnBump - dt * 4)
   for (const p of particles) {
-    p.vy += 260 * dt
+    if (!p.puff) p.vy += 260 * dt
     p.x += p.vx * dt
     p.y += p.vy * dt
     p.life -= dt
@@ -1062,6 +1650,7 @@ function update(dt: number) {
   }
   flyers = flyers.filter((f) => f.t < f.duration)
   if (toast) {
+    if (toast.max === undefined) toast.max = toast.life
     toast.life -= dt
     if (toast.life <= 0) toast = null
   }
@@ -1075,13 +1664,30 @@ function update(dt: number) {
 
 // --- drawing helpers -------------------------------------------------------------------------
 
-function text(value: string, x: number, y: number, size: number, color: string, align: CanvasTextAlign = 'center', weight = 800, outline: string | null = 'rgba(40, 30, 60, 0.55)') {
+const clamp01 = (k: number) => Math.min(1, Math.max(0, k))
+const easeOut = (k: number) => 1 - Math.pow(1 - clamp01(k), 3)
+const easeBack = (k: number) => {
+  const c = 1.70158
+  const x = clamp01(k) - 1
+  return 1 + (c + 1) * x * x * x + c * x * x
+}
+
+/** A color lighter (k > 0) or darker (k < 0). */
+function shade(hex: string, k: number) {
+  const n = parseInt(hex.slice(1, 7), 16)
+  const f = (v: number) => Math.round(Math.min(255, Math.max(0, k < 0 ? v * (1 + k) : v + (255 - v) * k)))
+  return `rgb(${f(n >> 16)}, ${f((n >> 8) & 255)}, ${f(n & 255)})`
+}
+
+const INK_TEXT = 'rgba(61, 42, 69, 0.85)'
+
+function text(value: string, x: number, y: number, size: number, color: string, align: CanvasTextAlign = 'center', weight = 800, outline: string | null = INK_TEXT) {
   ctx.font = `${weight} ${Math.round(size)}px ${FONT}`
   ctx.textAlign = align
   ctx.textBaseline = 'middle'
   if (outline) {
     ctx.lineJoin = 'round'
-    ctx.lineWidth = Math.max(2, size * 0.18)
+    ctx.lineWidth = Math.max(2.5, size * 0.22)
     ctx.strokeStyle = outline
     ctx.strokeText(value, x, y)
   }
@@ -1089,33 +1695,91 @@ function text(value: string, x: number, y: number, size: number, color: string, 
   ctx.fillText(value, x, y)
 }
 
+/** The size at which a text fits in `maxW` pixels. */
+function fitSize(value: string, maxW: number, size: number, weight = 800) {
+  ctx.font = `${weight} ${Math.round(size)}px ${FONT}`
+  const w = ctx.measureText(value).width
+  return w > maxW ? Math.max(8, (size * maxW) / w) : size
+}
+
+function clip(value: string, max: number) {
+  return value.length > max ? value.slice(0, max - 1) + '…' : value
+}
+
 interface Button { x: number; y: number; w: number; h: number; action: () => void; enabled: boolean }
 let buttons: Button[] = []
+/** The mouse (hover) and the last press (buttons sink when pressed). */
+let mouse: { x: number; y: number } | null = null
+let press: { x: number; y: number; at: number } | null = null
+const inside = (b: { x: number; y: number; w: number; h: number }, p: { x: number; y: number } | null) => !!p && p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h
 
-function button(label: string, x: number, y: number, w: number, h: number, color: string, enabled: boolean, action: () => void) {
-  ctx.fillStyle = 'rgba(40, 30, 60, 0.25)'
-  roundRect(ctx, x, y + 3, w, h, h / 2)
+/** A card of paper with an ink outline and a soft shadow. */
+function card(x: number, y: number, w: number, h: number, r: number, color: string = C.paper, ink = 2.5) {
+  ctx.fillStyle = 'rgba(61, 42, 69, 0.2)'
+  roundRect(ctx, x + 2, y + 5, w, h, r)
   ctx.fill()
-  ctx.fillStyle = enabled ? color : '#c9c1b6'
-  roundRect(ctx, x, y, w, h, h / 2)
+  roundRect(ctx, x, y, w, h, r)
+  paint(ctx, color, ink)
+}
+
+/** A thick button that sinks when pressed and lights up under the mouse. */
+function button(label: string, x: number, y: number, w: number, h: number, color: string, enabled: boolean, action: () => void, icon?: (cx: number, cy: number, s: number) => void) {
+  const pressed = !!press && clock - press.at < 0.16 && inside({ x, y, w, h }, press)
+  const hover = enabled && inside({ x, y, w, h }, mouse)
+  const depth = Math.max(3, h * 0.13)
+  const hf = h - depth
+  const top = pressed ? y + depth * 0.75 : hover ? y - 1 : y
+  const face = enabled ? (hover ? shade(color, 0.12) : color) : '#d5ccc2'
+  const edge = enabled ? shade(color, -0.32) : '#aea398'
+  const r = Math.min(hf / 2, 14 * ui)
+  roundRect(ctx, x, y + depth, w, hf, r)
+  paint(ctx, edge, 2)
+  roundRect(ctx, x, top, w, hf, r)
+  paint(ctx, face, 2)
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.28)'
+  roundRect(ctx, x + r * 0.6, top + hf * 0.12, w - r * 1.2, hf * 0.26, hf * 0.13)
   ctx.fill()
-  text(label, x + w / 2, y + h / 2, Math.min(h * 0.42, (w / Math.max(label.length, 1)) * 1.7), '#fff', 'center', 900, 'rgba(0,0,0,0.22)')
+  const iconW = icon ? hf * 0.8 : 0
+  const size = fitSize(label, w - 14 * ui - iconW, Math.min(hf * 0.46, 17 * ui), 900)
+  ctx.font = `900 ${Math.round(size)}px ${FONT}`
+  const tw = ctx.measureText(label).width
+  const startX = x + (w - tw - iconW) / 2
+  if (icon) icon(startX + iconW * 0.4, top + hf / 2, hf * 0.32)
+  text(label, startX + iconW + tw / 2, top + hf / 2 + 1, size, enabled ? '#fff' : '#f4efe9', 'center', 900, enabled ? 'rgba(61, 42, 69, 0.55)' : 'rgba(61,42,69,0.3)')
   buttons.push({ x, y, w, h, action, enabled })
+}
+
+const coinIcon = (cx: number, cy: number, s: number) => drawCoin(ctx, cx, cy, s)
+
+function coinButton(price: number, x: number, y: number, w: number, h: number, color: string, enabled: boolean, action: () => void) {
+  button(String(price), x, y, w, h, color, enabled, action, coinIcon)
+}
+
+/** An on / off switch (settings). */
+function toggle(on: boolean, x: number, y: number, w: number, h: number, enabled: boolean, action: () => void) {
+  const k = on ? 1 : 0
+  roundRect(ctx, x, y, w, h, h / 2)
+  paint(ctx, !enabled ? '#d5ccc2' : on ? C.teal : '#d8cfe0', 2)
+  const r = h / 2 - 3
+  const cx = x + h / 2 + (w - h) * k
+  ellipse(ctx, cx, y + h / 2 + 1, r, r, 'rgba(61,42,69,0.2)')
+  ellipse(ctx, cx, y + h / 2, r, r, '#fff', 0, 2)
+  buttons.push({ x, y, w, h, enabled, action })
 }
 
 function bubble(x: number, y: number, r: number, draw: () => void, bounce = 0) {
   const by = y - Math.abs(Math.sin(clock * 4)) * bounce
-  ctx.fillStyle = 'rgba(40, 30, 60, 0.18)'
+  ctx.fillStyle = 'rgba(61, 42, 69, 0.18)'
   ctx.beginPath()
-  ctx.arc(x, by + 3, r, 0, Math.PI * 2)
+  ctx.arc(x + 2, by + 4, r, 0, Math.PI * 2)
   ctx.fill()
-  ctx.fillStyle = '#fffaf0'
   ctx.beginPath()
-  ctx.arc(x, by, r, 0, Math.PI * 2)
-  ctx.moveTo(x - r * 0.3, by + r * 0.85)
-  ctx.lineTo(x, by + r * 1.35)
-  ctx.lineTo(x + r * 0.3, by + r * 0.85)
-  ctx.fill()
+  ctx.moveTo(x - r * 0.32, by + r * 0.8)
+  ctx.lineTo(x, by + r * 1.4)
+  ctx.lineTo(x + r * 0.32, by + r * 0.8)
+  ctx.arc(x, by, r, Math.PI * 0.62, Math.PI * 0.38)
+  ctx.closePath()
+  paint(ctx, C.paper, 2)
   ctx.save()
   ctx.translate(0, by - y)
   draw()
@@ -1123,8 +1787,9 @@ function bubble(x: number, y: number, r: number, draw: () => void, bounce = 0) {
 }
 
 function ring(x: number, y: number, r: number, k: number, color: string) {
-  ctx.strokeStyle = 'rgba(90, 70, 54, 0.2)'
-  ctx.lineWidth = 4
+  ctx.lineCap = 'round'
+  ctx.strokeStyle = 'rgba(61, 42, 69, 0.15)'
+  ctx.lineWidth = 5
   ctx.beginPath()
   ctx.arc(x, y, r, 0, Math.PI * 2)
   ctx.stroke()
@@ -1136,29 +1801,32 @@ function ring(x: number, y: number, r: number, k: number, color: string) {
 
 /** A small label under a character (workers, other farmers). */
 function nameTag(label: string, x: number, y: number, background: string, color: string) {
-  ctx.font = '800 11px ' + FONT
-  const w = ctx.measureText(label).width + 14
-  ctx.fillStyle = background
-  roundRect(ctx, x - w / 2, y, w, 18, 9)
-  ctx.fill()
-  text(label, x, y + 9, 11, color, 'center', 800, null)
+  ctx.font = '900 11px ' + FONT
+  const w = ctx.measureText(label).width + 16
+  roundRect(ctx, x - w / 2, y, w, 19, 9.5)
+  paint(ctx, background, 1.5)
+  text(label, x, y + 10, 11, color, 'center', 900, null)
 }
 
 /** A speech bubble over a character (a wave, a gift). */
 function emoteBubble(label: string, x: number, y: number, life: number) {
+  const k = easeBack(Math.min(1, (2.5 - life) * 5))
   ctx.globalAlpha = Math.min(1, life * 2)
   ctx.font = '900 14px ' + FONT
-  const w = ctx.measureText(label).width + 20
-  const by = y - Math.min(1, (2.5 - life) * 6) * 6
-  ctx.fillStyle = '#fffaf0'
-  roundRect(ctx, x - w / 2, by - 14, w, 28, 14)
-  ctx.fill()
+  const w = ctx.measureText(label).width + 22
+  ctx.save()
+  ctx.translate(x, y + 14)
+  ctx.scale(k, k)
   ctx.beginPath()
-  ctx.moveTo(x - 6, by + 13)
-  ctx.lineTo(x, by + 22)
-  ctx.lineTo(x + 6, by + 13)
-  ctx.fill()
-  text(label, x, by, 14, '#5a4636', 'center', 900, null)
+  roundRect(ctx, -w / 2, -28, w, 28, 14)
+  paint(ctx, C.paper, 2)
+  ctx.beginPath()
+  ctx.moveTo(-6, -1)
+  ctx.lineTo(0, 8)
+  ctx.lineTo(6, -1)
+  paint(ctx, C.paper)
+  text(label, 0, -14, 14, C.text, 'center', 900, null)
+  ctx.restore()
   ctx.globalAlpha = 1
 }
 
@@ -1166,65 +1834,324 @@ function emoteBubble(label: string, x: number, y: number, life: number) {
 function upgradeStars(level: number, x: number, y: number) {
   if (level <= 1) return
   for (let i = 0; i < level - 1; i++) {
-    const sx = x + i * 14
-    ctx.fillStyle = 'rgba(120, 70, 10, 0.5)'
-    star4(ctx, sx + 1, y + 1.5, 7)
-    ctx.fillStyle = '#ffd54a'
-    star4(ctx, sx, y, 7)
+    const sx = x + i * 15
+    const s = 1 + Math.sin(clock * 3 + i) * 0.08
+    ctx.fillStyle = C.ink
+    star4(ctx, sx, y + 1, 8.5 * s)
+    ctx.fillStyle = C.gold
+    star4(ctx, sx, y, 7 * s)
   }
+}
+
+/** A round picture: the website's picture of a player, or their farmer's face. */
+function face(person: { image: HTMLImageElement | null; look: Look }, cx: number, cy: number, r: number) {
+  ctx.save()
+  ctx.beginPath()
+  ctx.arc(cx, cy, r, 0, Math.PI * 2)
+  ctx.fillStyle = '#cfe9ff'
+  ctx.fill()
+  ctx.clip()
+  if (person.image && person.image.complete && person.image.naturalWidth) ctx.drawImage(person.image, cx - r, cy - r, r * 2, r * 2)
+  else drawFarmerFace(ctx, person.look, cx, cy + r * 0.12, r * 1.7, clock)
+  ctx.restore()
+  ctx.strokeStyle = C.ink
+  ctx.lineWidth = 2
+  ctx.beginPath()
+  ctx.arc(cx, cy, r, 0, Math.PI * 2)
+  ctx.stroke()
+}
+
+// --- the sky, the island and the light of the day ----------------------------------------------
+
+/** The light over 7 minutes: morning, noon, golden hour, dusk (sky top, sky bottom, light multiplied on the farm). */
+const DAY: [number, number[], number[], number[]][] = [
+  [0, [140, 196, 255], [255, 216, 190], [255, 242, 228]],
+  [0.3, [110, 188, 255], [205, 238, 255], [255, 255, 255]],
+  [0.55, [118, 148, 228], [255, 196, 140], [255, 228, 190]],
+  [0.72, [74, 72, 152], [232, 142, 162], [196, 178, 240]],
+  [0.86, [104, 124, 204], [250, 192, 190], [240, 214, 232]],
+  [1, [140, 196, 255], [255, 216, 190], [255, 242, 228]],
+]
+const DAY_LENGTH = 420
+// ?light=golden (or morning, noon, dusk) starts the day at that moment (to see it at once).
+const DAY_START = ({ morning: 0, noon: 0.3, golden: 0.55, dusk: 0.72 } as Record<string, number>)[new URLSearchParams(location.search).get('light') || ''] ?? 0.1
+
+function daylight() {
+  const p = (clock / DAY_LENGTH + DAY_START) % 1
+  let i = 0
+  while (i < DAY.length - 2 && DAY[i + 1][0] < p) i++
+  const [p0, top0, bottom0, tint0] = DAY[i]
+  const [p1, top1, bottom1, tint1] = DAY[i + 1]
+  const k = (p - p0) / (p1 - p0)
+  const mix = (a: number[], b: number[]) => a.map((v, j) => v + (b[j] - v) * k)
+  const rgb = (c: number[]) => `rgb(${c.slice(0, 3).map(Math.round).join(',')})`
+  const tint = mix(tint0, tint1)
+  return { top: rgb(mix(top0, top1)), bottom: rgb(mix(bottom0, bottom1)), tint: rgb(tint), dusk: Math.max(0, 1 - Math.abs(p - 0.72) / 0.12) }
+}
+
+/** Cloud puffs around the island (world coordinates), some far below it, some in front. */
+const PUFFS: { x: number; y: number; s: number; near: boolean }[] = (() => {
+  const list: { x: number; y: number; s: number; near: boolean }[] = []
+  const r = (i: number) => {
+    const n = Math.sin(i * 91.7 + 13.1) * 43758.5453
+    return n - Math.floor(n)
+  }
+  for (let i = 0; i < 16; i++) list.push({ x: (i / 15) * WORLD_PX_W, y: WORLD_PX_H + 120 + r(i) * 60, s: 90 + r(i + 40) * 70, near: i % 2 === 0 })
+  for (let i = 0; i < 14; i++) list.push({ x: (i / 13) * WORLD_PX_W, y: -50 - r(i + 7) * 50, s: 70 + r(i + 9) * 50, near: false })
+  for (let i = 0; i < 6; i++) {
+    list.push({ x: -70 - r(i + 3) * 40, y: (i / 5) * WORLD_PX_H, s: 80 + r(i + 5) * 40, near: i % 2 === 1 })
+    list.push({ x: WORLD_PX_W + 70 + r(i + 8) * 40, y: (i / 5) * WORLD_PX_H, s: 80 + r(i + 2) * 40, near: i % 2 === 0 })
+  }
+  return list
+})()
+
+function drawPuffs(near: boolean) {
+  for (const [i, p] of PUFFS.entries()) {
+    if (p.near !== near) continue
+    const dx = Math.sin(clock * 0.15 + i) * 16
+    const dy = Math.cos(clock * 0.11 + i * 2) * 6
+    if (!near) drawCloud(ctx, p.x + dx, p.y + dy + 16, p.s, 'rgba(160, 150, 210, 0.25)')
+    drawCloud(ctx, p.x + dx, p.y + dy, p.s, near ? 'rgba(255, 255, 255, 0.96)' : 'rgba(255, 255, 255, 0.8)')
+  }
+}
+
+/** The island: grass on top, and its cliff of earth with hanging roots under the farm. */
+function drawIsland() {
+  const W = WORLD_PX_W
+  const H = WORLD_PX_H
+  drawPuffs(false)
+  ctx.beginPath()
+  ctx.moveTo(10, H - 50)
+  ctx.lineTo(W - 10, H - 50)
+  const steps = 26
+  for (let i = steps; i >= 0; i--) {
+    const x = (i / steps) * W
+    const n = Math.sin(i * 12.9898) * 43758.5453
+    const drop = 70 + (n - Math.floor(n)) * 70 + Math.sin(i * 0.8) * 20
+    ctx.lineTo(x, H + drop)
+  }
+  ctx.closePath()
+  const g = ctx.createLinearGradient(0, H - 40, 0, H + 150)
+  g.addColorStop(0, '#b97d4f')
+  g.addColorStop(0.5, '#93603d')
+  g.addColorStop(1, '#6d4430')
+  paint(ctx, '#93603d', 3)
+  ctx.save()
+  ctx.clip()
+  ctx.fillStyle = g
+  ctx.fillRect(0, H - 60, W, 240)
+  ctx.strokeStyle = 'rgba(61, 42, 69, 0.25)'
+  ctx.lineWidth = 3
+  for (const k of [30, 62, 98]) {
+    ctx.beginPath()
+    for (let x = 0; x <= W; x += 40) ctx.lineTo(x, H + k + Math.sin(x * 0.02 + k) * 6)
+    ctx.stroke()
+  }
+  ctx.fillStyle = 'rgba(255, 220, 170, 0.25)'
+  for (let i = 0; i < 40; i++) {
+    ctx.beginPath()
+    ctx.arc((i * 97) % W, H + 20 + ((i * 53) % 110), 3 + (i % 3), 0, Math.PI * 2)
+    ctx.fill()
+  }
+  ctx.restore()
+  // Hanging roots and vines, swaying.
+  for (let i = 0; i < 18; i++) {
+    const x = 60 + ((i * 263) % (W - 120))
+    const len = 40 + ((i * 37) % 70)
+    const sway = Math.sin(clock * 1.2 + i) * 6
+    ctx.strokeStyle = i % 3 ? '#6a4a36' : C.leafDark
+    ctx.lineWidth = i % 3 ? 2 : 3
+    ctx.beginPath()
+    ctx.moveTo(x, H + 30)
+    ctx.quadraticCurveTo(x + sway, H + 30 + len * 0.6, x + sway * 1.6, H + 30 + len)
+    ctx.stroke()
+    if (i % 3 === 0) for (let k = 1; k < 4; k++) leaf(ctx, x + sway * (k / 3), H + 30 + (len * k) / 4, 8, k % 2 ? 0.9 : -0.9, C.leaf)
+  }
+  drawPuffs(true)
+  // The grass.
+  ctx.save()
+  roundRect(ctx, 0, 0, W, H, 60)
+  ctx.clip()
+  ctx.drawImage(ground, 0, 0)
+  ctx.restore()
+  ctx.strokeStyle = C.ink
+  ctx.lineWidth = 3
+  roundRect(ctx, 0, 0, W, H, 60)
+  ctx.stroke()
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.35)'
+  ctx.lineWidth = 4
+  roundRect(ctx, 5, 5, W - 10, H - 10, 56)
+  ctx.stroke()
+}
+
+// --- life on the island: butterflies, birds, fireflies -----------------------------------------
+
+interface Butterfly { x: number; y: number; tx: number; ty: number; color: string; phase: number }
+const butterflies: Butterfly[] = Array.from({ length: 6 }, (_, i) => {
+  const x = rand(1, 22) * TILE
+  const y = rand(1, 14) * TILE
+  return { x, y, tx: x, ty: y, color: [C.rose, C.gold, '#ffffff', '#b99cff', C.sky, C.coral][i], phase: rand(0, 6) }
+})
+let flock: { x: number; y: number; dir: number } | null = null
+let flockTimer = 8
+
+function updateLife(dt: number) {
+  for (const b of butterflies) {
+    const dx = b.tx - b.x
+    const dy = b.ty - b.y
+    const d = Math.hypot(dx, dy)
+    if (d < 8) {
+      b.tx = Math.min(Math.max(b.x + rand(-180, 180), 40), WORLD_PX_W - 40)
+      b.ty = Math.min(Math.max(b.y + rand(-140, 140), 40), WORLD_PX_H - 40)
+    } else {
+      b.x += (dx / d) * 40 * dt + Math.sin(clock * 3 + b.phase) * 0.6
+      b.y += (dy / d) * 40 * dt + Math.cos(clock * 4 + b.phase) * 0.6
+    }
+  }
+  flockTimer -= dt
+  if (!flock && flockTimer <= 0) {
+    const dir = Math.random() < 0.5 ? 1 : -1
+    flock = { x: dir > 0 ? -200 : WORLD_PX_W + 200, y: rand(1, 12) * TILE, dir }
+  }
+  if (flock) {
+    flock.x += flock.dir * 110 * dt
+    flock.y -= 8 * dt
+    if (flock.x < -300 || flock.x > WORLD_PX_W + 300) {
+      flock = null
+      flockTimer = rand(18, 35)
+    }
+  }
+}
+
+function drawButterflies() {
+  for (const b of butterflies) {
+    const flap = Math.abs(Math.sin(clock * 14 + b.phase))
+    const y = b.y - 30 + Math.sin(clock * 2 + b.phase) * 4
+    ellipse(ctx, b.x, b.y, 4, 1.5, 'rgba(61,42,69,0.12)')
+    for (const side of [-1, 1]) ellipse(ctx, b.x + side * 3.5 * flap, y, 3.5 * flap + 0.5, 4.5, b.color, side * 0.4, 1)
+    ellipse(ctx, b.x, y, 1, 3, C.ink)
+  }
+}
+
+function drawFlock() {
+  if (!flock) return
+  for (let i = 0; i < 5; i++) {
+    const x = flock.x - flock.dir * (Math.abs(i - 2) * 26)
+    const y = flock.y + (i - 2) * 16
+    const flap = Math.sin(clock * 9 + i) * 6
+    ellipse(ctx, x + 30, y + 140, 7, 3, 'rgba(61,42,69,0.1)')
+    ctx.strokeStyle = C.ink
+    ctx.lineWidth = 2.5
+    ctx.beginPath()
+    ctx.moveTo(x - 9, y - flap)
+    ctx.quadraticCurveTo(x - 4, y - 3, x, y)
+    ctx.quadraticCurveTo(x + 4, y - 3, x + 9, y - flap)
+    ctx.stroke()
+  }
+}
+
+function drawFireflies(dusk: number) {
+  if (dusk <= 0.05) return
+  ctx.globalCompositeOperation = 'lighter'
+  for (let i = 0; i < 26; i++) {
+    const [tx, ty] = TREES[i % TREES.length]
+    const x = tx * TILE + Math.sin(clock * 0.7 + i * 1.7) * 60
+    const y = ty * TILE - 20 + Math.cos(clock * 0.9 + i * 2.3) * 40
+    const glow = dusk * (0.5 + 0.5 * Math.sin(clock * 3 + i))
+    ellipse(ctx, x, y, 9, 9, `rgba(255, 240, 150, ${0.18 * glow})`)
+    ellipse(ctx, x, y, 2.2, 2.2, `rgba(255, 250, 200, ${glow})`)
+  }
+  ctx.globalCompositeOperation = 'source-over'
 }
 
 // --- world -----------------------------------------------------------------------------------
 
+/** When things were last planted / harvested / tapped, for their little bounce. */
+const plotPops = new Map<string, number>()
+const placeBumps = new Map<string, number>()
+interface Ring { x: number; y: number; life: number; color: string }
+let rings: Ring[] = []
+
+function popPlot(place: Place, index: number) {
+  plotPops.set(place.id + ':' + index, clock)
+  const x = (place.x + (index % place.w) + 0.5) * TILE
+  const y = (place.y + Math.floor(index / place.w) + 0.7) * TILE
+  rings.push({ x, y, life: 1, color: 'rgba(255, 245, 220, 0.9)' })
+}
+
+function bumpPlace(place: Place) {
+  placeBumps.set(place.id, clock)
+}
+
+/** Draws a building with a squash when it was just tapped. */
+function bumped(id: string, cx: number, base: number, draw: () => void) {
+  const at = placeBumps.get(id)
+  const k = at === undefined ? 1 : clamp01((clock - at) / 0.5)
+  if (k >= 1) {
+    draw()
+    return
+  }
+  const amp = Math.sin(k * Math.PI * 3) * (1 - k) * 0.09
+  ctx.save()
+  ctx.translate(cx, base)
+  ctx.scale(1 + amp, 1 - amp)
+  ctx.translate(-cx, -base)
+  draw()
+  ctx.restore()
+}
+
+function woodenSign(x: number, y: number, w: number, h: number, highlight: boolean) {
+  roundRect(ctx, x - 4, y + h - 6, 8, 30, 3)
+  paint(ctx, C.woodDark, 2)
+  roundRect(ctx, x - w / 2, y, w, h, 10)
+  paint(ctx, highlight ? '#ffeec2' : '#f3e7d6', 2.5)
+  roundRect(ctx, x - w / 2 + 4, y + 4, w - 8, h - 8, 7)
+  ctx.strokeStyle = 'rgba(139, 90, 54, 0.3)'
+  ctx.lineWidth = 1.5
+  ctx.stroke()
+}
+
 function drawLockedSign(place: Place) {
   const x = (place.x + place.w / 2) * TILE
   const y = (place.y + place.h / 2) * TILE
-  const canBuy = farm.level >= place.level
-  ctx.setLineDash([10, 8])
-  ctx.strokeStyle = 'rgba(255, 255, 255, 0.75)'
+  const canBuy = farm.level >= place.level && farm === home
+  ctx.setLineDash([12, 9])
+  ctx.lineDashOffset = -clock * 12
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.8)'
   ctx.lineWidth = 3
-  roundRect(ctx, place.x * TILE + 6, place.y * TILE + 6, place.w * TILE - 12, place.h * TILE - 12, 14)
+  roundRect(ctx, place.x * TILE + 6, place.y * TILE + 6, place.w * TILE - 12, place.h * TILE - 12, 18)
   ctx.stroke()
   ctx.setLineDash([])
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.18)'
-  roundRect(ctx, place.x * TILE + 6, place.y * TILE + 6, place.w * TILE - 12, place.h * TILE - 12, 14)
+  ctx.fillStyle = 'rgba(255, 255, 255, 0.16)'
   ctx.fill()
-  // Wooden sign.
-  ctx.fillStyle = '#7a5236'
-  ctx.fillRect(x - 3, y, 6, 26)
-  ctx.fillStyle = canBuy ? '#fff3c4' : '#efe6d8'
-  roundRect(ctx, x - 50, y - 26, 100, 34, 8)
-  ctx.fill()
-  ctx.strokeStyle = '#a8754b'
-  ctx.lineWidth = 2
-  roundRect(ctx, x - 50, y - 26, 100, 34, 8)
-  ctx.stroke()
+  woodenSign(x, y - 26, 104, 36, canBuy && farm.s.coins >= place.price)
   if (canBuy) {
-    drawCoin(ctx, x - 24, y - 9, 9)
-    text(String(place.price), x + 8, y - 9, 16, '#8a5a1a', 'center', 900, null)
+    drawCoin(ctx, x - 26, y - 8, 9)
+    text(String(place.price), x + 8, y - 8, 16, '#8a5a1a', 'center', 900, null)
     if (farm.s.coins >= place.price) {
-      ctx.fillStyle = `rgba(123, 201, 80, ${0.6 + 0.4 * Math.sin(clock * 5)})`
-      star4(ctx, x + 44, y - 26, 4)
+      ctx.fillStyle = `rgba(110, 200, 80, ${0.6 + 0.4 * Math.sin(clock * 5)})`
+      star4(ctx, x + 48, y - 26, 5)
     }
-  } else {
-    text(`🔒 ${t.levelNeeded} ${place.level}`, x, y - 9, 14, '#7a6a5a', 'center', 800, null)
-  }
+  } else text(`🔒 ${t.levelNeeded} ${place.level}`, x, y - 8, 14, C.muted, 'center', 800, null)
 }
 
 function drawField(place: Place) {
   const plots = farm.plots(place)
+  const wet = farm.s.sprinkler > 0
   for (let i = 0; i < plots.length; i++) {
     const plot = plots[i]
     const x = (place.x + (i % place.w) + 0.5) * TILE
     const y = (place.y + Math.floor(i / place.w) + 0.5) * TILE
-    drawPlot(ctx, x, y, TILE * 0.9, 0, false)
+    drawPlot(ctx, x, y, TILE * 0.9, 0, wet)
     if (!plot.crop) continue
     const growth = farm.growth(plot)
     const ripe = plot.readyAt <= farm.clock
-    drawPlant(ctx, plot.crop, x, y, TILE * 0.9, growth, ripe, false, false, clock)
+    const at = plotPops.get(place.id + ':' + i)
+    const pop = at === undefined ? 0 : Math.max(0, 1 - (clock - at) / 0.6)
+    drawPlant(ctx, plot.crop, x, y, TILE * 0.9, growth, ripe, false, false, clock, pop)
     if (ripe) {
       ctx.fillStyle = `rgba(255, 255, 255, ${0.5 + 0.5 * Math.sin(clock * 6 + i)})`
-      star4(ctx, x + TILE * 0.3, y - TILE * 0.3, 2.6)
+      star4(ctx, x + TILE * 0.3, y - TILE * 0.3, 2.8)
     }
   }
 }
@@ -1237,24 +2164,31 @@ function drawPen(place: Place) {
   const status = farm.penStatus(place)
   drawTrough(ctx, px + place.w * TILE * 0.5, py + 44, TILE * 0.9, status !== 'hungry', '#f2c14e')
   if (place.animal === 'chicken') {
-    // Little coop.
-    ctx.fillStyle = '#c98b52'
-    roundRect(ctx, px + 16, py + 4, 46, 38, 5)
-    ctx.fill()
-    ctx.fillStyle = '#a24a3a'
+    // Little coop with a teal roof.
+    roundRect(ctx, px + 16, py + 6, 46, 36, 6)
+    paint(ctx, '#f6dfbd', 2)
     ctx.beginPath()
-    ctx.moveTo(px + 10, py + 12)
-    ctx.lineTo(px + 39, py - 10)
-    ctx.lineTo(px + 68, py + 12)
-    ctx.fill()
-    ctx.fillStyle = '#5e3d27'
-    roundRect(ctx, px + 31, py + 22, 16, 20, 7)
-    ctx.fill()
+    ctx.moveTo(px + 9, py + 14)
+    ctx.quadraticCurveTo(px + 39, py - 16, px + 69, py + 14)
+    ctx.closePath()
+    paint(ctx, C.teal, 2)
+    ctx.beginPath()
+    ctx.moveTo(px + 31, py + 42)
+    ctx.lineTo(px + 31, py + 30)
+    ctx.arc(px + 39, py + 30, 8, Math.PI, 0)
+    ctx.lineTo(px + 47, py + 42)
+    paint(ctx, '#7a5236', 1.5)
   }
   const list = [...penWalkers(place)].sort((a, b) => a.y - b.y)
   for (const w of list) {
     const moving = Math.hypot(w.tx - w.x, w.ty - w.y) > 2
     drawAnimal(ctx, pen.kind, w.x, w.y, pen.kind === 'chicken' ? 26 : pen.kind === 'cow' ? 54 : 40, clock + w.x, w.facing, moving)
+  }
+  // Hungry animals say so.
+  if (status === 'hungry' && list.length) {
+    const w = list[0]
+    const k = (clock * 0.6) % 1
+    if (k < 0.5) text('?', w.x + 10, w.y - 40 - k * 20, 16, '#fff', 'center', 900)
   }
 }
 
@@ -1280,7 +2214,7 @@ function drawPlaceBubble(place: Place) {
           ctx.globalAlpha = enough ? 1 : 0.45
           drawItem(ctx, pen.feed.item, x - 4, y, 22)
           ctx.globalAlpha = 1
-          text(`${pen.feed.count}`, x + 10, y + 8, 13, enough ? '#2e7d32' : '#c0392b', 'center', 900, '#fffaf0')
+          text(`${pen.feed.count}`, x + 10, y + 8, 13, enough ? '#2e7d32' : '#c0392b', 'center', 900, C.paper)
         },
         enough ? 3 : 0,
       )
@@ -1296,13 +2230,13 @@ function drawPlaceBubble(place: Place) {
         20,
         () => {
           drawItem(ctx, type.output, x, y, 26)
-          if (ready > 1) text(`x${ready}`, x + 14, y + 10, 13, '#5a4636', 'center', 900, '#fffaf0')
+          if (ready > 1) text(`x${ready}`, x + 14, y + 10, 13, C.text, 'center', 900, C.paper)
         },
         6,
       )
     } else if (progress >= 0) {
       bubble(x, y, 20, () => {
-        ring(x, y, 14, progress, '#ffb627')
+        ring(x, y, 14, progress, C.gold)
         drawItem(ctx, type.output, x, y, 16)
       })
     } else {
@@ -1321,18 +2255,23 @@ function drawPlaceBubble(place: Place) {
     }
     const queued = farm.queue(place).length
     if (queued > 1) text(`${queued}/${farm.queueMax()}`, x, (place.y + place.h) * TILE + 6, 12, '#fff', 'center', 800)
-  } else if (place.kind === 'board') {
+  } else if (place.kind === 'board' && farm === home) {
     const deliverable = farm.s.orders.filter((_, i) => farm.canDeliver(i)).length
-    if (deliverable) bubble(x, y, 16, () => text('✓', x, y, 20, '#2e7d32', 'center', 900, null), 5)
+    if (deliverable) bubble(x, y, 16, () => text('✓', x, y, 20, '#2e9d5a', 'center', 900, null), 5)
   }
 }
 
-function drawWorld() {
+function drawWorld(light: ReturnType<typeof daylight>) {
+  const sky = ctx.createLinearGradient(0, 0, 0, height)
+  sky.addColorStop(0, light.top)
+  sky.addColorStop(1, light.bottom)
+  ctx.fillStyle = sky
+  ctx.fillRect(0, 0, width, height)
   ctx.save()
   ctx.translate(width / 2, height / 2)
   ctx.scale(cam.zoom, cam.zoom)
   ctx.translate(-cam.x, -cam.y)
-  ctx.drawImage(ground, 0, 0)
+  drawIsland()
   drawPond(ctx, POND.x * TILE, POND.y * TILE, POND.w * TILE, POND.h * TILE, clock)
   // Flat things first: fields and pens.
   for (const place of PLACES) {
@@ -1340,7 +2279,6 @@ function drawWorld() {
     if (place.kind === 'field') drawField(place)
     if (place.kind === 'pen') drawPen(place)
   }
-  // Sprinklers at the corners of the fields.
   if (farm.s.sprinkler > 0) {
     for (const place of PLACES) {
       if (place.kind !== 'field' || !farm.usable(place)) continue
@@ -1348,7 +2286,14 @@ function drawWorld() {
       if (farm.s.sprinkler > 1) drawSprinkler(ctx, (place.x + place.w) * TILE - 4, (place.y + place.h) * TILE - 2, clock + place.y)
     }
   }
-  // Then buildings and trees, back to front.
+  for (const r of rings) {
+    ctx.strokeStyle = r.color.replace(/[\d.]+\)$/, `${r.life * 0.9})`)
+    ctx.lineWidth = 3 * r.life
+    ctx.beginPath()
+    ctx.ellipse(r.x, r.y, 10 + (1 - r.life) * 30, 4 + (1 - r.life) * 12, 0, 0, Math.PI * 2)
+    ctx.stroke()
+  }
+  // Then buildings, trees and characters, back to front.
   const tall: { y: number; draw: () => void }[] = []
   for (const place of PLACES) {
     const x = place.x * TILE
@@ -1360,15 +2305,22 @@ function drawWorld() {
       tall.push({ y: y + h, draw: () => drawLockedSign(place) })
       continue
     }
-    if (place.kind === 'barn') tall.push({ y: y + h, draw: () => drawBarn(ctx, x, y, w, h) })
-    if (place.kind === 'board') tall.push({ y: y + h, draw: () => drawBoard(ctx, x, y, w, h, farm.s.orders.filter((o) => o.nextAt === 0).length) })
-    if (place.kind === 'workshop') tall.push({ y: y + h, draw: () => drawWorkshop(ctx, place.workshop!, x, y, w, h, clock, farm.workshopProgress(place) >= 0) })
+    const cx = x + w / 2
+    if (place.kind === 'barn') tall.push({ y: y + h, draw: () => bumped(place.id, cx, y + h, () => drawBarn(ctx, x, y, w, h, clock)) })
+    if (place.kind === 'board') tall.push({ y: y + h, draw: () => bumped(place.id, cx, y + h, () => drawBoard(ctx, x, y, w, h, farm === home ? farm.s.orders.filter((o) => o.nextAt === 0).length : 0, clock)) })
+    if (place.kind === 'workshop') tall.push({ y: y + h, draw: () => bumped(place.id, cx, y + h, () => drawWorkshop(ctx, place.workshop!, x, y, w, h, clock, farm.workshopProgress(place) >= 0)) })
   }
   for (const [tx, ty, s] of TREES) tall.push({ y: ty * TILE + 20, draw: () => drawTree(ctx, tx * TILE, ty * TILE, 70 * s, clock) })
   for (const d of farm.s.decor) tall.push({ y: d.y, draw: () => drawDecor(ctx, d.kind, d.x, d.y, clock) })
   if (farm.s.silo > 0) tall.push({ y: 3.7 * TILE, draw: () => drawSilo(ctx, 0.35 * TILE, 0.7 * TILE, 1.25 * TILE, 3 * TILE, farm.s.silo) })
-  const farmerWalking = Math.hypot(farmer.tx - farmer.x, farmer.ty - farmer.y) > 2
-  tall.push({ y: farmer.y, draw: () => drawFarmer(ctx, look(), farmer.x, farmer.y, 46, clock, farmer.facing, farmerWalking) })
+  const farmerWalking = Math.hypot(farmer.tx - farmer.x, farmer.ty - farmer.y) > 2 || (started && !panel && [...held].some((k) => KEYS[k]))
+  tall.push({
+    y: farmer.y,
+    draw: () => {
+      drawFarmer(ctx, look(), farmer.x, farmer.y, 46, clock, farmer.facing, farmerWalking)
+      if (visit || visitors.size) nameTag(clip(myName(), 16), farmer.x, farmer.y + 4, C.gold, C.text)
+    },
+  })
   if (myEmote) {
     const e = myEmote
     tall.push({ y: 1e9 - 1, draw: () => emoteBubble(e.text, farmer.x, farmer.y - 70, e.life) })
@@ -1376,13 +2328,14 @@ function drawWorld() {
   for (const id of WORKER_IDS) {
     if (!farm.workerActive(id)) continue
     const w = workers[id]
-    const walking = !!w.task
+    const at = farm === home ? w : WORKER_HOME[id]
+    const walking = farm === home && !!w.task
     tall.push({
-      y: w.y,
+      y: at.y,
       draw: () => {
-        drawFarmer(ctx, WORKER_LOOK[id], w.x, w.y, 44, clock + 1.7 + WORKER_IDS.indexOf(id), w.facing, walking)
+        drawFarmer(ctx, WORKER_LOOK[id], at.x, at.y, 44, clock + 1.7 + WORKER_IDS.indexOf(id), farm === home ? w.facing : 1, walking)
         const left = farm.workerLeft(id)
-        nameTag(`${t.workerTag[id]} · ${Number.isFinite(left) ? Math.ceil(left / 60) + ' min' : '∞'}`, w.x, w.y + 4, 'rgba(70, 120, 40, 0.85)', '#fff')
+        nameTag(`${t.workerTag[id]} · ${Number.isFinite(left) ? Math.ceil(left / 60) + ' min' : '∞'}`, at.x, at.y + 4, '#9ee07a', C.text)
       },
     })
   }
@@ -1392,7 +2345,7 @@ function drawWorld() {
       draw: () => {
         const moving = v.walking || Math.hypot(v.tx - v.x, v.ty - v.y) > 2
         drawFarmer(ctx, v.look, v.x, v.y, 46, clock + v.id.length, v.facing, moving)
-        nameTag(`${v.name} · ${t.level} ${v.level}`, v.x, v.y + 4, 'rgba(255, 250, 240, 0.92)', '#5a4636')
+        nameTag(`${v.host ? '🏠 ' : ''}${clip(v.name, 16)} · ${t.level} ${v.level}`, v.x, v.y + 4, v.host ? C.mint : C.paper, C.text)
       },
     })
     if (v.emote) {
@@ -1400,28 +2353,28 @@ function drawWorld() {
       tall.push({ y: 1e9 - 1, draw: () => emoteBubble(e.text, v.x, v.y - 70, e.life) })
     }
   }
-  if (keyboard && started && !panel) {
+  if (keyboard && started && !panel && !travel) {
     const near = nearVisitor() || nearPlace() || null
-    const zone = near ? null : nearZone()
+    const zone = near || visit ? null : nearZone()
     if (near || zone) {
       const hx = farmer.x
-      const hy = farmer.y - 74 - Math.abs(Math.sin(clock * 4)) * 4
+      const hy = farmer.y - 76 - Math.abs(Math.sin(clock * 4)) * 4
       tall.push({
         y: 1e9,
         draw: () => {
           ctx.font = '900 13px ' + FONT
-          const w = ctx.measureText(t.use).width + 18
-          ctx.fillStyle = 'rgba(40, 30, 60, 0.75)'
+          const w = ctx.measureText(t.use).width + 20
           roundRect(ctx, hx - w / 2, hy - 12, w, 24, 12)
-          ctx.fill()
+          paint(ctx, C.text, 1.5)
           text(t.use, hx, hy, 13, '#fff', 'center', 900, null)
         },
       })
     }
   }
   if (farm.s.machines.tractor) {
-    const moving = !!tractor.job || Math.hypot(tractor.x - TRACTOR_HOME.x, tractor.y - TRACTOR_HOME.y) > 3
-    tall.push({ y: tractor.y, draw: () => drawTractor(ctx, tractor.x, tractor.y, 54, tractor.facing, clock, moving) })
+    const at = farm === home ? tractor : { ...TRACTOR_HOME, facing: 1, job: null }
+    const moving = farm === home && (!!tractor.job || Math.hypot(tractor.x - TRACTOR_HOME.x, tractor.y - TRACTOR_HOME.y) > 3)
+    tall.push({ y: at.y, draw: () => drawTractor(ctx, at.x, at.y, 54, at.facing, clock, moving) })
   }
   if (farm.s.machines.truck) {
     const trip = farm.truckTrip()
@@ -1434,14 +2387,17 @@ function drawWorld() {
     tall.push({
       y: at.y,
       draw: () => {
-        ctx.globalAlpha = 0.6
+        ctx.globalAlpha = 0.6 + 0.2 * Math.sin(clock * 6)
         drawDecor(ctx, placing as string, at.x, at.y, clock)
         ctx.globalAlpha = 1
-        ctx.strokeStyle = ok ? 'rgba(123, 201, 80, 0.9)' : 'rgba(230, 57, 70, 0.9)'
+        ctx.strokeStyle = ok ? 'rgba(110, 200, 80, 0.95)' : 'rgba(230, 70, 80, 0.95)'
         ctx.lineWidth = 3
+        ctx.setLineDash([8, 6])
+        ctx.lineDashOffset = -clock * 20
         ctx.beginPath()
         ctx.ellipse(at.x, at.y, 30, 12, 0, 0, Math.PI * 2)
         ctx.stroke()
+        ctx.setLineDash([])
       },
     })
   }
@@ -1452,42 +2408,42 @@ function drawWorld() {
     drawForest(ctx, zone.x * TILE, zone.y * TILE, zone.w * TILE, zone.h * TILE, clock)
     const cx = (zone.x + zone.w / 2) * TILE
     const cy = (zone.y + zone.h / 2) * TILE
-    const canBuy = farm.level >= zone.level
-    ctx.fillStyle = '#7a5236'
-    ctx.fillRect(cx - 4, cy, 8, 34)
-    ctx.fillStyle = canBuy ? '#fff3c4' : '#efe6d8'
-    roundRect(ctx, cx - 78, cy - 46, 156, 54, 10)
-    ctx.fill()
-    ctx.strokeStyle = '#a8754b'
-    ctx.lineWidth = 3
-    roundRect(ctx, cx - 78, cy - 46, 156, 54, 10)
-    ctx.stroke()
-    text(t.zones[zone.id], cx, cy - 30, 15, '#5a4636', 'center', 900, null)
+    const canBuy = farm.level >= zone.level && farm === home
+    woodenSign(cx, cy - 46, 160, 56, canBuy && farm.s.coins >= zone.price)
+    text(t.zones[zone.id], cx, cy - 30, 15, C.text, 'center', 900, null)
     if (canBuy) {
       drawCoin(ctx, cx - 26, cy - 9, 9)
       text(String(zone.price), cx + 8, cy - 9, 16, '#8a5a1a', 'center', 900, null)
-    } else text('🔒 ' + t.levelNeeded + ' ' + zone.level, cx, cy - 9, 14, '#7a6a5a', 'center', 800, null)
+    } else text('🔒 ' + t.levelNeeded + ' ' + zone.level, cx, cy - 9, 14, C.muted, 'center', 800, null)
   }
   for (const place of PLACES) {
     if (!farm.usable(place)) continue
     drawPlaceBubble(place)
-    if (place.kind === 'field') upgradeStars(farm.upgradeLevel('fields'), (place.x + place.w) * TILE - 14 * (farm.upgradeLevel('fields') - 1), place.y * TILE + 4)
-    if (place.kind === 'pen') upgradeStars(farm.upgradeLevel('pens'), (place.x + place.w) * TILE - 18 - 14 * (farm.upgradeLevel('pens') - 1), place.y * TILE + 22)
+    if (place.kind === 'field') upgradeStars(farm.upgradeLevel('fields'), (place.x + place.w) * TILE - 15 * (farm.upgradeLevel('fields') - 1), place.y * TILE + 4)
+    if (place.kind === 'pen') upgradeStars(farm.upgradeLevel('pens'), (place.x + place.w) * TILE - 18 - 15 * (farm.upgradeLevel('pens') - 1), place.y * TILE + 22)
     if (place.kind === 'workshop') upgradeStars(farm.upgradeLevel('workshops'), place.x * TILE + 10, (place.y + place.h) * TILE - 6)
   }
+  drawButterflies()
   // Cloud shadows drifting over the farm.
   for (let i = 0; i < 4; i++) {
     const cx = ((clock * 14 + i * 520) % (WORLD_PX_W + 600)) - 300
     const cy = 120 + i * 230
-    ctx.globalAlpha = 0.05
-    drawCloud(ctx, cx, cy, 220, '#1d3b5a')
+    ctx.globalAlpha = 0.06
+    drawCloud(ctx, cx, cy, 220, '#3d2a45')
     ctx.globalAlpha = 1
   }
+  // The light of the hour.
+  ctx.globalCompositeOperation = 'multiply'
+  ctx.fillStyle = light.tint
+  ctx.fillRect(-4 * TILE, -4 * TILE, WORLD_PX_W + 8 * TILE, WORLD_PX_H + 8 * TILE)
+  ctx.globalCompositeOperation = 'source-over'
+  drawFireflies(light.dusk)
   for (const p of particles) {
     if (p.screen) continue
     ctx.globalAlpha = Math.min(1, (p.life / p.max) * 1.5)
     ctx.fillStyle = p.color
-    if (p.star) star4(ctx, p.x, p.y, p.size * 0.8)
+    if (p.puff) ellipse(ctx, p.x, p.y, p.size * (1.6 - p.life / p.max), p.size * 0.7 * (1.6 - p.life / p.max), p.color)
+    else if (p.star) star4(ctx, p.x, p.y, p.size * 0.8)
     else {
       ctx.beginPath()
       ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2)
@@ -1496,100 +2452,125 @@ function drawWorld() {
   }
   ctx.globalAlpha = 1
   for (const f of floats) {
+    const k = 1 - f.life
+    const s = k < 0.15 ? easeBack(k / 0.15) : 1
     ctx.globalAlpha = Math.min(1, f.life * 2)
-    text(f.text, f.x, f.y, f.size, f.color)
+    text(f.text, f.x, f.y, f.size * s, f.color)
   }
   ctx.globalAlpha = 1
+  drawFlock()
   ctx.restore()
 }
 
 // --- interface -------------------------------------------------------------------------------
 
+let shownCoins = -1
+const coinChip = { x: 0, y: 0 }
+const barnButton = { x: 0, y: 0 }
+
 function drawHud() {
   // Profile: the player's picture from the website (or their farmer), name, level and XP.
-  const r = 24 * ui
-  const cx = 14 * ui + r
-  const cy = 12 * ui + r
-  const name = (player && player.name) || t.farmer
-  ctx.fillStyle = 'rgba(40, 30, 60, 0.35)'
-  roundRect(ctx, cx, cy - 18 * ui, 150 * ui, 36 * ui, 18 * ui)
-  ctx.fill()
-  text(name.length > 14 ? name.slice(0, 13) + '…' : name, cx + r + 8 * ui, cy - 6 * ui, 13 * ui, '#fff', 'left', 900)
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.25)'
-  roundRect(ctx, cx + r + 8 * ui, cy + 5 * ui, 100 * ui, 7 * ui, 3.5 * ui)
-  ctx.fill()
-  ctx.fillStyle = '#7bc950'
-  roundRect(ctx, cx + r + 8 * ui, cy + 5 * ui, 100 * ui * Math.max(0.06, farm.levelProgress()), 7 * ui, 3.5 * ui)
-  ctx.fill()
+  const r = 25 * ui
+  const cx = 16 * ui + r
+  const cy = 14 * ui + r
+  const name = clip(myName(), 15)
+  card(cx, cy - 19 * ui, 156 * ui, 38 * ui, 19 * ui, C.paper, 2)
+  text(name, cx + r + 8 * ui, cy - 6 * ui, fitSize(name, 110 * ui, 13 * ui, 900), C.text, 'left', 900, null)
+  roundRect(ctx, cx + r + 8 * ui, cy + 4 * ui, 104 * ui, 9 * ui, 4.5 * ui)
+  paint(ctx, '#eadfce', 1.5)
+  const xp = Math.max(0.06, home.levelProgress())
+  roundRect(ctx, cx + r + 8 * ui, cy + 4 * ui, 104 * ui * xp, 9 * ui, 4.5 * ui)
+  paint(ctx, '#7fcf5a')
+  ctx.fillStyle = 'rgba(255,255,255,0.45)'
+  const shine = ((clock * 0.4) % 1.4) - 0.2
+  if (shine > 0 && shine < xp) ctx.fillRect(cx + r + 8 * ui + 104 * ui * shine, cy + 5 * ui, 6 * ui, 7 * ui)
   ctx.save()
   ctx.beginPath()
   ctx.arc(cx, cy, r, 0, Math.PI * 2)
-  ctx.fillStyle = '#bfe3ff'
+  ctx.fillStyle = '#cfe9ff'
   ctx.fill()
   ctx.clip()
   if (playerImageReady) ctx.drawImage(playerImage, cx - r, cy - r, r * 2, r * 2)
-  else drawFarmerFace(ctx, look(), cx, cy + r * 0.12, r * 1.7)
+  else drawFarmerFace(ctx, look(), cx, cy + r * 0.12, r * 1.7, clock)
   ctx.restore()
-  ctx.strokeStyle = '#fff'
-  ctx.lineWidth = 3
+  ctx.strokeStyle = C.ink
+  ctx.lineWidth = 2.5
   ctx.beginPath()
   ctx.arc(cx, cy, r, 0, Math.PI * 2)
   ctx.stroke()
-  // Level, on the badge.
-  ctx.fillStyle = '#ffb627'
+  // Level, on a gold badge (it pops when the level goes up).
+  const pop = levelBanner ? 1 + Math.max(0, Math.sin((3.5 - levelBanner.life) * 8)) * 0.25 * clamp01(levelBanner.life - 2.5) : 1
+  const br = 11 * ui * pop
+  ellipse(ctx, cx - r * 0.78, cy + r * 0.7, br, br, C.gold, 0, 2)
+  text(String(home.level), cx - r * 0.78, cy + r * 0.72, fitSize(String(home.level), br * 1.6, 12 * ui * pop, 900), '#fff', 'center', 900)
+  buttons.push({ x: cx - r, y: cy - r, w: r * 2 + 156 * ui, h: r * 2, enabled: !visit, action: () => (panel = 'avatar') })
+  // Settings: a gear under the profile.
+  const gx = cx
+  const gy = cy + r + 22 * ui
+  const gr = 17 * ui
+  const gh = inside({ x: gx - gr, y: gy - gr, w: gr * 2, h: gr * 2 }, mouse)
+  ellipse(ctx, gx + 1, gy + 3, gr, gr, 'rgba(61,42,69,0.2)')
+  ellipse(ctx, gx, gy, gr, gr, gh ? '#ffffff' : C.paper, 0, 2)
+  ctx.save()
+  ctx.translate(gx, gy)
+  ctx.rotate(gh ? clock * 2 : 0)
   ctx.beginPath()
-  ctx.arc(cx + r * 0.72, cy + r * 0.72, 11 * ui, 0, Math.PI * 2)
-  ctx.fill()
-  ctx.strokeStyle = '#fff'
-  ctx.lineWidth = 2
-  ctx.stroke()
-  text(String(farm.level), cx + r * 0.72, cy + r * 0.74, 12 * ui, '#fff', 'center', 900, null)
-  buttons.push({ x: cx - r, y: cy - r, w: r * 2 + 150 * ui, h: r * 2, enabled: true, action: () => (panel = 'avatar') })
-  const ly = 12 * ui
-  // Coins.
-  const s = 1 + coinBump * 0.2
-  ctx.fillStyle = 'rgba(40, 30, 60, 0.35)'
-  roundRect(ctx, width - 140 * ui, ly + 8 * ui, 126 * ui, 26 * ui, 13 * ui)
-  ctx.fill()
-  drawCoin(ctx, width - 128 * ui, ly + 21 * ui, 15 * ui * s)
-  text(String(farm.s.coins), width - 24 * ui, ly + 21 * ui, 17 * ui * s, '#fff', 'right', 900)
-  // Farmers online (multiplayer).
-  if (room) {
-    const oy = ly + 40 * ui
-    ctx.fillStyle = visitors.size ? 'rgba(70, 120, 40, 0.8)' : 'rgba(40, 30, 60, 0.35)'
-    roundRect(ctx, width - 140 * ui, oy, 126 * ui, 24 * ui, 12 * ui)
-    ctx.fill()
-    ctx.fillStyle = visitors.size ? '#b8ff8a' : '#d0c8d8'
-    ctx.beginPath()
-    ctx.arc(width - 126 * ui, oy + 12 * ui, 4.5 * ui, 0, Math.PI * 2)
-    ctx.fill()
-    text(`${visitors.size + 1} ${t.online}`, width - 24 * ui, oy + 12 * ui, 13 * ui, '#fff', 'right', 800)
-    buttons.push({ x: width - 140 * ui, y: oy, w: 126 * ui, h: 24 * ui, enabled: true, action: () => (panel = 'online') })
+  for (let i = 0; i < 16; i++) {
+    const a = (i / 16) * Math.PI * 2
+    const rr = i % 2 ? gr * 0.62 : gr * 0.48
+    ctx.lineTo(Math.cos(a) * rr, Math.sin(a) * rr)
+  }
+  ctx.closePath()
+  paint(ctx, C.muted, 1.5)
+  ellipse(ctx, 0, 0, gr * 0.2, gr * 0.2, C.paper)
+  ctx.restore()
+  buttons.push({ x: gx - gr, y: gy - gr, w: gr * 2, h: gr * 2, enabled: true, action: () => (panel = 'settings') })
+  // Coins, counting up and down.
+  if (shownCoins < 0) shownCoins = home.s.coins
+  shownCoins += (home.s.coins - shownCoins) * Math.min(1, 0.15 + Math.abs(home.s.coins - shownCoins) * 0.0005)
+  if (Math.abs(home.s.coins - shownCoins) < 0.5) shownCoins = home.s.coins
+  const ly = 14 * ui
+  const s = 1 + coinBump * 0.22
+  card(width - 146 * ui, ly + 6 * ui, 130 * ui, 30 * ui, 15 * ui, C.paper, 2)
+  coinChip.x = width - 132 * ui
+  coinChip.y = ly + 21 * ui
+  drawCoin(ctx, coinChip.x, coinChip.y, 15 * ui * s, coinBump * 6)
+  text(String(Math.round(shownCoins)), width - 26 * ui, ly + 21 * ui, 17 * ui * s, C.text, 'right', 900, null)
+  // Online: players connected, or "offline".
+  if (play.canJoinRooms) {
+    const oy = ly + 44 * ui
+    const on = !!lobby
+    const count = online.size + 1
+    card(width - 146 * ui, oy, 130 * ui, 26 * ui, 13 * ui, on && online.size ? C.mint : C.paper, 2)
+    const pulse = on ? 1 + Math.sin(clock * 4) * 0.25 : 1
+    ellipse(ctx, width - 130 * ui, oy + 13 * ui, 5 * ui * pulse, 5 * ui * pulse, on ? '#3ccf6e' : '#bfb4c4', 0, 1.5)
+    text(on ? `${count} ${t.online}` : t.offline, width - 26 * ui, oy + 13 * ui, 13 * ui, C.text, 'right', 900, null)
+    buttons.push({ x: width - 146 * ui, y: oy, w: 130 * ui, h: 26 * ui, enabled: true, action: () => (panel = on ? 'online' : 'settings') })
   }
 }
 
 function drawSeedBar() {
   const crops = farm.crops()
-  const size = 54 * ui
-  const total = crops.length * size + 12 * ui
+  const size = 56 * ui
+  const total = crops.length * size + 14 * ui
   const x0 = 12 * ui
   seedBarRight = x0 + total
-  const y0 = height - size - 16 * ui
-  ctx.fillStyle = 'rgba(255, 250, 240, 0.9)'
-  roundRect(ctx, x0, y0 - 6 * ui, total, size + 12 * ui, 18 * ui)
-  ctx.fill()
+  const y0 = height - size - 18 * ui
+  card(x0, y0 - 7 * ui, total, size + 14 * ui, 20 * ui, C.paper, 2.5)
   crops.forEach((crop, i) => {
-    const x = x0 + 6 * ui + i * size
-    if (crop.id === selected) {
-      ctx.fillStyle = '#ffe08a'
-      roundRect(ctx, x + 2, y0, size - 4, size, 14 * ui)
-      ctx.fill()
+    const x = x0 + 7 * ui + i * size
+    const on = crop.id === selected && tool === 'seed'
+    const lift = on ? 4 * ui + Math.abs(Math.sin(clock * 5)) * 2 * ui : 0
+    if (on) {
+      roundRect(ctx, x + 3, y0 - lift, size - 6, size, 14 * ui)
+      paint(ctx, '#ffe7a0', 2)
     }
     const affordable = farm.s.coins >= crop.cost
     ctx.globalAlpha = affordable ? 1 : 0.4
-    drawItem(ctx, crop.id, x + size / 2, y0 + size * 0.4, size * 0.5)
-    drawCoin(ctx, x + size * 0.36, y0 + size * 0.84, 6 * ui)
-    text(String(crop.cost), x + size * 0.48, y0 + size * 0.84, 12 * ui, '#5a4636', 'left', 800, null)
+    drawItem(ctx, crop.id, x + size / 2, y0 + size * 0.38 - lift, size * (on ? 0.56 : 0.5))
+    drawCoin(ctx, x + size * 0.36, y0 + size * 0.84 - lift, 6 * ui)
+    text(String(crop.cost), x + size * 0.48, y0 + size * 0.84 - lift, 12 * ui, C.text, 'left', 900, null)
+    if (keyboard) text(String(i + 1), x + 10 * ui, y0 + 9 * ui - lift, 10 * ui, C.muted, 'center', 900, null)
     ctx.globalAlpha = 1
     buttons.push({
       x,
@@ -1600,105 +2581,138 @@ function drawSeedBar() {
       action: () => {
         selected = crop.id
         tool = 'seed'
+        sound.plant()
       },
     })
   })
-  if (farm.s.machines.tractor) {
+  if (farm.s.machines.tractor && farm === home) {
     // The tractor tool: tap a field to send the tractor.
     const x = x0 + total + 8 * ui
-    ctx.fillStyle = tool === 'tractor' ? '#ffe08a' : 'rgba(255, 250, 240, 0.9)'
-    roundRect(ctx, x, y0 - 6 * ui, size + 4 * ui, size + 12 * ui, 18 * ui)
-    ctx.fill()
-    drawTractor(ctx, x + size / 2 + 2 * ui, y0 + size * 0.72, size * 0.62, 1, clock, !!tractor.job)
+    card(x, y0 - 7 * ui, size + 4 * ui, size + 14 * ui, 20 * ui, tool === 'tractor' ? '#ffe7a0' : C.paper, 2.5)
+    drawTractor(ctx, x + size / 2 + 2 * ui, y0 + size * 0.74, size * 0.62, 1, clock, !!tractor.job)
     seedBarRight = x + size + 4 * ui
-    buttons.push({ x, y: y0 - 6 * ui, w: size + 4 * ui, h: size + 12 * ui, enabled: true, action: () => (tool = tool === 'tractor' ? 'seed' : 'tractor') })
+    buttons.push({ x, y: y0 - 7 * ui, w: size + 4 * ui, h: size + 14 * ui, enabled: true, action: () => (tool = tool === 'tractor' ? 'seed' : 'tractor') })
   }
 }
 
 function drawMenuButtons() {
-  const size = 58 * ui
-  // Above the seed bar when the screen is too narrow for both.
-  const narrow = seedBarRight + 8 * ui > width - size * 3 - 38 * ui
-  const y = height - size - 16 * ui - (narrow ? size + 24 * ui : 0)
+  const size = 60 * ui
+  const narrow = seedBarRight + 8 * ui > width - size * 3 - 40 * ui
+  const y = height - size - 18 * ui - (narrow ? size + 26 * ui : 0)
   menuY = y + size / 2
-  const entries: [string, number, () => void, number][] = [
-    [t.shop, width - size * 3 - 38 * ui, () => (panel = 'shop'), 0],
-    [t.orders, width - size * 2 - 26 * ui, () => (panel = 'orders'), farm.s.orders.filter((_, i) => farm.canDeliver(i)).length],
-    [t.barn, width - size - 14 * ui, () => (panel = 'barn'), 0],
+  if (visit) {
+    // On a friend's farm: only the way home.
+    const bw = 150 * ui
+    button('🏠 ' + t.goHome, width - bw - 14 * ui, y + size * 0.15, bw, size * 0.8, C.coral, !travel, () => goHome(null))
+    return
+  }
+  const entries: [string, number, () => void, number, string][] = [
+    [t.shop, width - size * 3 - 40 * ui, () => (panel = 'shop'), 0, C.gold],
+    [t.orders, width - size * 2 - 27 * ui, () => (panel = 'orders'), farm.s.orders.filter((_, i) => farm.canDeliver(i)).length, C.coral],
+    [t.barn, width - size - 14 * ui, () => (panel = 'barn'), 0, C.teal],
   ]
-  entries.forEach(([label, x, action, badge], i) => {
-    const bump = i === 2 ? 1 + barnBump * 0.15 : 1
+  entries.forEach(([label, x, action, badge, color], i) => {
+    const bump = i === 2 ? 1 + barnBump * 0.18 : 1
+    const hovered = inside({ x, y, w: size, h: size }, mouse)
+    const pressed = !!press && clock - press.at < 0.16 && inside({ x, y, w: size, h: size }, press)
     ctx.save()
-    ctx.translate(x + size / 2, y + size / 2)
+    ctx.translate(x + size / 2, y + size / 2 + (pressed ? 3 : hovered ? -2 : 0))
     ctx.scale(bump, bump)
-    ctx.fillStyle = 'rgba(40, 30, 60, 0.25)'
-    roundRect(ctx, -size / 2, -size / 2 + 3, size, size, 16 * ui)
-    ctx.fill()
-    ctx.fillStyle = '#fffaf0'
-    roundRect(ctx, -size / 2, -size / 2, size, size, 16 * ui)
-    ctx.fill()
-    if (i === 2) drawBarn(ctx, -size * 0.3, -size * 0.36, size * 0.6, size * 0.52)
-    else if (i === 1) drawBoard(ctx, -size * 0.3, -size * 0.42, size * 0.6, size * 0.56, 3)
+    card(-size / 2, -size / 2, size, size, 18 * ui, C.paper, 2.5)
+    if (i === 2) drawBarn(ctx, -size * 0.3, -size * 0.36, size * 0.6, size * 0.5, clock)
+    else if (i === 1) drawBoard(ctx, -size * 0.32, -size * 0.42, size * 0.64, size * 0.56, 3, clock)
     else {
-      drawCoin(ctx, -size * 0.12, -size * 0.06, size * 0.17)
-      drawCoin(ctx, size * 0.12, -size * 0.12, size * 0.15)
-      drawCoin(ctx, 0, -size * 0.2, size * 0.13)
+      drawCoin(ctx, -size * 0.13, -size * 0.06, size * 0.16)
+      drawCoin(ctx, size * 0.13, -size * 0.12, size * 0.15)
+      drawCoin(ctx, 0, -size * 0.22, size * 0.13, clock * 2)
     }
-    text(label, 0, size * 0.36, 11 * ui, '#5a4636', 'center', 800, null)
+    roundRect(ctx, -size * 0.46, size * 0.22, size * 0.92, size * 0.26, size * 0.13)
+    paint(ctx, color, 2)
+    text(label, 0, size * 0.35, fitSize(label, size * 0.84, 11 * ui, 900), '#fff', 'center', 900, 'rgba(61,42,69,0.5)')
     ctx.restore()
     if (badge) {
-      ctx.fillStyle = '#e63946'
-      ctx.beginPath()
-      ctx.arc(x + size - 4, y + 4, 10 * ui, 0, Math.PI * 2)
-      ctx.fill()
+      const p = 1 + Math.sin(clock * 6) * 0.1
+      ellipse(ctx, x + size - 4, y + 4, 11 * ui * p, 11 * ui * p, C.coral, 0, 2)
       text(String(badge), x + size - 4, y + 5, 12 * ui, '#fff', 'center', 900, null)
+    }
+    if (i === 2) {
+      barnButton.x = x + size / 2
+      barnButton.y = y + size / 2
     }
     buttons.push({ x, y, w: size, h: size, enabled: true, action })
   })
 }
 
-function panelFrame(title: string, wMax: number, hMax: number) {
-  ctx.fillStyle = 'rgba(30, 20, 40, 0.45)'
+let panelKey = ''
+let panelAt = 0
+let framed = false
+
+function panelFrame(title: string, wMax: number, hMax: number, color: string = C.teal) {
+  const k = clamp01((clock - panelAt) / 0.3)
+  ctx.fillStyle = `rgba(40, 25, 55, ${0.45 * easeOut(k * 1.4)})`
   ctx.fillRect(0, 0, width, height)
   buttons.push({ x: 0, y: 0, w: width, h: height, enabled: true, action: () => {} }) // blocks the farm
   const w = Math.min(width - 24, wMax * ui)
-  const h = Math.min(height - 24, hMax * ui)
+  const h = Math.min(height - 40 * ui, hMax * ui)
   const x = (width - w) / 2
-  const y = (height - h) / 2
-  ctx.fillStyle = '#fffaf0'
-  roundRect(ctx, x, y, w, h, 22 * ui)
-  ctx.fill()
-  ctx.fillStyle = '#ffd27a'
-  roundRect(ctx, x, y, w, 48 * ui, 22 * ui)
-  ctx.fill()
-  ctx.fillRect(x, y + 26 * ui, w, 22 * ui)
-  text(title, x + w / 2, y + 25 * ui, 20 * ui, '#5a4636', 'center', 900, null)
+  const y = (height - h) / 2 + 12 * ui
+  const s = 0.82 + 0.18 * easeBack(k)
+  framed = true
+  ctx.save()
+  ctx.translate(width / 2, y + h / 2)
+  ctx.scale(s, s)
+  ctx.translate(-width / 2, -(y + h / 2))
+  card(x, y, w, h, 24 * ui, C.paper, 3)
+  // The title on a ribbon.
+  const size = fitSize(title, w * 0.62, 20 * ui, 900)
+  ctx.font = `900 ${Math.round(size)}px ${FONT}`
+  const rw = Math.min(w * 0.8, ctx.measureText(title).width + 64 * ui)
+  const rh = 40 * ui
+  const rx = (width - rw) / 2
+  const ry = y - rh * 0.5
+  for (const side of [-1, 1]) {
+    const ex = side < 0 ? rx - 14 * ui : rx + rw + 14 * ui
+    ctx.beginPath()
+    ctx.moveTo(side < 0 ? rx + 10 * ui : rx + rw - 10 * ui, ry + 10 * ui)
+    ctx.lineTo(ex, ry + 10 * ui)
+    ctx.lineTo(ex + side * -8 * ui, ry + rh * 0.62)
+    ctx.lineTo(ex, ry + rh + 6 * ui)
+    ctx.lineTo(side < 0 ? rx + 10 * ui : rx + rw - 10 * ui, ry + rh + 6 * ui)
+    ctx.closePath()
+    paint(ctx, shade(color, -0.28), 2.5)
+  }
+  roundRect(ctx, rx, ry, rw, rh, 12 * ui)
+  paint(ctx, color, 2.5)
+  text(title, width / 2, ry + rh / 2 + 1, size, '#fff', 'center', 900, 'rgba(61,42,69,0.55)')
   // Close button (registered last so it wins over the blocker).
-  const cs = 32 * ui
-  const close = { x: x + w - cs - 8 * ui, y: y + 8 * ui, w: cs, h: cs, enabled: true, action: () => (panel = null) }
-  ctx.fillStyle = '#e8735a'
-  roundRect(ctx, close.x, close.y, cs, cs, cs / 2)
-  ctx.fill()
+  const cs = 34 * ui
+  const close = { x: x + w - cs * 0.75, y: y - cs * 0.25, w: cs, h: cs, enabled: true, action: () => (panel = null) }
+  const hovered = inside(close, mouse)
+  ellipse(ctx, close.x + cs / 2 + 1, close.y + cs / 2 + 3, cs / 2, cs / 2, 'rgba(61,42,69,0.25)')
+  ellipse(ctx, close.x + cs / 2, close.y + cs / 2, cs / 2, cs / 2, hovered ? shade(C.coral, 0.15) : C.coral, 0, 2.5)
   text('✕', close.x + cs / 2, close.y + cs / 2 + 1, 16 * ui, '#fff', 'center', 900, null)
-  return { x, y: y + 48 * ui, w, h: h - 48 * ui, close }
+  return { x, y: y + rh * 0.6, w, h: h - rh * 0.6, close }
+}
+
+function slot(x: number, y: number, w: number, h: number, color: string = C.paper2) {
+  roundRect(ctx, x, y, w, h, 14 * ui)
+  paint(ctx, color, 1.5)
 }
 
 function drawBarnPanel() {
-  const box = panelFrame(`${t.barn} · ${farm.used()}/${farm.capacity()}`, 560, 420)
+  const box = panelFrame(`${t.barn} · ${farm.used()}/${farm.capacity()}`, 560, 430, C.teal)
   const items = (Object.keys(ITEMS) as ItemId[]).filter((id) => farm.count(id) > 0)
-  if (!items.length) text(t.emptyBarn, box.x + box.w / 2, box.y + box.h / 2, 15 * ui, '#8a7a6a', 'center', 700, null)
-  const cell = 96 * ui
+  if (!items.length) text(t.emptyBarn, box.x + box.w / 2, box.y + box.h / 2, 15 * ui, C.muted, 'center', 800, null)
+  const cell = 98 * ui
   const cols = Math.max(1, Math.floor((box.w - 20 * ui) / cell))
   const x0 = box.x + (box.w - cols * cell) / 2
   items.forEach((id, i) => {
     const x = x0 + (i % cols) * cell
-    const y = box.y + 12 * ui + Math.floor(i / cols) * cell * 1.08
-    ctx.fillStyle = '#f3ead9'
-    roundRect(ctx, x + 4, y, cell - 8, cell, 14 * ui)
-    ctx.fill()
-    drawItem(ctx, id, x + cell / 2, y + cell * 0.3, cell * 0.36)
-    text(`x${farm.count(id)}`, x + cell - 14 * ui, y + 12 * ui, 13 * ui, '#5a4636', 'right', 900, null)
-    button(`${t.sell} ${ITEMS[id].price}`, x + 12 * ui, y + cell * 0.64, cell - 24 * ui, cell * 0.26, '#ffb627', true, () => {
+    const y = box.y + 10 * ui + Math.floor(i / cols) * cell * 1.08
+    slot(x + 4, y, cell - 8, cell)
+    drawItem(ctx, id, x + cell / 2, y + cell * 0.3 + Math.sin(clock * 2 + i) * 1.5, cell * 0.36)
+    text(`x${farm.count(id)}`, x + cell - 14 * ui, y + 13 * ui, 13 * ui, C.text, 'right', 900, null)
+    button(`${t.sell} ${ITEMS[id].price}`, x + 12 * ui, y + cell * 0.62, cell - 24 * ui, cell * 0.3, C.gold, true, () => {
       const coins = farm.sell(id, 1)
       if (coins) {
         flyCoins(x + cell / 2, y + cell * 0.6, coins)
@@ -1710,45 +2724,43 @@ function drawBarnPanel() {
 }
 
 function drawOrdersPanel() {
-  const box = panelFrame(t.orders, 640, 380)
+  const box = panelFrame(t.orders, 640, 390, C.coral)
   const gapX = 10 * ui
   const cw = (box.w - gapX * (ORDER_SLOTS + 1)) / ORDER_SLOTS
   const ch = box.h - 20 * ui
   farm.s.orders.forEach((order, i) => {
     const x = box.x + gapX + i * (cw + gapX)
     const y = box.y + 10 * ui
-    ctx.fillStyle = '#f3ead9'
-    roundRect(ctx, x, y, cw, ch, 16 * ui)
-    ctx.fill()
+    slot(x, y, cw, ch)
     if (order.nextAt > 0) {
-      text(t.nextOrder, x + cw / 2, y + ch * 0.42, 13 * ui, '#8a7a6a', 'center', 700, null)
-      text(`${Math.ceil(order.nextAt - farm.clock)} s`, x + cw / 2, y + ch * 0.55, 18 * ui, '#8a7a6a', 'center', 900, null)
+      text(t.nextOrder, x + cw / 2, y + ch * 0.42, 13 * ui, C.muted, 'center', 800, null)
+      text(`${Math.ceil(order.nextAt - farm.clock)} s`, x + cw / 2, y + ch * 0.55, 18 * ui, C.muted, 'center', 900, null)
       return
     }
     const villager = VILLAGERS[order.villager % VILLAGERS.length]
     const can = farm.canDeliver(i)
-    drawVillager(ctx, villager.id, x + cw / 2, y + ch * 0.17, Math.min(cw * 0.42, ch * 0.24), can ? 'happy' : 'neutral', clock)
+    drawVillager(ctx, villager.id, x + cw / 2, y + ch * 0.17 - (can ? Math.abs(Math.sin(clock * 4)) * 4 * ui : 0), Math.min(cw * 0.42, ch * 0.24), can ? 'happy' : 'neutral', clock)
     order.items.forEach((it, k) => {
       const iy = y + ch * (0.38 + k * 0.13)
       drawItem(ctx, it.item, x + cw * 0.3, iy, Math.min(26 * ui, ch * 0.11))
       const have = farm.count(it.item)
-      text(`${Math.min(have, it.count)}/${it.count}`, x + cw * 0.62, iy, 14 * ui, have >= it.count ? '#2e7d32' : '#c0392b', 'center', 900, null)
+      text(`${Math.min(have, it.count)}/${it.count}`, x + cw * 0.62, iy, 14 * ui, have >= it.count ? '#2e9d5a' : '#d0453a', 'center', 900, null)
     })
     const ry = y + ch * 0.78
     drawCoin(ctx, x + cw * 0.22, ry, 8 * ui)
-    text(String(order.coins), x + cw * 0.3, ry, 13 * ui, '#b7791f', 'left', 900, null)
-    text(`+${order.xp} XP`, x + cw * 0.92, ry, 12 * ui, '#5c9e3a', 'right', 800, null)
-    const bh = Math.min(30 * ui, ch * 0.13)
-    button(t.deliver, x + cw * 0.08, y + ch - bh - 8 * ui, cw * 0.58, bh, '#5cbf3a', can, () => {
+    text(String(order.coins), x + cw * 0.3, ry, 13 * ui, C.goldDark, 'left', 900, null)
+    text(`+${order.xp} XP`, x + cw * 0.92, ry, 12 * ui, '#4f9e3a', 'right', 900, null)
+    const bh = Math.min(34 * ui, ch * 0.14)
+    button(t.deliver, x + cw * 0.06, y + ch - bh - 8 * ui, cw * 0.6, bh, C.teal, can, () => {
       const reward = farm.deliver(i)
       if (reward) {
         sound.order()
-        burst(x + cw / 2, y + ch / 2, 30, ['#ffd54a', '#7bc950', '#ff8fab', '#fff'], 1.2, true, true)
+        burst(x + cw / 2, y + ch / 2, 30, ['#ffd54a', '#7fd6c8', '#ff9db0', '#fff'], 1.2, true, true)
         flyCoins(x + cw / 2, y + ch * 0.6, reward.coins)
         changed()
       }
     })
-    button('↻', x + cw * 0.7, y + ch - bh - 8 * ui, cw * 0.22, bh, '#9b8f80', true, () => {
+    button('↻', x + cw * 0.7, y + ch - bh - 8 * ui, cw * 0.24, bh, '#a99bb0', true, () => {
       farm.skip(i)
       changed()
     })
@@ -1757,59 +2769,54 @@ function drawOrdersPanel() {
 }
 
 function drawBuyPanel(place: Place) {
-  const box = panelFrame(placeName(place), 360, 260)
+  const box = panelFrame(placeName(place), 380, 280, C.gold)
   const cx = box.x + box.w / 2
   const levelOk = farm.level >= place.level
   if (place.kind === 'pen') {
-    drawAnimal(ctx, place.animal!, cx, box.y + box.h * 0.28, 64 * ui, clock, 1, false)
+    drawAnimal(ctx, place.animal!, cx, box.y + box.h * 0.3, 64 * ui, clock, 1, Math.sin(clock * 2) > 0.5)
     const pen = PENS[place.animal!]
-    text(`${t.items[pen.feed.item]} → ${t.items[pen.product.item]}`, cx, box.y + box.h * 0.52, 14 * ui, '#8a7a6a', 'center', 700, null)
+    text(`${t.items[pen.feed.item]} → ${t.items[pen.product.item]}`, cx, box.y + box.h * 0.54, 14 * ui, C.muted, 'center', 800, null)
   } else if (place.kind === 'workshop') {
     const type = WORKSHOPS[place.workshop!]
-    drawItem(ctx, type.output, cx, box.y + box.h * 0.26, 48 * ui)
-    text(`${type.inputs.map((i) => `${i.count} ${t.items[i.item].toLowerCase()}`).join(' + ')} → ${t.items[type.output]}`, cx, box.y + box.h * 0.52, 14 * ui, '#8a7a6a', 'center', 700, null)
+    drawItem(ctx, type.output, cx, box.y + box.h * 0.28 + Math.sin(clock * 3) * 3, 48 * ui)
+    text(`${type.inputs.map((i) => `${i.count} ${t.items[i.item].toLowerCase()}`).join(' + ')} → ${t.items[type.output]}`, cx, box.y + box.h * 0.54, 14 * ui, C.muted, 'center', 800, null)
   } else {
-    drawPlot(ctx, cx - 22 * ui, box.y + box.h * 0.26, 40 * ui, 0, false)
-    drawPlot(ctx, cx + 22 * ui, box.y + box.h * 0.26, 40 * ui, 0, false)
-    text(`+${place.w * place.h}`, cx, box.y + box.h * 0.52, 15 * ui, '#8a7a6a', 'center', 800, null)
+    drawPlot(ctx, cx - 22 * ui, box.y + box.h * 0.28, 40 * ui, 0, false)
+    drawPlot(ctx, cx + 22 * ui, box.y + box.h * 0.28, 40 * ui, 0, false)
+    text(`+${place.w * place.h}`, cx, box.y + box.h * 0.54, 15 * ui, C.muted, 'center', 900, null)
   }
   const bw = box.w * 0.6
-  const bh = 44 * ui
+  const bh = 48 * ui
   if (levelOk) {
-    button(`${t.buy} · ${place.price}`, cx - bw / 2, box.y + box.h - bh - 18 * ui, bw, bh, '#5cbf3a', farm.s.coins >= place.price, () => {
+    button(`${t.buy} · ${place.price}`, cx - bw / 2, box.y + box.h - bh - 18 * ui, bw, bh, C.teal, farm.s.coins >= place.price, () => {
       if (farm.unlock(place) === 'ok') {
         sound.buy()
         panel = null
         const x = (place.x + place.w / 2) * TILE
         const y = (place.y + place.h / 2) * TILE
-        burst(x, y, 40, ['#ffd54a', '#7bc950', '#ff8fab', '#fff'], 1.4, true)
+        burst(x, y, 40, ['#ffd54a', '#7fd6c8', '#ff9db0', '#fff'], 1.4, true)
+        bumpPlace(place)
         persist()
       }
     })
-  } else {
-    text(`🔒 ${t.levelNeeded} ${place.level}`, cx, box.y + box.h - 40 * ui, 18 * ui, '#8a7a6a', 'center', 900, null)
-  }
+  } else text(`🔒 ${t.levelNeeded} ${place.level}`, cx, box.y + box.h - 40 * ui, 18 * ui, C.muted, 'center', 900, null)
   buttons.push(box.close)
 }
 
 /** A row of the shop: icon, name, help, and a price button / owned / level. */
 function shopRow(x: number, y: number, w: number, h: number, icon: () => void, name: string, help: string, level: number, price: number | null, buy: () => void, doneLabel = t.owned + ' ✓') {
-  ctx.fillStyle = '#f3ead9'
-  roundRect(ctx, x, y, w, h - 8 * ui, 14 * ui)
-  ctx.fill()
+  slot(x, y, w, h - 8 * ui)
   icon()
   const mid = y + (h - 8 * ui) / 2
-  text(name, x + h * 1.05, mid - 10 * ui, 15 * ui, '#5a4636', 'left', 900, null)
-  text(help, x + h * 1.05, mid + 11 * ui, 12 * ui, '#8a7a6a', 'left', 600, null)
-  const bw = 104 * ui
-  const bh = 36 * ui
+  const textW = w - h * 1.05 - 124 * ui
+  text(name, x + h * 1.05, mid - 10 * ui, fitSize(name, textW, 15 * ui, 900), C.text, 'left', 900, null)
+  text(help, x + h * 1.05, mid + 11 * ui, fitSize(help, textW, 12 * ui, 700), C.muted, 'left', 700, null)
+  const bw = 108 * ui
+  const bh = 40 * ui
   const bx = x + w - bw - 10 * ui
-  if (price === null) text(doneLabel, bx + bw / 2, mid, 15 * ui, '#5c9e3a', 'center', 900, null)
-  else if (farm.level < level) text('🔒 ' + t.levelNeeded + ' ' + level, bx + bw / 2, mid, 13 * ui, '#8a7a6a', 'center', 800, null)
-  else {
-    button('    ' + price, bx, mid - bh / 2, bw, bh, '#ffb627', farm.s.coins >= price, buy)
-    drawCoin(ctx, bx + 24 * ui, mid, 9 * ui)
-  }
+  if (price === null) text(doneLabel, bx + bw / 2, mid, 15 * ui, '#4f9e3a', 'center', 900, null)
+  else if (farm.level < level) text('🔒 ' + t.levelNeeded + ' ' + level, bx + bw / 2, mid, 13 * ui, C.muted, 'center', 800, null)
+  else coinButton(price, bx, mid - bh / 2, bw, bh, C.gold, farm.s.coins >= price, buy)
 }
 
 function bought(result: string, wx?: number, wy?: number) {
@@ -1818,7 +2825,7 @@ function bought(result: string, wx?: number, wy?: number) {
     return
   }
   sound.buy()
-  burst(width / 2, height / 2, 40, ['#ffd54a', '#7bc950', '#ff8fab', '#6ec6ff', '#fff'], 1.6, true, true)
+  burst(width / 2, height / 2, 40, ['#ffd54a', '#7fd6c8', '#ff9db0', '#8fc7ff', '#fff'], 1.6, true, true)
   if (wx !== undefined && wy !== undefined) {
     cam.x = wx
     cam.y = wy
@@ -1831,36 +2838,32 @@ function bought(result: string, wx?: number, wy?: number) {
 /** A row of the workers' tab: hire for 10 minutes, or for good. */
 function workerRow(id: WorkerId, x: number, y: number, w: number, h: number) {
   const info = WORKERS[id]
-  ctx.fillStyle = '#f3ead9'
-  roundRect(ctx, x, y, w, h - 8 * ui, 14 * ui)
-  ctx.fill()
-  drawFarmer(ctx, WORKER_LOOK[id], x + h * 0.45, y + h * 0.78, h * 0.62, clock + WORKER_IDS.indexOf(id), 1, farm.workerActive(id))
+  slot(x, y, w, h - 8 * ui)
+  drawFarmer(ctx, WORKER_LOOK[id], x + h * 0.45, y + h * 0.8, h * 0.62, clock + WORKER_IDS.indexOf(id), 1, farm.workerActive(id))
   const mid = y + (h - 8 * ui) / 2
   const left = farm.workerLeft(id)
   const name = Number.isFinite(left) && left > 0 ? `${t.workers[id]} · ${Math.ceil(left / 60)} min` : t.workers[id]
-  text(name, x + h * 1.05, mid - 10 * ui, 15 * ui, '#5a4636', 'left', 900, null)
-  text(t.workerHelp[id], x + h * 1.05, mid + 11 * ui, 12 * ui, '#8a7a6a', 'left', 600, null)
-  const bw = 92 * ui
-  const bh = 30 * ui
+  const textW = w - h * 1.05 - 210 * ui
+  text(name, x + h * 1.05, mid - 10 * ui, fitSize(name, textW, 15 * ui, 900), C.text, 'left', 900, null)
+  text(t.workerHelp[id], x + h * 1.05, mid + 11 * ui, fitSize(t.workerHelp[id], textW, 12 * ui, 700), C.muted, 'left', 700, null)
+  const bw = 96 * ui
+  const bh = 34 * ui
   const bx2 = x + w - bw - 10 * ui
   const bx1 = bx2 - bw - 8 * ui
-  if (farm.s.workers[id].forever) text(t.hiredForever + ' ✓', x + w - 14 * ui, mid, 13 * ui, '#5c9e3a', 'right', 900, null)
-  else if (farm.level < info.level) text('🔒 ' + t.levelNeeded + ' ' + info.level, bx2 + bw / 2, mid, 13 * ui, '#8a7a6a', 'center', 800, null)
+  if (farm.s.workers[id].forever) text(t.hiredForever + ' ✓', x + w - 14 * ui, mid, 13 * ui, '#4f9e3a', 'right', 900, null)
+  else if (farm.level < info.level) text('🔒 ' + t.levelNeeded + ' ' + info.level, bx2 + bw / 2, mid, 13 * ui, C.muted, 'center', 800, null)
   else {
     const atMax = left + WORKER.duration > WORKER.maxAhead
-    text(t.forHire, bx1 + bw / 2, mid - 23 * ui, 11 * ui, '#8a7a6a', 'center', 800, null)
-    text(t.forever, bx2 + bw / 2, mid - 23 * ui, 11 * ui, '#8a7a6a', 'center', 800, null)
-    if (atMax) text(t.max, bx1 + bw / 2, mid + 4 * ui, 14 * ui, '#5c9e3a', 'center', 900, null)
-    else {
-      button('    ' + info.price, bx1, mid - bh / 2 + 4 * ui, bw, bh, '#ffb627', farm.s.coins >= info.price, () => {
+    text(t.forHire, bx1 + bw / 2, mid - 24 * ui, 11 * ui, C.muted, 'center', 900, null)
+    text(t.forever, bx2 + bw / 2, mid - 24 * ui, 11 * ui, C.muted, 'center', 900, null)
+    if (atMax) text(t.max, bx1 + bw / 2, mid + 4 * ui, 14 * ui, '#4f9e3a', 'center', 900, null)
+    else
+      coinButton(info.price, bx1, mid - bh / 2 + 5 * ui, bw, bh, C.gold, farm.s.coins >= info.price, () => {
         const result = farm.hireWorker(id)
         bought(result)
         if (result === 'ok' && !workers[id].task) Object.assign(workers[id], WORKER_HOME[id])
       })
-      drawCoin(ctx, bx1 + 20 * ui, mid + 4 * ui, 8 * ui)
-    }
-    button('    ' + info.forever, bx2, mid - bh / 2 + 4 * ui, bw, bh, '#9b6bd1', farm.s.coins >= info.forever, () => bought(farm.hireWorkerForever(id)))
-    drawCoin(ctx, bx2 + 20 * ui, mid + 4 * ui, 8 * ui)
+    coinButton(info.forever, bx2, mid - bh / 2 + 5 * ui, bw, bh, C.plum, farm.s.coins >= info.forever, () => bought(farm.hireWorkerForever(id)))
   }
 }
 
@@ -1874,60 +2877,59 @@ function upgradeIcon(id: UpgradeId, x: number, y: number, s: number) {
 
 function drawCoinsTab(x: number, y: number, w: number, h: number) {
   if (!play.canPurchase) {
-    drawCoin(ctx, x + w / 2, y + h * 0.3, 26 * ui)
-    text(t.coinsUnavailable, x + w / 2, y + h * 0.55, 15 * ui, '#8a7a6a', 'center', 800, null)
+    drawCoin(ctx, x + w / 2, y + h * 0.3, 26 * ui, clock * 2)
+    text(t.coinsUnavailable, x + w / 2, y + h * 0.55, 15 * ui, C.muted, 'center', 800, null)
     return
   }
   if (!products) {
-    text(t.loading, x + w / 2, y + h * 0.45, 15 * ui, '#8a7a6a', 'center', 800, null)
+    text(t.loading, x + w / 2, y + h * 0.45, 15 * ui, C.muted, 'center', 800, null)
     return
   }
   const list = products.slice(0, 6)
   const cols = Math.min(3, Math.max(1, list.length))
   const cw = w / cols
-  const ch = Math.min(150 * ui, (h - 34 * ui) / Math.ceil(list.length / cols))
+  const ch = Math.min(156 * ui, (h - 34 * ui) / Math.ceil(list.length / cols))
   list.forEach((product, i) => {
     const cx = x + (i % cols) * cw
     const cy = y + Math.floor(i / cols) * ch
-    ctx.fillStyle = '#f3ead9'
-    roundRect(ctx, cx + 5 * ui, cy, cw - 10 * ui, ch - 10 * ui, 14 * ui)
-    ctx.fill()
+    slot(cx + 5 * ui, cy, cw - 10 * ui, ch - 10 * ui)
     // A pile of coins, bigger for bigger packs.
     const pile = Math.min(5, 1 + i)
-    for (let k = 0; k < pile; k++) drawCoin(ctx, cx + cw / 2 + (k - (pile - 1) / 2) * 9 * ui, cy + ch * 0.24 - (k % 2) * 6 * ui, 12 * ui)
+    for (let k = 0; k < pile; k++) drawCoin(ctx, cx + cw / 2 + (k - (pile - 1) / 2) * 10 * ui, cy + ch * 0.24 - (k % 2) * 6 * ui, 12 * ui, k === pile - 1 ? clock * 2 : 0)
     const coins = productCoins(product)
-    text(coins ? `+${coins}` : product.title, cx + cw / 2, cy + ch * 0.46, 20 * ui, '#b7791f', 'center', 900, null)
-    if (coins && product.title) text(product.title, cx + cw / 2, cy + ch * 0.6, 12 * ui, '#8a7a6a', 'center', 700, null)
-    const bw = cw * 0.7
-    const bh = 30 * ui
-    button(paying ? t.paying : String(product.price || t.buy), cx + (cw - bw) / 2, cy + ch * 0.68, bw, bh, '#5cbf3a', !paying, () => buyProduct(product))
+    text(coins ? `+${coins}` : product.title, cx + cw / 2, cy + ch * 0.46, 20 * ui, C.goldDark, 'center', 900, null)
+    if (coins && product.title) text(clip(product.title, 18), cx + cw / 2, cy + ch * 0.59, 12 * ui, C.muted, 'center', 800, null)
+    const bw = cw * 0.72
+    const bh = 36 * ui
+    button(paying ? t.paying : String(product.price || t.buy), cx + (cw - bw) / 2, cy + ch * 0.66, bw, bh, C.teal, !paying, () => buyProduct(product))
   })
-  text(t.coinsHelp, x + w / 2, y + h - 14 * ui, 12 * ui, '#8a7a6a', 'center', 700, null)
+  text(t.coinsHelp, x + w / 2, y + h - 14 * ui, 12 * ui, C.muted, 'center', 800, null)
 }
 
 function drawShopPanel() {
-  const box = panelFrame(t.shop, 660, 480)
-  // Tabs.
+  const box = panelFrame(t.shop, 680, 490, C.gold)
+  // Tabs; the chosen one is raised.
   const tw = (box.w - 24 * ui) / t.tabs.length
   t.tabs.forEach((label, i) => {
     const x = box.x + 12 * ui + i * tw
-    ctx.fillStyle = i === shopTab ? '#ffb627' : '#efe2c8'
-    roundRect(ctx, x + 3 * ui, box.y + 10 * ui, tw - 6 * ui, 34 * ui, 17 * ui)
-    ctx.fill()
-    text(label, x + tw / 2, box.y + 27 * ui, Math.min(13 * ui, ((tw - 10 * ui) / label.length) * 1.75), i === shopTab ? '#fff' : '#5a4636', 'center', 900, null)
-    buttons.push({ x, y: box.y + 10 * ui, w: tw, h: 34 * ui, enabled: true, action: () => (shopTab = i) })
+    const on = i === shopTab
+    roundRect(ctx, x + 3 * ui, box.y + 8 * ui - (on ? 3 * ui : 0), tw - 6 * ui, 34 * ui, 17 * ui)
+    paint(ctx, on ? C.gold : C.paper2, 2)
+    text(label, x + tw / 2, box.y + 25 * ui - (on ? 3 * ui : 0), fitSize(label, tw - 14 * ui, 13 * ui, 900), on ? '#fff' : C.text, 'center', 900, on ? 'rgba(61,42,69,0.5)' : null)
+    buttons.push({ x, y: box.y + 8 * ui, w: tw, h: 34 * ui, enabled: true, action: () => (shopTab = i) })
   })
   const x = box.x + 16 * ui
   const w = box.w - 32 * ui
-  let y = box.y + 56 * ui
-  const rowH = Math.min(78 * ui, (box.h - 66 * ui) / (shopTab === 3 ? 5 : 4))
+  let y = box.y + 54 * ui
+  const rowH = Math.min(80 * ui, (box.h - 64 * ui) / (shopTab === 3 ? 5 : 4))
   if (shopTab === 0) {
     for (const zone of ZONES) {
+      const zy = y
       shopRow(x, y, w, rowH, () => {
         ctx.save()
-        roundRect(ctx, x + 8 * ui, y + 6 * ui, rowH - 20 * ui, rowH - 20 * ui, 10 * ui)
+        roundRect(ctx, x + 8 * ui, zy + 6 * ui, rowH - 20 * ui, rowH - 20 * ui, 10 * ui)
         ctx.clip()
-        ctx.translate(x + 8 * ui, y + 6 * ui)
+        ctx.translate(x + 8 * ui, zy + 6 * ui)
         ctx.scale((rowH - 20 * ui) / 160, (rowH - 20 * ui) / 160)
         drawForest(ctx, 0, 0, 160, 160, clock)
         ctx.restore()
@@ -1944,8 +2946,8 @@ function drawShopPanel() {
     for (const id of machines) {
       const iy = y
       shopRow(x, y, w, rowH, () => {
-        if (id === 'tractor') drawTractor(ctx, x + rowH * 0.45, iy + rowH * 0.66, rowH * 0.6, 1, clock, false)
-        else drawTruck(ctx, x + rowH * 0.45, iy + rowH * 0.62, rowH * 0.62, 1, clock, false, true)
+        if (id === 'tractor') drawTractor(ctx, x + rowH * 0.45, iy + rowH * 0.68, rowH * 0.6, 1, clock, false)
+        else drawTruck(ctx, x + rowH * 0.45, iy + rowH * 0.64, rowH * 0.62, 1, clock, false, true)
       }, t.machines[id], t.machineHelp[id], MACHINES[id].level, farm.s.machines[id] ? null : MACHINES[id].price, () => bought(farm.buyMachine(id)))
       y += rowH
     }
@@ -1956,7 +2958,7 @@ function drawShopPanel() {
       const next = farm.nextUpgrade(id)
       shopRow(x, y, w, rowH, () => {
         upgradeIcon(id, x + rowH * 0.45, uy + rowH * 0.4, rowH * 0.7)
-        upgradeStars(Math.min(level + 0, MAX_UPGRADE), x + rowH * 0.2, uy + rowH * 0.12)
+        upgradeStars(Math.min(level, MAX_UPGRADE), x + rowH * 0.2, uy + rowH * 0.12)
       }, `${t.upgrades[id]} ${level}/${MAX_UPGRADE}`, t.upgradeHelp[id], next ? next.level : 0, next ? next.price : null, () => bought(farm.buyUpgrade(id)), t.max + ' ✓')
       y += rowH
     }
@@ -1966,81 +2968,69 @@ function drawShopPanel() {
     const iy = y
     shopRow(x, y, w, rowH, () => drawSilo(ctx, x + rowH * 0.3, iy + rowH * 0.1, rowH * 0.32, rowH * 0.6, 0), `${t.machines.silo} ${farm.s.silo}/${SILO_PRICES.length}`, t.machineHelp.silo, SILO_LEVEL, farm.s.silo >= SILO_PRICES.length ? null : SILO_PRICES[farm.s.silo], () => bought(farm.buySilo(SILO_LEVEL)))
   } else if (shopTab === 5) {
-    drawCoinsTab(x, y, w, box.h - 66 * ui)
+    drawCoinsTab(x, y, w, box.h - 64 * ui)
   } else {
     const kinds = Object.keys(DECORS) as DecorKind[]
     const cols = 3
     const cw = w / cols
-    const ch = Math.min(130 * ui, (box.h - 70 * ui) / 2)
+    const ch = Math.min(134 * ui, (box.h - 70 * ui) / 2)
     kinds.forEach((kind, i) => {
       const cx = x + (i % cols) * cw
       const cy = y + Math.floor(i / cols) * ch
-      ctx.fillStyle = '#f3ead9'
-      roundRect(ctx, cx + 5 * ui, cy, cw - 10 * ui, ch - 10 * ui, 14 * ui)
-      ctx.fill()
+      slot(cx + 5 * ui, cy, cw - 10 * ui, ch - 10 * ui)
       ctx.save()
       ctx.translate(cx + cw / 2, cy + ch * 0.42)
       ctx.scale(ui * 0.85, ui * 0.85)
       drawDecor(ctx, kind, 0, 0, clock)
       ctx.restore()
-      text(t.decors[kind], cx + cw / 2, cy + ch * 0.58, 12 * ui, '#5a4636', 'center', 800, null)
+      text(t.decors[kind], cx + cw / 2, cy + ch * 0.56, fitSize(t.decors[kind], cw - 20 * ui, 12 * ui, 900), C.text, 'center', 900, null)
       const info = DECORS[kind]
-      const bw = cw * 0.64
-      const bh = 28 * ui
-      if (farm.level < info.level) text('🔒 ' + t.levelNeeded + ' ' + info.level, cx + cw / 2, cy + ch * 0.78, 12 * ui, '#8a7a6a', 'center', 800, null)
-      else {
-        button('    ' + info.price, cx + (cw - bw) / 2, cy + ch * 0.7, bw, bh, '#ffb627', farm.s.coins >= info.price, () => {
+      const bw = cw * 0.66
+      const bh = 32 * ui
+      if (farm.level < info.level) text('🔒 ' + t.levelNeeded + ' ' + info.level, cx + cw / 2, cy + ch * 0.76, 12 * ui, C.muted, 'center', 800, null)
+      else
+        coinButton(info.price, cx + (cw - bw) / 2, cy + ch * 0.64, bw, bh, C.gold, farm.s.coins >= info.price, () => {
           placing = kind
           panel = null
           hover = toWorld(width / 2, height / 2)
         })
-        drawCoin(ctx, cx + (cw - bw) / 2 + 18 * ui, cy + ch * 0.7 + bh / 2, 8 * ui)
-      }
     })
   }
   buttons.push(box.close)
 }
 
 function swatch(color: string, x: number, y: number, r: number) {
-  ctx.fillStyle = color
-  ctx.beginPath()
-  ctx.arc(x, y, r, 0, Math.PI * 2)
-  ctx.fill()
-  ctx.strokeStyle = 'rgba(90, 70, 54, 0.3)'
-  ctx.lineWidth = 2
-  ctx.stroke()
+  ellipse(ctx, x, y, r, r, color, 0, 2)
 }
 
 function drawAvatarPanel() {
-  const box = panelFrame(t.avatarTitle, 560, 440)
+  const box = panelFrame(t.avatarTitle, 560, 450, C.plum)
   const left = box.x + box.w * 0.25
-  // Big farmer preview.
-  drawFarmer(ctx, look(), left, box.y + box.h * 0.66, Math.min(box.h * 0.5, 160 * ui), clock, 1, false)
-  if (player && player.name) {
-    text(t.connected, left, box.y + box.h * 0.76, 11 * ui, '#8a7a6a', 'center', 700, null)
-    text(player.name, left, box.y + box.h * 0.83, 15 * ui, '#5a4636', 'center', 900, null)
-  }
+  ellipse(ctx, left, box.y + box.h * 0.66, 60 * ui, 16 * ui, 'rgba(61,42,69,0.08)')
+  drawFarmer(ctx, look(), left, box.y + box.h * 0.66, Math.min(box.h * 0.5, 160 * ui), clock, Math.sin(clock * 0.8) > 0 ? 1 : -1, false)
+  text(clip(myName(), 18), left, box.y + box.h * 0.76, 15 * ui, C.text, 'center', 900, null)
+  if (player && player.name) text(t.connected, left, box.y + box.h * 0.83, 11 * ui, C.muted, 'center', 800, null)
   const x = box.x + box.w * 0.48
   const w = box.w * 0.48
   const rows: [string, number, (i: number) => void, (i: number, cx: number, cy: number, r: number) => void, number][] = [
-    [t.looks[0], SKINS.length, (i) => (farm.s.avatar.skin = i), (i, cx, cy, r) => swatch(SKINS[i], cx, cy, r), farm.s.avatar.skin],
-    [t.looks[1], HATS.length, (i) => (farm.s.avatar.hat = i), (i, cx, cy, r) => drawFarmerFace(ctx, { ...look(), hat: HATS[i] }, cx, cy + r * 0.2, r * 1.6), farm.s.avatar.hat],
-    [t.looks[2], SHIRTS.length, (i) => (farm.s.avatar.shirt = i), (i, cx, cy, r) => swatch(SHIRTS[i], cx, cy, r), farm.s.avatar.shirt],
-    [t.looks[3], PANTS.length, (i) => (farm.s.avatar.pants = i), (i, cx, cy, r) => swatch(PANTS[i], cx, cy, r), farm.s.avatar.pants],
+    [t.looks[0], SKINS.length, (i) => (home.s.avatar.skin = i), (i, cx, cy, r) => swatch(SKINS[i], cx, cy, r), home.s.avatar.skin],
+    [t.looks[1], HATS.length, (i) => (home.s.avatar.hat = i), (i, cx, cy, r) => drawFarmerFace(ctx, { ...look(), hat: HATS[i] }, cx, cy + r * 0.2, r * 1.6, clock), home.s.avatar.hat],
+    [t.looks[2], SHIRTS.length, (i) => (home.s.avatar.shirt = i), (i, cx, cy, r) => swatch(SHIRTS[i], cx, cy, r), home.s.avatar.shirt],
+    [t.looks[3], PANTS.length, (i) => (home.s.avatar.pants = i), (i, cx, cy, r) => swatch(PANTS[i], cx, cy, r), home.s.avatar.pants],
   ]
   const rowH = (box.h - 20 * ui) / rows.length
   rows.forEach(([label, count, set, drawOption, current], k) => {
     const y = box.y + 10 * ui + k * rowH
-    text(label, x, y + 12 * ui, 13 * ui, '#5a4636', 'left', 900, null)
+    text(label, x, y + 12 * ui, 13 * ui, C.text, 'left', 900, null)
     const r = Math.min(15 * ui, w / count / 2 - 3 * ui)
     for (let i = 0; i < count; i++) {
       const cx = x + r + 2 * ui + i * (r * 2 + 6 * ui)
       const cy = y + rowH * 0.6
       if (i === current) {
-        ctx.strokeStyle = '#ffb627'
+        ctx.strokeStyle = C.gold
         ctx.lineWidth = 4
         ctx.beginPath()
-        ctx.arc(cx, cy, r + 4, 0, Math.PI * 2)
+        ctx.arc(cx, cy, r + 4 + Math.sin(clock * 5) * 1, 0, Math.PI * 2)
         ctx.stroke()
       }
       drawOption(i, cx, cy, r)
@@ -2061,138 +3051,416 @@ function drawAvatarPanel() {
   buttons.push(box.close)
 }
 
-/** A farmer's face: their picture from the website, or their farmer. */
-function visitorFace(v: Visitor, cx: number, cy: number, r: number) {
-  ctx.save()
-  ctx.beginPath()
-  ctx.arc(cx, cy, r, 0, Math.PI * 2)
-  ctx.fillStyle = '#bfe3ff'
-  ctx.fill()
-  ctx.clip()
-  if (v.image && v.image.complete && v.image.naturalWidth) ctx.drawImage(v.image, cx - r, cy - r, r * 2, r * 2)
-  else drawFarmerFace(ctx, v.look, cx, cy + r * 0.12, r * 1.7)
-  ctx.restore()
+// --- online: settings, players, invitations ----------------------------------------------------
+
+/** The nickname field (a real input, so phones show their keyboard), over the settings panel. */
+const nameInput = document.createElement('input')
+nameInput.type = 'text'
+nameInput.maxLength = NAME_MAX
+nameInput.autocomplete = 'off'
+nameInput.spellcheck = false
+nameInput.setAttribute('aria-label', 'Nickname')
+Object.assign(nameInput.style, {
+  position: 'fixed',
+  display: 'none',
+  boxSizing: 'border-box',
+  border: '2px solid #3d2a45',
+  borderRadius: '12px',
+  background: '#ffffff',
+  color: '#3d2a45',
+  fontFamily: FONT,
+  fontWeight: '800',
+  padding: '0 12px',
+  outline: 'none',
+  zIndex: '2',
+})
+document.body.appendChild(nameInput)
+let nameShown = false
+
+function cleanName(value: string) {
+  return value
+    .replace(/[\u0000-\u001f\u007f<>]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, NAME_MAX)
+}
+
+function commitName() {
+  const name = cleanName(nameInput.value)
+  nameInput.value = name || home.s.name
+  if (!name || name === home.s.name) return
+  home.s.name = name
+  persist()
+  renameInRooms()
+  sound.coin()
+}
+
+function showNameInput(x: number, y: number, w: number, h: number) {
+  if (!nameShown) {
+    nameShown = true
+    nameInput.value = home.s.name || myName()
+    nameInput.style.display = 'block'
+  }
+  Object.assign(nameInput.style, { left: x + 'px', top: y + 'px', width: w + 'px', height: h + 'px', fontSize: Math.round(15 * ui) + 'px' })
+}
+
+function hideNameInput() {
+  if (!nameShown) return
+  nameShown = false
+  commitName()
+  nameInput.style.display = 'none'
+  nameInput.blur()
+}
+
+nameInput.addEventListener('keydown', (event) => {
+  event.stopPropagation()
+  if (event.key === 'Enter' || event.key === 'Escape') {
+    commitName()
+    nameInput.blur()
+    canvas.focus()
+  }
+})
+nameInput.addEventListener('blur', commitName)
+
+function soundOn() {
+  try {
+    return localStorage.getItem('cloud-acres:sound') !== 'off'
+  } catch {
+    return true
+  }
+}
+
+function setSound(on: boolean) {
+  try {
+    localStorage.setItem('cloud-acres:sound', on ? 'on' : 'off')
+  } catch {
+    // Private browsing: kept for this session only.
+  }
+  sound.setEnabled(on && play.isAudioEnabled)
+  if (on) sound.coin()
+}
+
+function drawSettingsPanel() {
+  const box = panelFrame(t.settings, 520, 430, C.sky)
+  const x = box.x + 22 * ui
+  const w = box.w - 44 * ui
+  const rowH = Math.min(84 * ui, (box.h - 20 * ui) / 4)
+  let y = box.y + 12 * ui
+  // Nickname.
+  slot(x, y, w, rowH - 10 * ui)
+  text(t.nickname, x + 16 * ui, y + 18 * ui, 15 * ui, C.text, 'left', 900, null)
+  const fromSite = !!(player && player.name)
+  text(fromSite ? t.nicknameFromSite : t.nicknameHelp, x + 16 * ui, y + 38 * ui, 11 * ui, C.muted, 'left', 700, null)
+  const fw = Math.min(220 * ui, w * 0.5)
+  const fx = x + w - fw - 14 * ui
+  const fh = 38 * ui
+  const fy = y + (rowH - 10 * ui - fh) / 2
+  if (fromSite) {
+    roundRect(ctx, fx, fy, fw, fh, 12 * ui)
+    paint(ctx, '#efe7da', 2)
+    text(clip(player!.name, 18), fx + 12 * ui, fy + fh / 2, 15 * ui, C.text, 'left', 900, null)
+  } else {
+    // The input sits there (drawn by the browser); the card shows through while it opens.
+    const k = easeOut((clock - panelAt) / 0.3)
+    if (k >= 1) showNameInput(fx, fy, fw, fh)
+    else {
+      roundRect(ctx, fx, fy, fw, fh, 12 * ui)
+      paint(ctx, '#fff', 2)
+    }
+  }
+  y += rowH
+  // Online.
+  slot(x, y, w, rowH - 10 * ui)
+  text(t.showOnline, x + 16 * ui, y + 18 * ui, 15 * ui, C.text, 'left', 900, null)
+  text(play.canJoinRooms ? t.showOnlineHelp : t.onlineUnavailable, x + 16 * ui, y + 38 * ui, 11 * ui, C.muted, 'left', 700, null)
+  toggle(home.s.online && play.canJoinRooms, x + w - 70 * ui, y + (rowH - 10 * ui) / 2 - 15 * ui, 56 * ui, 30 * ui, play.canJoinRooms, () => {
+    setOnline(!home.s.online)
+    sound.plant()
+  })
+  y += rowH
+  // Sound.
+  slot(x, y, w, rowH - 10 * ui)
+  text(t.sound, x + 16 * ui, y + 18 * ui, 15 * ui, C.text, 'left', 900, null)
+  text(t.soundHelp, x + 16 * ui, y + 38 * ui, 11 * ui, C.muted, 'left', 700, null)
+  const on = soundOn()
+  toggle(on, x + w - 70 * ui, y + (rowH - 10 * ui) / 2 - 15 * ui, 56 * ui, 30 * ui, true, () => setSound(!on))
+  y += rowH
+  // My farmer.
+  button('👤 ' + t.myFarmer, x + w * 0.2, y + 4 * ui, w * 0.6, 46 * ui, C.plum, !visit, () => (panel = 'avatar'))
+  buttons.push(box.close)
+}
+
+function statusOf(o: Lobbyist) {
+  if (!o.at) return t.atHome
+  if (o.at === myFarmId) return `${t.visitingAt} ${t.you.toLowerCase()}`
+  const host = [...online.values()].find((p) => p.farmId === o.at)
+  return `${t.visitingAt} ${host ? host.name : '…'}`
 }
 
 function drawOnlinePanel() {
-  const box = panelFrame(t.onlineTitle, 520, 420)
-  const list = [...visitors.values()].slice(0, 6)
-  if (!list.length) text(t.nobodyOnline, box.x + box.w / 2, box.y + box.h / 2, 15 * ui, '#8a7a6a', 'center', 700, null)
-  const rowH = Math.min(58 * ui, (box.h - 20 * ui) / 6)
-  list.forEach((v, i) => {
-    const x = box.x + 14 * ui
-    const y = box.y + 10 * ui + i * rowH
-    const w = box.w - 28 * ui
-    ctx.fillStyle = '#f3ead9'
-    roundRect(ctx, x, y, w, rowH - 6 * ui, 12 * ui)
-    ctx.fill()
+  const box = panelFrame(t.onlineTitle, 560, 450, C.teal)
+  const list = [...online.values()].slice(0, 7)
+  const x = box.x + 14 * ui
+  const w = box.w - 28 * ui
+  if (!list.length) {
+    const cx = box.x + box.w / 2
+    const cy = box.y + box.h * 0.4
+    drawCloud(ctx, cx, cy + Math.sin(clock * 1.5) * 4, 50 * ui, '#e9f4ff')
+    text('z', cx + 40 * ui, cy - 30 * ui - ((clock * 10) % 20), 14 * ui, C.muted, 'center', 900, null)
+    text(t.nobodyOnline, cx, box.y + box.h * 0.66, 15 * ui, C.muted, 'center', 800, null)
+    text(t.showOnlineHelp, cx, box.y + box.h * 0.74, 12 * ui, C.muted, 'center', 700, null)
+  }
+  const rowH = Math.min(60 * ui, (box.h - 16 * ui) / 7)
+  list.forEach((o, i) => {
+    const y = box.y + 8 * ui + i * rowH
+    slot(x, y, w, rowH - 6 * ui)
     const mid = y + (rowH - 6 * ui) / 2
-    visitorFace(v, x + 24 * ui, mid, 17 * ui)
-    text(v.name.length > 18 ? v.name.slice(0, 17) + '…' : v.name, x + 50 * ui, mid - 7 * ui, 14 * ui, '#5a4636', 'left', 900, null)
-    text(`${t.level} ${v.level}`, x + 50 * ui, mid + 10 * ui, 12 * ui, '#8a7a6a', 'left', 700, null)
-    const bw = 86 * ui
-    const bh = 28 * ui
-    button(t.wave, x + w - bw * 2 - 18 * ui, mid - bh / 2, bw, bh, '#4f8ff7', true, () => wave(v.id))
-    button(t.give, x + w - bw - 8 * ui, mid - bh / 2, bw, bh, '#ff8fab', true, () => (panel = { visitor: v.id }))
+    face(o, x + 26 * ui, mid, 18 * ui)
+    const bw = 92 * ui
+    const bh = 34 * ui
+    const nameW = w - 60 * ui - bw * 2 - 30 * ui
+    text(clip(o.name, 20), x + 52 * ui, mid - 8 * ui, fitSize(clip(o.name, 20), nameW, 14 * ui, 900), C.text, 'left', 900, null)
+    text(`${t.level} ${o.level} · ${statusOf(o)}`, x + 52 * ui, mid + 10 * ui, fitSize(`${t.level} ${o.level} · ${statusOf(o)}`, nameW, 11 * ui, 700), C.muted, 'left', 700, null)
+    const already = invitedAlready(o.id)
+    const canInvite = !visit && !already && o.at !== myFarmId
+    button(already ? t.invited : t.invite, x + w - bw * 2 - 16 * ui, mid - bh / 2, bw, bh, C.teal, canInvite, () => invite(o))
+    button('🎁 👋', x + w - bw - 8 * ui, mid - bh / 2, bw, bh, C.rose, true, () => (panel = { person: o.id }))
+  })
+  const tip = visit ? t.inviteFromHome : list.length ? t.inviteTip : ''
+  if (tip) text(tip, box.x + box.w / 2, box.y + box.h - 16 * ui, fitSize(tip, box.w - 40 * ui, 12 * ui, 800), C.muted, 'center', 800, null)
+  buttons.push(box.close)
+}
+
+/** A player online (lobby): wave, invite, give something from your barn. */
+function drawPersonPanel(id: string) {
+  const o = online.get(id)
+  if (!o) {
+    panel = null
+    return
+  }
+  const box = panelFrame(clip(o.name, 22), 580, 420, C.rose)
+  const left = box.x + box.w * 0.2
+  drawFarmer(ctx, o.look, left, box.y + box.h * 0.56, Math.min(box.h * 0.42, 130 * ui), clock, 1, false)
+  text(`${t.level} ${o.level}`, left, box.y + box.h * 0.64, 14 * ui, C.text, 'center', 900, null)
+  text(statusOf(o), left, box.y + box.h * 0.71, 11 * ui, C.muted, 'center', 700, null)
+  const bw = Math.min(150 * ui, box.w * 0.32)
+  const already = invitedAlready(o.id)
+  button(already ? t.invited : '🏡 ' + t.invite, left - bw / 2, box.y + box.h - 100 * ui, bw, 40 * ui, C.teal, !visit && !already && o.at !== myFarmId, () => invite(o))
+  button('👋 ' + t.wave, left - bw / 2, box.y + box.h - 52 * ui, bw, 40 * ui, C.sky, true, () => wavePerson(id))
+  const x = box.x + box.w * 0.4
+  const w = box.w * 0.57
+  text(t.give, x + w / 2, box.y + 16 * ui, 15 * ui, C.text, 'center', 900, null)
+  const items = (Object.keys(ITEMS) as ItemId[]).filter((item) => home.count(item) > 0).slice(0, 8)
+  if (!items.length) text(t.nothingToGive, x + w / 2, box.y + box.h / 2, 13 * ui, C.muted, 'center', 800, null)
+  const cols = 4
+  const cell = w / cols
+  items.forEach((item, i) => {
+    const cx = x + (i % cols) * cell
+    const cy = box.y + 34 * ui + Math.floor(i / cols) * cell * 1.15
+    slot(cx + 4 * ui, cy, cell - 8 * ui, cell * 1.05)
+    drawItem(ctx, item, cx + cell / 2, cy + cell * 0.32, cell * 0.38)
+    text(`x${home.count(item)}`, cx + cell - 12 * ui, cy + 11 * ui, 11 * ui, C.text, 'right', 900, null)
+    button(t.give, cx + 9 * ui, cy + cell * 0.64, cell - 18 * ui, cell * 0.32, C.rose, true, () => giveTo(id, item))
   })
   buttons.push(box.close)
 }
 
+/** Someone on the farm on screen: wave; the owner can send a guest home. */
 function drawVisitorPanel(id: string) {
   const v = visitors.get(id)
   if (!v) {
     panel = null
     return
   }
-  const box = panelFrame(v.name, 560, 400)
-  const left = box.x + box.w * 0.2
-  drawFarmer(ctx, v.look, left, box.y + box.h * 0.62, Math.min(box.h * 0.45, 130 * ui), clock, 1, false)
-  text(`${t.level} ${v.level}`, left, box.y + box.h * 0.72, 14 * ui, '#8a7a6a', 'center', 800, null)
-  const bw = Math.min(140 * ui, box.w * 0.3)
-  button('👋 ' + t.wave, left - bw / 2, box.y + box.h - 52 * ui, bw, 36 * ui, '#4f8ff7', true, () => wave(id))
-  // Gifts: one item of the barn at a time.
-  const x = box.x + box.w * 0.4
-  const w = box.w * 0.57
-  text(t.give, x + w / 2, box.y + 22 * ui, 15 * ui, '#5a4636', 'center', 900, null)
-  const items = (Object.keys(ITEMS) as ItemId[]).filter((item) => farm.count(item) > 0).slice(0, 8)
-  if (!items.length) text(t.nothingToGive, x + w / 2, box.y + box.h / 2, 13 * ui, '#8a7a6a', 'center', 700, null)
-  const cols = 4
-  const cell = w / cols
-  items.forEach((item, i) => {
-    const cx = x + (i % cols) * cell
-    const cy = box.y + 42 * ui + Math.floor(i / cols) * cell * 1.15
-    ctx.fillStyle = '#f3ead9'
-    roundRect(ctx, cx + 4 * ui, cy, cell - 8 * ui, cell * 1.05, 12 * ui)
-    ctx.fill()
-    drawItem(ctx, item, cx + cell / 2, cy + cell * 0.32, cell * 0.38)
-    text(`x${farm.count(item)}`, cx + cell - 12 * ui, cy + 10 * ui, 11 * ui, '#5a4636', 'right', 900, null)
-    button(t.give, cx + 10 * ui, cy + cell * 0.66, cell - 20 * ui, cell * 0.28, '#ff8fab', true, () => giveTo(id, item))
-  })
+  const box = panelFrame(clip(v.name, 22), 420, 340, v.host ? C.teal : C.rose)
+  const cx = box.x + box.w / 2
+  drawFarmer(ctx, v.look, cx, box.y + box.h * 0.5, Math.min(box.h * 0.4, 120 * ui), clock, 1, false)
+  text(v.host ? `🏠 ${t.visitingTitle} ${v.name}` : `${t.level} ${v.level}`, cx, box.y + box.h * 0.6, 14 * ui, C.text, 'center', 900, null)
+  const bw = Math.min(170 * ui, box.w * 0.42)
+  const room = farmRoom
+  const wave = () => {
+    if (room) safely(() => room.send({ type: 'wave' }, id))
+    myEmote = { text: '👋 ' + t.hello, life: 2.5 }
+    sound.coin()
+  }
+  if (guests.has(id)) {
+    button('👋 ' + t.wave, cx - bw - 6 * ui, box.y + box.h - 60 * ui, bw, 44 * ui, C.sky, true, wave)
+    button(t.sendHome, cx + 6 * ui, box.y + box.h - 60 * ui, bw, 44 * ui, C.coral, true, () => sendHome(id))
+  } else button('👋 ' + t.wave, cx - bw / 2, box.y + box.h - 60 * ui, bw, 44 * ui, C.sky, true, wave)
   buttons.push(box.close)
 }
 
 function drawZonePanel(zone: Zone) {
-  const box = panelFrame(t.zones[zone.id], 380, 260)
+  const box = panelFrame(t.zones[zone.id], 400, 280, C.leafDark)
   const cx = box.x + box.w / 2
   ctx.save()
-  roundRect(ctx, cx - 60 * ui, box.y + 14 * ui, 120 * ui, 80 * ui, 12 * ui)
+  roundRect(ctx, cx - 64 * ui, box.y + 12 * ui, 128 * ui, 84 * ui, 14 * ui)
   ctx.clip()
-  drawForest(ctx, cx - 60 * ui, box.y + 14 * ui, 120 * ui, 80 * ui, clock)
+  drawForest(ctx, cx - 64 * ui, box.y + 12 * ui, 128 * ui, 84 * ui, clock)
   ctx.restore()
-  text(t.zoneHelp, cx, box.y + 116 * ui, 14 * ui, '#8a7a6a', 'center', 700, null)
+  roundRect(ctx, cx - 64 * ui, box.y + 12 * ui, 128 * ui, 84 * ui, 14 * ui)
+  ctx.strokeStyle = C.ink
+  ctx.lineWidth = 2
+  ctx.stroke()
+  text(t.zoneHelp, cx, box.y + 118 * ui, 14 * ui, C.muted, 'center', 800, null)
   const bw = box.w * 0.6
-  const bh = 44 * ui
+  const bh = 48 * ui
   if (farm.level >= zone.level) {
-    button(t.buy + ' · ' + zone.price, cx - bw / 2, box.y + box.h - bh - 18 * ui, bw, bh, '#5cbf3a', farm.s.coins >= zone.price, () => bought(farm.buyZone(zone), (zone.x + zone.w / 2) * TILE, (zone.y + zone.h / 2) * TILE))
-  } else text('🔒 ' + t.levelNeeded + ' ' + zone.level, cx, box.y + box.h - 40 * ui, 18 * ui, '#8a7a6a', 'center', 900, null)
+    button(t.buy + ' · ' + zone.price, cx - bw / 2, box.y + box.h - bh - 16 * ui, bw, bh, C.teal, farm.s.coins >= zone.price, () => bought(farm.buyZone(zone), (zone.x + zone.w / 2) * TILE, (zone.y + zone.h / 2) * TILE))
+  } else text('🔒 ' + t.levelNeeded + ' ' + zone.level, cx, box.y + box.h - 40 * ui, 18 * ui, C.muted, 'center', 900, null)
   buttons.push(box.close)
 }
 
 function drawPlacingBanner() {
-  const w = Math.min(width - 40, 440 * ui)
+  const w = Math.min(width - 40, 460 * ui)
   const x = (width - w) / 2
-  const y = 70 * ui
-  ctx.fillStyle = '#fffaf0'
-  roundRect(ctx, x, y, w, 48 * ui, 24 * ui)
-  ctx.fill()
-  text(t.placeHere, x + 20 * ui, y + 24 * ui, 14 * ui, '#5a4636', 'left', 800, null)
-  button(t.cancel, x + w - 100 * ui, y + 8 * ui, 90 * ui, 32 * ui, '#e8735a', true, () => (placing = null))
+  const y = 74 * ui
+  card(x, y, w, 52 * ui, 26 * ui, C.paper, 2.5)
+  text(t.placeHere, x + 22 * ui, y + 26 * ui, fitSize(t.placeHere, w - 140 * ui, 14 * ui, 800), C.text, 'left', 800, null)
+  button(t.cancel, x + w - 108 * ui, y + 8 * ui, 96 * ui, 38 * ui, C.coral, true, () => (placing = null))
 }
 
-/** Messages (welcome back, purchases, gifts): over everything, panels included. */
-function drawToast() {
-  if (toast) {
-    ctx.globalAlpha = Math.min(1, toast.life)
-    const w = Math.min(width - 40, 420 * ui)
-    const x = (width - w) / 2
-    const y = 64 * ui
-    ctx.fillStyle = '#fffaf0'
-    roundRect(ctx, x, y, w, 64 * ui, 18 * ui)
-    ctx.fill()
-    text(toast.title, width / 2, y + 22 * ui, 18 * ui, '#5a4636', 'center', 900, null)
-    text(toast.text, width / 2, y + 45 * ui, Math.min(13 * ui, (w / Math.max(1, toast.text.length)) * 1.8), '#8a7a6a', 'center', 700, null)
+/** On a friend's farm: whose farm it is, and what your help does. */
+function drawVisitBanner() {
+  if (!visit || !visit.host) return
+  const title = `🏠 ${t.visitingTitle} ${clip(visit.name, 18)}`
+  // Between the profile and the coins when there is room, else under them.
+  const left = 205 * ui
+  const right = width - 154 * ui
+  const roomy = right - left >= 250 * ui
+  const w = roomy ? Math.min(right - left - 12 * ui, 380 * ui) : Math.min(width - 32 * ui, 380 * ui)
+  const x = roomy ? (left + right - w) / 2 : (width - w) / 2
+  const y = (roomy ? 12 * ui : 98 * ui) + Math.sin(clock * 2) * 2 * ui
+  const cx = x + w / 2
+  card(x, y, w, 50 * ui, 16 * ui, C.mint, 2.5)
+  text(title, cx, y + 17 * ui, fitSize(title, w - 24 * ui, 15 * ui, 900), C.text, 'center', 900, null)
+  text(t.visitingHelp, cx, y + 36 * ui, fitSize(t.visitingHelp, w - 24 * ui, 11 * ui, 700), C.text, 'center', 700, null)
+}
+
+/** An invitation received: it slides in, with a countdown. */
+function drawInvitation() {
+  const inv = invitation
+  if (!inv) return
+  const w = Math.min(width - 24, 330 * ui)
+  const h = 150 * ui
+  const k = easeBack((inv.max - inv.life) * 3)
+  const x = width - (w + 14 * ui) * k
+  const y = Math.min(108 * ui, height - h - 100 * ui)
+  ctx.save()
+  ctx.translate(x + w / 2, y + h / 2)
+  ctx.rotate(Math.sin(clock * 3) * 0.01)
+  ctx.translate(-(x + w / 2), -(y + h / 2))
+  card(x, y, w, h, 20 * ui, C.paper, 3)
+  roundRect(ctx, x, y, w, 8 * ui, 4 * ui)
+  ctx.save()
+  roundRect(ctx, x + 10 * ui, y + h - 12 * ui, w - 20 * ui, 6 * ui, 3 * ui)
+  paint(ctx, '#eadfce')
+  roundRect(ctx, x + 10 * ui, y + h - 12 * ui, (w - 20 * ui) * (inv.life / inv.max), 6 * ui, 3 * ui)
+  paint(ctx, inv.life < 8 ? C.coral : C.teal)
+  ctx.restore()
+  const bounce = Math.abs(Math.sin(clock * 4)) * 4 * ui
+  face(inv.from, x + 40 * ui, y + 44 * ui - bounce, 24 * ui)
+  text('🏡', x + 58 * ui, y + 62 * ui, 16 * ui, '#fff', 'center', 900, null)
+  const name = clip(inv.from.name, 18)
+  text(name, x + 76 * ui, y + 30 * ui, fitSize(name, w - 90 * ui, 16 * ui, 900), C.text, 'left', 900, null)
+  text(t.invitesYou, x + 76 * ui, y + 50 * ui, fitSize(t.invitesYou, w - 90 * ui, 12 * ui, 800), C.text, 'left', 800, null)
+  text(t.inviteHelp, x + 76 * ui, y + 67 * ui, fitSize(t.inviteHelp, w - 90 * ui, 10 * ui, 700), C.muted, 'left', 700, null)
+  const bw = (w - 36 * ui) / 2
+  button(t.decline, x + 12 * ui, y + h - 60 * ui, bw, 42 * ui, '#a99bb0', true, declineInvitation)
+  button(t.accept, x + 24 * ui + bw, y + h - 60 * ui, bw, 42 * ui, C.teal, !travel, acceptInvitation)
+  ctx.restore()
+}
+
+/** Between two farms: a curtain of clouds sweeps across the screen. */
+function drawTravel() {
+  if (!travel) return
+  const k = travel.dir === 1 ? easeOut(travel.k) : 1 - easeOut(1 - travel.k)
+  const cover = travel.dir === 1 ? k : travel.k
+  buttons.push({ x: 0, y: 0, w: width, h: height, enabled: true, action: () => {} })
+  ctx.fillStyle = `rgba(255, 255, 255, ${Math.max(0, cover * 1.4 - 0.4)})`
+  ctx.fillRect(0, 0, width, height)
+  const s = Math.max(width, height) / 5
+  for (let row = 0; row < 6; row++) {
+    for (let i = 0; i < 6; i++) {
+      const from = row % 2 ? 1 : -1
+      const x0 = (i / 5) * width
+      const x = x0 + from * (1 - cover) * (width + s * 2)
+      const y = (row / 5) * height + Math.sin(clock * 2 + i + row) * 6
+      drawCloud(ctx, x, y + s * 0.2, s, 'rgba(200, 190, 235, 0.5)')
+      drawCloud(ctx, x, y, s, '#ffffff')
+    }
+  }
+  if (cover > 0.9) {
+    ctx.globalAlpha = (cover - 0.9) * 10
+    const label = visit && !visit.host ? t.travelling : ''
+    if (label) text(label, width / 2, height / 2, 26 * ui, C.text, 'center', 900, null)
     ctx.globalAlpha = 1
   }
 }
 
+/** Messages (welcome back, purchases, gifts): over everything, panels included. */
+function drawToast() {
+  if (!toast) return
+  const age = (toast.max ?? toast.life) - toast.life
+  const k = Math.min(easeBack(age * 3.5), clamp01(toast.life * 2.5))
+  const w = Math.min(width - 40, 430 * ui)
+  const h = toast.text ? 64 * ui : 46 * ui
+  const x = (width - w) / 2
+  const y = -h + (h + 66 * ui) * k
+  card(x, y, w, h, 20 * ui, C.paper, 2.5)
+  roundRect(ctx, x + 14 * ui, y + h / 2 - 3 * ui, 6 * ui, 6 * ui, 3 * ui)
+  paint(ctx, C.gold)
+  roundRect(ctx, x + w - 20 * ui, y + h / 2 - 3 * ui, 6 * ui, 6 * ui, 3 * ui)
+  paint(ctx, C.gold)
+  text(toast.title, width / 2, y + (toast.text ? 22 * ui : h / 2), fitSize(toast.title, w - 50 * ui, 18 * ui, 900), C.text, 'center', 900, null)
+  if (toast.text) text(toast.text, width / 2, y + 45 * ui, fitSize(toast.text, w - 50 * ui, 13 * ui, 800), C.muted, 'center', 800, null)
+}
+
 function drawOverlays() {
   if (levelBanner) {
-    const k = Math.min(1, (3.5 - levelBanner.life) * 4, levelBanner.life * 2)
-    ctx.globalAlpha = k
-    const s = 1 + (1 - k) * 0.3
-    text(`${t.levelUp} ${levelBanner.level} !`, width / 2, height * 0.32, 44 * ui * s, '#ffe08a', 'center', 900, 'rgba(150, 80, 20, 0.9)')
-    if (levelBanner.news.length) text(`${t.unlocked} : ${levelBanner.news.join(', ')}`, width / 2, height * 0.32 + 42 * ui, 17 * ui, '#fff', 'center', 800)
-    ctx.globalAlpha = 1
+    const age = 3.5 - levelBanner.life
+    const k = Math.min(easeBack(age * 2.5), clamp01(levelBanner.life * 2))
+    const cy = height * 0.32
+    ctx.save()
+    ctx.translate(width / 2, cy)
+    ctx.scale(k, k)
+    ctx.rotate(Math.sin(clock * 2) * 0.02)
+    const label = `${t.levelUp} ${levelBanner.level} !`
+    const size = 40 * ui
+    ctx.font = `900 ${size}px ${FONT}`
+    const w = ctx.measureText(label).width + 90 * ui
+    for (const side of [-1, 1]) {
+      ctx.beginPath()
+      ctx.moveTo((side * w) / 2 - side * 20 * ui, -26 * ui)
+      ctx.lineTo((side * w) / 2 + side * 34 * ui, -26 * ui)
+      ctx.lineTo((side * w) / 2 + side * 22 * ui, 0)
+      ctx.lineTo((side * w) / 2 + side * 34 * ui, 30 * ui)
+      ctx.lineTo((side * w) / 2 - side * 20 * ui, 30 * ui)
+      ctx.closePath()
+      paint(ctx, C.coralDark, 3)
+    }
+    roundRect(ctx, -w / 2, -34 * ui, w, 64 * ui, 16 * ui)
+    paint(ctx, C.coral, 3)
+    text(label, 0, -2 * ui, size, C.gold, 'center', 900, 'rgba(61,42,69,0.9)')
+    ctx.restore()
+    if (levelBanner.news.length) {
+      ctx.globalAlpha = clamp01(levelBanner.life * 2)
+      text(`${t.unlocked} : ${levelBanner.news.join(', ')}`, width / 2, cy + 54 * ui, fitSize(`${t.unlocked} : ${levelBanner.news.join(', ')}`, width - 40, 17 * ui, 900), '#fff', 'center', 900)
+      ctx.globalAlpha = 1
+    }
   }
   for (const f of flyers) {
     if (f.t < 0) continue
     const k = Math.max(0, f.t / f.duration)
     const e = k * k * (3 - 2 * k)
     const mx = (f.x0 + f.x1) / 2
-    const my = Math.min(f.y0, f.y1) - 80
+    const my = Math.min(f.y0, f.y1) - 90
     const x = (1 - e) * (1 - e) * f.x0 + 2 * (1 - e) * e * mx + e * e * f.x1
     const y = (1 - e) * (1 - e) * f.y0 + 2 * (1 - e) * e * my + e * e * f.y1
-    if (f.item === 'coin') drawCoin(ctx, x, y, 9 * ui)
+    // A little trail of sparkles.
+    ctx.fillStyle = `rgba(255, 245, 200, ${0.6 * (1 - k)})`
+    star4(ctx, x - (f.x1 - f.x0) * 0.03, y + 6, 2.5)
+    if (f.item === 'coin') drawCoin(ctx, x, y, 9 * ui, f.t * 12)
     else drawItem(ctx, f.item, x, y, 30 * ui * (1 - e * 0.4))
   }
   for (const p of particles) {
@@ -2210,30 +3478,61 @@ function drawOverlays() {
 }
 
 function drawTitle() {
-  ctx.fillStyle = 'rgba(40, 70, 30, 0.25)'
+  ctx.fillStyle = 'rgba(40, 30, 70, 0.22)'
   ctx.fillRect(0, 0, width, height)
   const s = Math.min(width, height * 1.4) / 520
-  text('CLOUD', width / 2, height * 0.3, 72 * s, '#fff', 'center', 900, 'rgba(70, 120, 40, 0.95)')
-  text('ACRES', width / 2, height * 0.3 + 70 * s, 72 * s, '#ffe08a', 'center', 900, 'rgba(150, 80, 20, 0.95)')
-  text(t.tagline, width / 2, height * 0.3 + 124 * s, 22 * s, '#fff', 'center', 800)
-  ctx.globalAlpha = 0.6 + 0.4 * Math.sin(clock * 4)
-  text(keyboard ? (document.hasFocus() ? t.pressToStart : t.clickToStart) : t.tapToStart, width / 2, height * 0.78, 30 * s, '#fff', 'center', 900)
-  ctx.globalAlpha = 1
+  const cy = height * 0.3
+  // A cloud plaque behind the name.
+  drawCloud(ctx, width / 2 + 6 * s, cy + 50 * s, 150 * s, 'rgba(61,42,69,0.18)')
+  drawCloud(ctx, width / 2, cy + 40 * s + Math.sin(clock * 1.2) * 4 * s, 150 * s, '#ffffff')
+  const word = (value: string, y: number, color: string, size: number, offset: number) => {
+    ctx.font = `900 ${size}px ${FONT}`
+    const total = ctx.measureText(value).width
+    let x = width / 2 - total / 2
+    for (let i = 0; i < value.length; i++) {
+      const ch = value[i]
+      const cw = ctx.measureText(ch).width
+      const bounce = Math.sin(clock * 3 - (i + offset) * 0.5) * 5 * s
+      text(ch, x + cw / 2, y + bounce, size, color, 'center', 900, C.ink)
+      x += cw
+    }
+  }
+  word('CLOUD', cy, C.sky, 66 * s, 0)
+  word('ACRES', cy + 64 * s, C.gold, 66 * s, 5)
+  text(t.tagline, width / 2, cy + 118 * s, 20 * s, '#fff', 'center', 900)
+  const pulse = 1 + Math.sin(clock * 4) * 0.05
+  const prompt = keyboard ? (document.hasFocus() ? t.pressToStart : t.clickToStart) : t.tapToStart
+  const pw = Math.min(width - 40, 330 * s)
+  ctx.save()
+  ctx.translate(width / 2, height * 0.76)
+  ctx.scale(pulse, pulse)
+  card(-pw / 2, -26 * s, pw, 52 * s, 26 * s, C.teal, 3)
+  text(prompt, 0, 0, fitSize(prompt, pw - 30 * s, 22 * s, 900), '#fff', 'center', 900, 'rgba(61,42,69,0.5)')
+  ctx.restore()
   const help = keyboard ? t.howToKeys : t.howTo
-  text(help, width / 2, height * 0.78 + 40 * s, Math.min(15 * s, (width / help.length) * 1.7), '#fff', 'center', 700)
+  text(help, width / 2, height * 0.76 + 50 * s, fitSize(help, width - 30, 14 * s, 800), '#fff', 'center', 800)
 }
 
 function draw() {
   buttons = []
+  framed = false
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-  drawWorld()
+  const light = daylight()
+  drawWorld(light)
   if (!started) {
     drawTitle()
+    hideNameInput()
     return
+  }
+  const key = panel === null ? '' : typeof panel === 'string' ? panel : JSON.stringify(Object.keys(panel)) + JSON.stringify(Object.values(panel).map((v) => (typeof v === 'object' && v ? (v as { id?: string }).id : v)))
+  if (key !== panelKey) {
+    panelKey = key
+    panelAt = clock
   }
   drawHud()
   drawSeedBar()
   drawMenuButtons()
+  drawVisitBanner()
   drawOverlays()
   if (placing) drawPlacingBanner()
   if (panel === 'barn') drawBarnPanel()
@@ -2241,22 +3540,27 @@ function draw() {
   else if (panel === 'shop') drawShopPanel()
   else if (panel === 'avatar') drawAvatarPanel()
   else if (panel === 'online') drawOnlinePanel()
+  else if (panel === 'settings') drawSettingsPanel()
   else if (panel && 'visitor' in panel) drawVisitorPanel(panel.visitor)
+  else if (panel && 'person' in panel) drawPersonPanel(panel.person)
   else if (panel && 'zone' in panel) drawZonePanel(panel.zone)
   else if (panel) drawBuyPanel(panel.buy)
+  if (framed) ctx.restore()
+  if (panel !== 'settings') hideNameInput()
+  if (!panel) drawInvitation()
   drawToast()
-  if (keyboard && !document.hasFocus() && !paused && !panel) {
+  if (keyboard && !document.hasFocus() && !paused && !panel && !nameShown) {
     // Keys go to the page around the game until it is clicked.
-    const w = Math.min(width - 40, 380 * ui)
-    ctx.fillStyle = 'rgba(40, 30, 60, 0.8)'
-    roundRect(ctx, (width - w) / 2, height - 130 * ui, w, 34 * ui, 17 * ui)
-    ctx.fill()
-    text('⌨ ' + t.clickToFocus, width / 2, height - 113 * ui, 13 * ui, '#fff', 'center', 800, null)
+    const w = Math.min(width - 40, 390 * ui)
+    roundRect(ctx, (width - w) / 2, height - 136 * ui, w, 36 * ui, 18 * ui)
+    paint(ctx, 'rgba(61, 42, 69, 0.85)', 2)
+    text('⌨ ' + t.clickToFocus, width / 2, height - 118 * ui, fitSize('⌨ ' + t.clickToFocus, w - 20 * ui, 13 * ui, 800), '#fff', 'center', 800, null)
   }
+  drawTravel()
   if (paused) {
-    ctx.fillStyle = 'rgba(30, 20, 40, 0.5)'
+    ctx.fillStyle = 'rgba(40, 25, 55, 0.5)'
     ctx.fillRect(0, 0, width, height)
-    text(t.paused, width / 2, height / 2, 32 * ui, '#fff')
+    text(t.paused, width / 2, height / 2, 34 * ui, '#fff')
   }
 }
 
@@ -2291,6 +3595,7 @@ canvas.addEventListener('pointerdown', (event) => {
   canvas.focus()
   canvas.setPointerCapture(event.pointerId)
   const p = position(event)
+  press = { x: p.x, y: p.y, at: clock }
   pointers.set(event.pointerId, p)
   if (pointers.size === 2) {
     // Pinch to zoom (cancels the current gesture).
@@ -2320,7 +3625,7 @@ canvas.addEventListener('pointerdown', (event) => {
     return
   }
   const hit = plotAt(w.x, w.y)
-  if (hit && tool === 'tractor') {
+  if (hit && tool === 'tractor' && !visit) {
     sendTractor(hit.place)
     gesture = null
   } else if (hit) {
@@ -2334,6 +3639,11 @@ canvas.addEventListener('pointerdown', (event) => {
 })
 
 canvas.addEventListener('pointermove', (event) => {
+  if (event.pointerType === 'mouse') {
+    mouse = position(event)
+    const hit = [...buttons].reverse().find((b) => inside(b, mouse) && !(b.w >= width && b.h >= height))
+    canvas.style.cursor = hit && hit.enabled ? 'pointer' : ''
+  }
   if (placing) {
     const q = position(event)
     hover = toWorld(q.x, q.y)
@@ -2373,13 +3683,14 @@ function pointerEnd(event: PointerEvent) {
   else if (gesture.mode === 'pending' && placing) placeDecorAt(w.x, w.y)
   else if (gesture.mode === 'pending' && gesture.place) tapPlace(gesture.place)
   else if (gesture.mode === 'pending') {
-    const zone = zoneAt(w.x, w.y)
+    const zone = visit ? null : zoneAt(w.x, w.y)
     if (zone) panel = { zone }
     else goTo(w.x, w.y)
   }
   gesture = null
 }
 canvas.addEventListener('pointerup', pointerEnd)
+canvas.addEventListener('pointerleave', () => (mouse = null))
 canvas.addEventListener('pointercancel', pointerEnd)
 canvas.addEventListener(
   'wheel',
@@ -2405,7 +3716,17 @@ window.addEventListener('keydown', (event) => {
     if (key === ' ' || key === 'Enter') startGame()
     return
   }
-  if (paused) return
+  if (paused || travel) return
+  if (invitation && !panel) {
+    if (key === 'Enter' || key === 'y') {
+      acceptInvitation()
+      return
+    }
+    if (key === 'Escape' || key === 'n') {
+      declineInvitation()
+      return
+    }
+  }
   if (KEYS[key]) held.add(key)
   const n = Number(key)
   const crops = farm.crops()
@@ -2422,7 +3743,7 @@ window.addEventListener('keydown', (event) => {
     if (placing) placeDecorAt(farmer.x, farmer.y + 30)
     else useNearby()
   }
-  if (key === 't' && farm.s.machines.tractor && !panel) {
+  if (key === 't' && farm.s.machines.tractor && !panel && !visit) {
     const hit = plotAt(farmer.x, farmer.y - 6)
     if (hit) sendTractor(hit.place)
   }
@@ -2457,8 +3778,8 @@ play.onResume(() => {
   paused = false
   sound.resume()
 })
-play.onAudioChange((on) => sound.setEnabled(on))
-sound.setEnabled(play.isAudioEnabled)
+play.onAudioChange((on) => sound.setEnabled(on && soundOn()))
+sound.setEnabled(play.isAudioEnabled && soundOn())
 window.addEventListener('pagehide', () => persist())
 
 paintGround()
@@ -2468,16 +3789,17 @@ requestAnimationFrame(frame)
 play
   .load<Save>()
   .then((saved) => {
-    farm = new Farm(saved)
+    home = farm = new Farm(saved)
   })
   .catch((error) => play.logWarning(error))
   .finally(() => {
     // The website's language and player are known now.
     t = texts(play.language)
     loadPlayer()
-    farm.onLevelUp = levelUp
+    home.onLevelUp = levelUp
     if (!farm.crops().some((c) => c.id === selected)) selected = 'wheat'
     play.gameReady()
     loadShop()
-    joinRoom()
+    joinLobby()
+    joinFarmRoom()
   })

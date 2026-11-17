@@ -281,10 +281,25 @@ export interface Save {
   upgrades: Record<UpgradeId, number>
   /** Purchases (coins bought on the website) already given, so none is given twice. */
   credited: string[]
+  /** Nickname shown to the other players ('' until chosen). */
+  name: string
+  /** Visible to the other players, who can invite you (and you them). */
+  online: boolean
 }
 
+/** A random id, made of letters and digits (the room of a farm during a session). */
+export function randomFarmId() {
+  const chars = 'abcdefghijkmnpqrstuvwxyz23456789'
+  let id = ''
+  for (let i = 0; i < 12; i++) id += chars[Math.floor(Math.random() * chars.length)]
+  return id
+}
+
+/** Longest nickname. */
+export const NAME_MAX = 18
+
 /** The save of version 2 (one farmhand), loaded and turned into a version 3. */
-export interface SaveV2 extends Omit<Save, 'version' | 'workers' | 'upgrades' | 'credited'> {
+export interface SaveV2 extends Omit<Save, 'version' | 'workers' | 'upgrades' | 'credited' | 'name' | 'online'> {
   version: 2
   helper?: { hiredUntil: number }
 }
@@ -320,6 +335,8 @@ export const NEW_SAVE = (): Save => ({
   workers: { field: { until: 0, forever: false }, animal: { until: 0, forever: false }, craft: { until: 0, forever: false } },
   upgrades: { fields: 1, pens: 1, workshops: 1 },
   credited: [],
+  name: '',
+  online: true,
 })
 
 /** Time away that counts (the farm works up to 12 hours without the player). */

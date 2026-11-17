@@ -28,6 +28,7 @@ import {
   PLACES,
   WORKSHOPS,
   WORKSHOP_QUEUE,
+  NAME_MAX,
   cropById,
   type CropId,
   type DecorKind,
@@ -65,7 +66,71 @@ function upgradeSave(saved: Save | SaveV2): Save {
   // Version 2 had one farmhand: they become the field hand.
   if (saved.version === 2 && saved.helper) s.workers.field = { until: saved.helper.hiredUntil, forever: false }
   delete s.helper
+  s.name = typeof s.name === 'string' ? s.name.slice(0, NAME_MAX) : ''
+  s.online = s.online !== false
   return s
+}
+
+/** What a visiting friend sees of a farm (and works on): no orders, no purchases, no name. */
+export type FarmSnapshot = Pick<
+  Save,
+  'clock' | 'coins' | 'xp' | 'barn' | 'owned' | 'plots' | 'pens' | 'workshops' | 'avatar' | 'machines' | 'sprinkler' | 'silo' | 'decor' | 'truck' | 'workers' | 'upgrades'
+>
+
+const num = (value: unknown, fallback = 0) => (typeof value === 'number' && Number.isFinite(value) ? value : fallback)
+const round = (value: number) => Math.round(value * 10) / 10
+const has = (object: object, key: string) => Object.prototype.hasOwnProperty.call(object, key)
+
+/** A snapshot received from another player, checked field by field (it is drawn as is). */
+function cleanSnapshot(raw: unknown): FarmSnapshot | null {
+  if (!raw || typeof raw !== 'object') return null
+  const s = raw as Record<string, any>
+  const fresh = NEW_SAVE()
+  const barn: Save['barn'] = {}
+  if (s.barn && typeof s.barn === 'object') for (const id of Object.keys(ITEMS)) if (has(s.barn, id)) barn[id as ItemId] = Math.max(0, Math.floor(num(s.barn[id])))
+  const placeIds = new Set([...PLACES.map((p) => p.id), ...ZONES.map((z) => z.id)])
+  const owned = Array.isArray(s.owned) ? s.owned.filter((id: unknown) => typeof id === 'string' && placeIds.has(id)) : fresh.owned
+  const plots: Save['plots'] = {}
+  const pens: Save['pens'] = {}
+  const workshops: Save['workshops'] = {}
+  for (const place of PLACES) {
+    if (place.kind === 'field' && s.plots && Array.isArray(s.plots[place.id])) {
+      plots[place.id] = Array.from({ length: place.w * place.h }, (_, i) => {
+        const plot = s.plots[place.id][i] || {}
+        const crop = CROPS.some((c) => c.id === plot.crop) ? (plot.crop as CropId) : null
+        return { crop, readyAt: num(plot.readyAt) }
+      })
+    }
+    if (place.kind === 'pen' && s.pens && s.pens[place.id]) pens[place.id] = { readyAt: num(s.pens[place.id].readyAt) }
+    if (place.kind === 'workshop' && s.workshops && s.workshops[place.id] && Array.isArray(s.workshops[place.id].queue)) {
+      workshops[place.id] = { queue: s.workshops[place.id].queue.slice(0, 10).map((t: unknown) => num(t)) }
+    }
+  }
+  const avatar = s.avatar && typeof s.avatar === 'object' ? s.avatar : fresh.avatar
+  const upgrades = { ...fresh.upgrades }
+  for (const id of Object.keys(upgrades) as UpgradeId[]) if (s.upgrades) upgrades[id] = Math.min(MAX_UPGRADE, Math.max(1, Math.floor(num(s.upgrades[id], 1))))
+  const workers = { ...fresh.workers }
+  for (const id of WORKER_IDS) if (s.workers && s.workers[id]) workers[id] = { until: num(s.workers[id].until), forever: !!s.workers[id].forever }
+  return {
+    clock: num(s.clock),
+    coins: Math.max(0, Math.floor(num(s.coins))),
+    xp: Math.max(0, Math.floor(num(s.xp))),
+    barn,
+    owned,
+    plots,
+    pens,
+    workshops,
+    avatar: { skin: num(avatar.skin), hat: num(avatar.hat), shirt: num(avatar.shirt), pants: num(avatar.pants) },
+    machines: { tractor: !!(s.machines && s.machines.tractor), truck: !!(s.machines && s.machines.truck) },
+    sprinkler: Math.min(SPRINKLER_PRICES.length, Math.max(0, Math.floor(num(s.sprinkler)))),
+    silo: Math.min(SILO_PRICES.length, Math.max(0, Math.floor(num(s.silo)))),
+    decor: Array.isArray(s.decor)
+      ? s.decor.slice(0, 120).filter((d: any) => d && has(DECORS, d.kind)).map((d: any) => ({ kind: d.kind as DecorKind, x: num(d.x), y: num(d.y) }))
+      : [],
+    truck: { returnAt: num(s.truck && s.truck.returnAt), coins: 0, xp: 0 },
+    workers,
+    upgrades,
+  }
 }
 
 export class Farm {
@@ -84,6 +149,54 @@ export class Farm {
       this.catchUp(this.s.clock + this.away)
     }
     this.ensureOrders()
+  }
+
+  /** A friend's farm, shown while visiting them: it follows the snapshots they send. */
+  static view(snapshot: unknown): Farm | null {
+    const farm = new Farm(null)
+    return farm.applySnapshot(snapshot) ? farm : null
+  }
+
+  /** Replaces what a visitor sees by a newer snapshot. false if the snapshot is not valid. */
+  applySnapshot(raw: unknown) {
+    const snapshot = cleanSnapshot(raw)
+    if (!snapshot) return false
+    this.s = { ...this.s, ...snapshot, orders: [] }
+    return true
+  }
+
+  /** What friends visiting this farm need to see it and work on it. */
+  snapshot(): FarmSnapshot {
+    const s = this.s
+    const plots: Save['plots'] = {}
+    for (const id of Object.keys(s.plots)) plots[id] = s.plots[id].map((p) => ({ crop: p.crop, readyAt: p.crop ? round(p.readyAt) : 0 }))
+    const workshops: Save['workshops'] = {}
+    for (const id of Object.keys(s.workshops)) workshops[id] = { queue: s.workshops[id].queue.map(round) }
+    const pens: Save['pens'] = {}
+    for (const id of Object.keys(s.pens)) pens[id] = { readyAt: round(s.pens[id].readyAt) }
+    return {
+      clock: round(s.clock),
+      coins: s.coins,
+      xp: s.xp,
+      barn: s.barn,
+      owned: s.owned,
+      plots,
+      pens,
+      workshops,
+      avatar: s.avatar,
+      machines: s.machines,
+      sprinkler: s.sprinkler,
+      silo: s.silo,
+      decor: s.decor,
+      truck: { returnAt: round(s.truck.returnAt), coins: 0, xp: 0 },
+      workers: s.workers,
+      upgrades: s.upgrades,
+    }
+  }
+
+  /** Lives `seconds` of game time at once (time spent visiting a friend), workers included. */
+  fastForward(seconds: number) {
+    if (seconds > 0) this.catchUp(this.s.clock + Math.min(seconds, MAX_AWAY))
   }
 
   /**
