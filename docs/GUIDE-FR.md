@@ -331,12 +331,26 @@ Le premier jeu, **Cloud Acres** (`examples/play/cloud-acres/`), est une ferme vu
   file), plus l'arrosage et les silos. Des étoiles dorées apparaissent sur les bâtiments améliorés ;
 - **les pièces** (onglet Pièces) : les packs vendus par le site (voir plus haut). Pour essayer
   sans site : `?shop=test` dans l'adresse du jeu (packs gratuits) ;
-- **les autres joueurs** : quand le site propose le multijoueur, les fermiers connectés marchent
-  sur ta ferme avec leur nom et leur niveau, « N en ligne » s'affiche en haut à droite. En touchant
-  un fermier (ou Espace à côté de lui) : **Saluer** (une bulle « 👋 Salut ! ») ou **Offrir** un
-  produit de ta grange (il le reçoit dans la sienne).
+- **les paramètres** (roue dentée sous le portrait) : le **pseudo** que voient les autres joueurs
+  (quand le site a des comptes, c'est le nom du compte qui s'affiche), **Jouer en ligne**
+  (oui / non), le **son**, et l'accès à « Mon fermier » ;
+- **les autres joueurs** : quand le site propose le multijoueur, « N en ligne » s'affiche en haut à
+  droite. On y voit la liste des joueurs connectés (niveau, « Dans sa ferme » ou « Chez … »), et
+  pour chacun : **Inviter**, **Saluer** et **Offrir** un produit de sa grange ;
+- **les invitations** : l'invité reçoit une carte « Ama vous invite dans sa ferme » (30 secondes
+  pour répondre, Entrée pour accepter, Échap pour refuser). S'il accepte, un rideau de nuages
+  l'emmène dans la **vraie ferme** de son ami : il y marche, récolte, plante, nourrit les animaux et
+  lance les ateliers, et **tout va dans la grange de son ami** (qui gagne aussi l'expérience). Ses
+  combos lui rapportent des pièces à lui. Le bouton **Rentrer** le ramène chez lui (sa ferme a
+  continué de tourner, ouvriers compris), et le propriétaire peut le **raccompagner**. La ferme
+  d'un ami ne se modifie pas autrement : ni boutique, ni grange, ni commandes.
 
-Tout est dessiné par le code (aucune image). **Au clavier** : les flèches (ou ZQSD / WASD)
+Tout est dessiné par le code (aucune image), dans un style à soi : une île flottante au-dessus d'une
+mer de nuages, contours dessinés à l'encre, ombres douces, et une lumière qui change sur 7 minutes
+(matin, midi, heure dorée, crépuscule avec des lucioles). `?light=dusk` (ou `golden`, `noon`,
+`morning`) montre directement une heure. Tout bouge : cultures et arbres dans le vent, animaux qui
+picorent, mâchent ou sautillent, papillons, oiseaux, poisson qui saute dans l'étang, girouette,
+boutons qui s'enfoncent, fenêtres qui rebondissent, pièces qui défilent. **Au clavier** : les flèches (ou ZQSD / WASD)
 font marcher le fermier, qui plante et récolte en passant sur les champs ; Espace utilise ce qui
 est à côté (animaux, atelier, grange, commandes, panneau) ; 1 à 5 choisit la graine ; T envoie le
 tracteur sur le champ où l'on est. **Au doigt ou à la souris** : on glisse sur les champs, on se
@@ -345,7 +359,10 @@ Le jeu s'inspire des mécaniques classiques des jeux de ferme, avec son propre n
 et ses graphismes.
 
 Test automatique : `node scripts/e2e-play.mjs target/debug/noru.exe` (le SDK, `<Playable>` dans une
-page Next et Cloud Acres, dans un vrai navigateur).
+page Next et Cloud Acres, dans un vrai navigateur). Pour essayer le jeu en ligne seul : sans
+serveur, deux onglets du même navigateur se retrouvent, mais ils partagent la même sauvegarde (même
+pseudo, même ferme). Pour deux vrais joueurs avec chacun sa ferme, il faut un serveur de salles
+(`noru dev`, qui l'inclut, ou `noru play-server`) et deux navigateurs.
 
 ## 9. Limites actuelles et prochaines étapes
 

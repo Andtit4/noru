@@ -1,0 +1,41 @@
+# The noru play rooms server, behind Caddy for HTTPS: pages served over https (Netlify, Vercel...)
+# can only open wss:// connections. Settings in .env (see .env.example).
+#
+#   cp .env.example .env                    # then edit SITE_ORIGIN, ROOMS_HOST
+#   docker compose up -d --build            # the rooms on port 4040 (nginx in front: nginx.conf)
+#   docker compose --profile caddy up -d --build   # or with Caddy for HTTPS (ports 80 / 443 free)
+#
+# Rooms: wss://$ROOMS_HOST (and ws://<server>:4040 directly, to test).
+
+services:
+  rooms:
+    build:
+      context: .
+      args:
+        REF: ${NORU_REF:-main}
+    image: noru-play-server
+    restart: unless-stopped
+    command: ["--allow-origin", "${SITE_ORIGIN:?set SITE_ORIGIN in .env}"]
+    ports:
+      - "4040:4040"
+
+  # HTTPS by Caddy, only with --profile caddy (a server without a web server on ports 80 / 443).
+  # With nginx already there, use nginx.conf instead.
+  caddy:
+    profiles: [caddy]
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [rooms]
+    environment:
+      ROOMS_HOST: ${ROOMS_HOST:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

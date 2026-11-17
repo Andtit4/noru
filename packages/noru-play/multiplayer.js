@@ -36,6 +36,8 @@ export function broadcastChannelTransport() {
         const id = randomId()
         const self = { id, name: me.name || '', avatar: me.avatar || null, state: me.state === undefined ? null : me.state }
         const peers = new Map() // id -> { player, seen }
+        // Messages received while joining (an answer to our hello): given once the room is joined.
+        const early = []
         let ready = false
         let closed = false
         const post = (data) => {
@@ -62,8 +64,9 @@ export function broadcastChannelTransport() {
           if (known) known.seen = Date.now()
           switch (data.t) {
             case 'hello':
-              add(data.player)
+              // Answered first: what the new player is sent once they are known comes after.
               post({ t: 'here', player: self, to: data.from })
+              add(data.player)
               break
             case 'here':
               add(data.player)
@@ -80,6 +83,7 @@ export function broadcastChannelTransport() {
               break
             case 'msg':
               if (known && ready) events.message(data.data, data.from)
+              else if (!ready) early.push([data.data, data.from])
               break
             case 'bye':
               remove(data.from)
@@ -117,6 +121,7 @@ export function broadcastChannelTransport() {
             },
             leave,
           })
+          for (const [message, from] of early.splice(0)) if (peers.has(from)) events.message(message, from)
         }, 150)
       })
     },

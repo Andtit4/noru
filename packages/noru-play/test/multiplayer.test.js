@@ -46,8 +46,17 @@ async function scenario(transport, label) {
   assert.ok(!a.log.some((e) => e[0] === 'message'), 'no echo of your own messages')
   kofi.leave()
   await until(() => a.log.some((e) => e[0] === 'leave' && e[1] === kofi.me.id), 'leave event')
+  // A player answering at once to someone who arrives (a welcome): the answer is not lost.
+  const welcomer = recorder()
+  welcomer.events.join = (p) => owner.send({ welcome: p.name }, p.id)
+  const owner = await transport.join('farm2', { name: 'Ama', avatar: null, state: null }, welcomer.events)
+  const c = recorder()
+  const guest = await transport.join('farm2', { name: 'Efua', avatar: null, state: null }, c.events)
+  await until(() => c.log.some((e) => e[0] === 'message' && e[1].welcome === 'Efua'), 'message sent while joining')
+  guest.leave()
+  owner.leave()
   ama.leave()
-  console.log(`✓ ${label}: join, players already there, state, messages (all / one player), leave`)
+  console.log(`✓ ${label}: join, players already there, state, messages (all / one player, sent while joining), leave`)
 }
 
 await scenario(broadcastChannelTransport(), 'tabs of a browser (BroadcastChannel)')
