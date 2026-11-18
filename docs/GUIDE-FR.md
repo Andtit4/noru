@@ -325,7 +325,12 @@ Le premier jeu, **Cloud Acres** (`examples/play/cloud-acres/`), est une ferme vu
   l'**artisan** (niveau 5) vide les ateliers et relance la production. On les paie pour 10 minutes
   (jusqu'à une heure d'avance) ou **pour toujours** (2 500, 3 200 et 4 000 pièces). Ils travaillent
   aussi pendant l'absence du joueur : la ferme revit ce temps pas à pas (les cultures repoussent et
-  sont récoltées plusieurs fois) ;
+  sont récoltées plusieurs fois). Embauchés **pour toujours**, ils touchent un **salaire** (120, 150
+  et 180 pièces par heure de travail) qu'on paie à la main dans la grange (onglet Ouvriers) ; au
+  bout d'une heure de salaire impayé, ils s'arrêtent (💰) jusqu'à ce qu'on les paie ;
+- **payer les amis qui aident** : chaque récolte d'un ami invité dans ta ferme te fait lui devoir
+  30 % de sa valeur. Il voit combien tu lui dois ; à 60 pièces dues, il ne peut plus aider tant que
+  tu n'as pas payé (touche-le, puis le bouton avec le montant : les pièces arrivent dans sa ferme) ;
 - **les améliorations** (onglet Améliorer), niveaux 1 à 3 : champs fertiles (+1 récolte par
   parcelle), enclos confortables (+1 produit), ateliers modernes (25 % plus rapides, +1 dans la
   file), plus l'arrosage et les silos. Des étoiles dorées apparaissent sur les bâtiments améliorés ;

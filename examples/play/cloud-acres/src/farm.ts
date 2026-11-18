@@ -44,6 +44,8 @@ import {
   MERCHANT_MAX,
   ENERGY,
   MARKET_MARKUP,
+  WAGES,
+  WAGE_LIMIT,
   NEW_RUINS,
   type TransportId,
   type SceneId,
@@ -95,6 +97,8 @@ function upgradeSave(saved: Save | SaveV2): Save {
   s.stall = fresh3 && Array.isArray(fresh3.stall) ? fresh3.stall : []
   s.merchant = fresh3 && fresh3.merchant && typeof fresh3.merchant === 'object' ? fresh3.merchant : { day: '', sold: 0 }
   s.stock = fresh3 && fresh3.stock && typeof fresh3.stock === 'object' ? fresh3.stock : {}
+  const wages = fresh3 && fresh3.wages && typeof fresh3.wages === 'object' ? fresh3.wages : null
+  s.wages = { field: Math.max(0, Number(wages?.field) || 0), animal: Math.max(0, Number(wages?.animal) || 0), craft: Math.max(0, Number(wages?.craft) || 0) }
   s.energy = fresh3 && typeof fresh3.energy === 'number' && Number.isFinite(fresh3.energy) ? Math.min(ENERGY.max, Math.max(0, fresh3.energy)) : ENERGY.max
   return s
 }
@@ -242,11 +246,13 @@ export class Farm {
       return
     }
     while (this.s.clock < end) {
-      this.s.clock = Math.min(end, this.s.clock + WORKER.actionTime)
+      const step = Math.min(end - this.s.clock, WORKER.actionTime)
+      this.s.clock += step
+      this.accrueWages(step)
       this.ensureOrders()
       this.tickTruck()
       for (const id of WORKER_IDS) {
-        if (!this.workerActive(id)) continue
+        if (!this.workerWorking(id)) continue
         const task = this.workerTasks(id).find((t) => t.kind !== 'plot' || this.space() > 0)
         if (task) this.workerDo(task)
       }
@@ -259,6 +265,37 @@ export class Farm {
   workerActive(id: WorkerId) {
     const w = this.s.workers[id]
     return w.forever || w.until > this.clock
+  }
+
+  /** Wages owed to a worker hired for good. */
+  wageOwed(id: WorkerId) {
+    return Math.floor(this.s.wages[id])
+  }
+
+  /** Most a worker can be owed before stopping. */
+  wageLimit(id: WorkerId) {
+    return WAGES[id] * WAGE_LIMIT
+  }
+
+  /** Hired, and not waiting for their pay. */
+  workerWorking(id: WorkerId) {
+    return this.workerActive(id) && !(this.s.workers[id].forever && this.s.wages[id] >= this.wageLimit(id))
+  }
+
+  private accrueWages(seconds: number) {
+    for (const id of WORKER_IDS) {
+      if (!this.workerWorking(id) || !this.s.workers[id].forever) continue
+      this.s.wages[id] = Math.min(this.wageLimit(id), this.s.wages[id] + (WAGES[id] * seconds) / 3600)
+    }
+  }
+
+  /** Pays what a worker is owed: coins paid, or 0 (not enough coins). */
+  payWages(id: WorkerId) {
+    const owed = this.wageOwed(id)
+    if (owed <= 0 || this.s.coins < owed) return 0
+    this.s.coins -= owed
+    this.s.wages[id] = 0
+    return owed
   }
 
   /** Seconds of work left (Infinity when hired for good). */
@@ -454,8 +491,9 @@ export class Farm {
 
   fireWorker(id: WorkerId) {
     if (!this.workerActive(id)) return 0
-    const coins = this.workerResale(id)
+    const coins = Math.max(0, this.workerResale(id) - this.wageOwed(id))
     this.s.workers[id] = { until: 0, forever: false }
+    this.s.wages[id] = 0
     this.s.coins += coins
     return coins
   }
@@ -512,6 +550,7 @@ export class Farm {
 
   advance(dt: number) {
     this.s.clock += dt
+    this.accrueWages(dt)
     this.rest(dt / ENERGY.regenEvery)
     this.ensureOrders()
     this.tickTruck()

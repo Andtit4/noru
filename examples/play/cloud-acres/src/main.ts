@@ -43,6 +43,9 @@ import {
   STALL_MAX,
   MERCHANT_MAX,
   ENERGY,
+  WAGES,
+  FRIEND_SHARE,
+  FRIEND_LIMIT,
   today,
   type SceneId,
   type FruitId,
@@ -172,6 +175,23 @@ function taskPoint(task: WorkerTask) {
   return { x: (task.place.x + task.place.w / 2) * TILE, y: (task.place.y + task.place.h) * TILE + 12 }
 }
 
+/** Workers already told they wait for their pay (once until paid). */
+const unpaidToldAt = new Set<WorkerId>()
+
+/** Pays a worker what they are owed. */
+function payWorker(id: WorkerId, sx: number, sy: number) {
+  const paid = farm.payWages(id)
+  if (!paid) {
+    sound.denied()
+    toast = { title: t.noCoins, text: `${t.owed} : ${farm.wageOwed(id)}`, life: 2.5 }
+    return
+  }
+  flyCoins(sx, sy, paid)
+  sound.buy()
+  toast = { title: `${t.paid} · ${t.workers[id]}`, text: `-${paid}`, life: 2.5 }
+  persist()
+}
+
 /** A sleep of the farmer in the house (the screen dims, the energy fills). */
 let sleeping: { t: number; night: boolean } | null = null
 const SLEEP_TIME = 4.5
@@ -229,6 +249,25 @@ function updateWorker(id: WorkerId, dt: number) {
     w.x = HOUSE_DOOR.x * TILE
     w.y = HOUSE_DOOR.y * TILE
   }
+  // Not paid: they stop and wait at their place.
+  if (!farm.workerWorking(id)) {
+    w.task = null
+    if (!unpaidToldAt.has(id)) {
+      unpaidToldAt.add(id)
+      toast = { title: `💰 ${t.workers[id]}`, text: `${t.waitsPay} · ${farm.wageOwed(id)}`, life: 4 }
+      sound.denied()
+    }
+    const home2 = WORKER_HOME[id]
+    const dx = home2.x - w.x
+    const dy = home2.y - w.y
+    const d = Math.hypot(dx, dy)
+    if (d > 3) {
+      w.x += (dx / d) * Math.min(d, 120 * dt)
+      w.y += (dy / d) * Math.min(d, 120 * dt)
+    }
+    return
+  }
+  unpaidToldAt.delete(id)
   w.wait -= dt
   if (!w.task && w.wait <= 0) {
     // The nearest thing to do.
@@ -383,6 +422,8 @@ type FarmMessage =
   | { type: 'wave' }
   | { type: 'bye' }
   | { type: 'hello'; token: string }
+  | { type: 'wage'; owed: number }
+  | { type: 'pay'; coins: number }
 
 interface Person { id: string; name: string; image: HTMLImageElement | null; look: Look; level: number }
 interface Lobbyist extends Person { farmId: string; at: string }
@@ -400,7 +441,9 @@ const visitors = new Map<string, Visitor>()
 /** Invitations you sent: token -> friend (lobby id). */
 const invitesSent = new Map<string, { to: string; until: number }>()
 /** Friends on your farm (farm room ids), with a limit of actions per second. */
-const guests = new Map<string, { token: string; acts: number; second: number }>()
+const guests = new Map<string, { token: string; acts: number; second: number; owed: number; told: number }>()
+/** On a friend's farm: what the owner owes you for your help. */
+let owedByHost = 0
 /** An invitation you received. */
 let invitation: { from: Lobbyist; farm: string; token: string; life: number; max: number } | null = null
 /** The farm you visit (host: the owner's id in their farm room, once they welcomed you). */
@@ -591,6 +634,7 @@ function acceptInvitation() {
       scene = 'home'
       leaveFarmRoom()
       visit = { farmId: inv.farm, token: inv.token, name: inv.from.name, host: '', since: clock, waiting: 10 }
+      owedByHost = 0
       joinFarmRoom()
     },
     () => !visit || !!visit.host,
@@ -713,7 +757,7 @@ function onFarmJoin(p: RoomPlayer<Shared>) {
 function admitGuest(p: RoomPlayer<Shared>, token: string) {
   if (!invitesSent.has(token) || !farmRoom || guests.has(p.id)) return
   invitesSent.delete(token)
-  guests.set(p.id, { token, acts: 0, second: 0 })
+  guests.set(p.id, { token, acts: 0, second: 0, owed: 0, told: -1 })
   const v = visitorOf(p)
   visitors.set(p.id, v)
   const room = farmRoom
@@ -731,7 +775,8 @@ function onFarmLeave(p: RoomPlayer<Shared>) {
     goHome(`${visit.name} ${t.hostLeft}`)
     return
   }
-  if (guests.delete(p.id) && v) toast = { title: v.name, text: t.guestLeft, life: 3 }
+  const left = guests.get(p.id)
+  if (guests.delete(p.id) && v) toast = { title: v.name, text: left && left.owed > 0 ? `${t.leftUnpaid} ${left.owed}` : t.guestLeft, life: 3.5 }
 }
 
 function onFarmMessage(data: FarmMessage, from: RoomPlayer<Shared>) {
@@ -758,6 +803,19 @@ function onFarmMessage(data: FarmMessage, from: RoomPlayer<Shared>) {
     } else if (data.type === 'snap' && visit.host && from.id === visit.host && farm !== home) {
       if (farm.applySnapshot(data.snap)) replayPending()
     } else if (data.type === 'bye' && from.id === visit.host) goHome(t.sentHome)
+    else if (data.type === 'wage' && from.id === visit.host) owedByHost = Math.max(0, Math.floor(Number(data.owed) || 0))
+    else if (data.type === 'pay' && from.id === visit.host) {
+      // Paid by the owner: never more than what they said they owed.
+      const coins = Math.min(Math.max(0, Math.floor(Number(data.coins) || 0)), Math.max(owedByHost, 0))
+      if (coins > 0) {
+        home.s.coins += coins
+        owedByHost -= coins
+        toast = { title: `${visit.name} ${t.paidYou}`, text: `+${coins}`, life: 3 }
+        flyCoins(width / 2, height / 3, coins)
+        sound.order()
+        persist()
+      }
+    }
     return
   }
   const guest = guests.get(from.id)
@@ -840,10 +898,51 @@ function doAct(f: Farm, act: Act): ActResult {
 }
 
 /** On your farm: what a friend did, applied for real (crops go to your barn). */
+/** Tells a friend what you owe them (when it changed). */
+function tellOwed(id: string) {
+  const guest = guests.get(id)
+  const room = farmRoom
+  if (!guest || !room || guest.told === guest.owed) return
+  guest.told = guest.owed
+  safely(() => room.send({ type: 'wage', owed: guest.owed }, id))
+}
+
+/** Pays a friend what you owe them for their help (the coins go to their farm). */
+function payFriend(id: string) {
+  const guest = guests.get(id)
+  const room = farmRoom
+  if (!guest || !room || guest.owed <= 0) return
+  if (home.s.coins < guest.owed) {
+    toast = { title: t.noCoins, text: `${t.youOwe} ${guest.owed}`, life: 2.5 }
+    sound.denied()
+    return
+  }
+  const coins = guest.owed
+  home.s.coins -= coins
+  guest.owed = 0
+  safely(() => room.send({ type: 'pay', coins }, id))
+  tellOwed(id)
+  const v = visitors.get(id)
+  toast = { title: `${t.paid} · ${v ? clip(v.name, 16) : ''}`, text: `-${coins}`, life: 2.5 }
+  sound.buy()
+  persist()
+}
+
 function runGuestAct(id: string, act: Act) {
   const v = visitors.get(id)
+  const guest = guests.get(id)
+  // Owed too much: they stop helping until paid.
+  if (guest && guest.owed >= FRIEND_LIMIT) {
+    guest.told = -1
+    tellOwed(id)
+    return
+  }
   const result = doAct(home, act)
   if (!v || !result) return
+  if (guest && (result.kind === 'harvest' || result.kind === 'collect')) {
+    guest.owed += Math.max(1, Math.round(ITEMS[result.item].price * result.count * FRIEND_SHARE))
+    tellOwed(id)
+  }
   const place = PLACES.find((p) => p.id === act.p)!
   let wx = (place.x + place.w / 2) * TILE
   let wy = place.y * TILE + TILE * 0.5
@@ -1429,6 +1528,7 @@ function tapPlace(place: Place) {
       floatText(cx, top, t.notYourFarm, '#ffe0e0', 15)
       return
     }
+    if (helpBlocked(cx, top)) return
     sendAct({ a: 'place', p: place.id })
   }
   if (!farm.owns(place.id)) {
@@ -1522,12 +1622,24 @@ function touchPlot(hit: { place: Place; index: number } | null) {
 }
 
 /** Plants or harvests a plot (`free`: the tractor does it, the farmer does not get tired). */
+/** On a friend's farm, owed too much: no more help until they pay. */
+function helpBlocked(wx: number, wy: number) {
+  if (!visit || owedByHost < FRIEND_LIMIT) return false
+  if (clock - lastDenied > 1.5) {
+    lastDenied = clock
+    sound.denied()
+    floatText(wx, wy - 30, `${visit.name} ${t.mustPayFirst}`, '#ffe0e0', 14)
+  }
+  return true
+}
+
 function actOnPlot(hit: { place: Place; index: number }, free = false) {
   const plot = farm.plots(hit.place)[hit.index]
   const col = hit.index % hit.place.w
   const row = Math.floor(hit.index / hit.place.w)
   const wx = (hit.place.x + col + 0.5) * TILE
   const wy = (hit.place.y + row + 0.5) * TILE
+  if (!free && helpBlocked(wx, wy)) return
   if (!plot.crop) {
     if (!free && !enough(ENERGY.sow, wx, wy)) return
     const result = farm.plant(hit.place, hit.index, selected)
@@ -2638,7 +2750,8 @@ function drawWorld(light: Daylight) {
       draw: () => {
         drawFarmer(ctx, WORKER_LOOK[id], at.x, at.y, 44, clock + 1.7 + WORKER_IDS.indexOf(id), farm === home ? w.facing : 1, walking)
         const left = farm.workerLeft(id)
-        nameTag(`${t.workerTag[id]} · ${Number.isFinite(left) ? Math.ceil(left / 60) + ' min' : '∞'}`, at.x, at.y + 4, '#9ee07a', C.text)
+        if (!farm.workerWorking(id)) nameTag(`💰 ${t.unpaid} · ${farm.wageOwed(id)}`, at.x, at.y + 4, C.coral, '#fff')
+        else nameTag(`${t.workerTag[id]} · ${Number.isFinite(left) ? Math.ceil(left / 60) + ' min' : '∞'}`, at.x, at.y + 4, '#9ee07a', C.text)
       },
     })
   }
@@ -2648,7 +2761,8 @@ function drawWorld(light: Daylight) {
       draw: () => {
         const moving = v.walking || Math.hypot(v.tx - v.x, v.ty - v.y) > 2
         drawFarmer(ctx, v.look, v.x, v.y, 46, clock + v.id.length, v.facing, moving)
-        nameTag(`${v.host ? '🏠 ' : ''}${clip(v.name, 16)} · ${t.level} ${v.level}`, v.x, v.y + 4, v.host ? C.mint : C.paper, C.text)
+        const owed = guests.get(v.id)?.owed ?? 0
+        nameTag(`${v.host ? '🏠 ' : ''}${clip(v.name, 16)} · ${owed > 0 ? '💰 ' + owed : t.level + ' ' + v.level}`, v.x, v.y + 4, v.host ? C.mint : owed >= FRIEND_LIMIT ? '#ffc9bd' : C.paper, C.text)
       },
     })
     if (v.emote) {
@@ -4443,8 +4557,12 @@ function drawBarnPanel() {
       const y = top + i * rowH
       const left = farm.workerLeft(id)
       const coins = farm.workerResale(id)
-      const mid = ownRow(x, y, w, rowH, () => drawFarmer(ctx, WORKER_LOOK[id], x + rowH * 0.5, y + rowH * 0.86, rowH * 0.66, clock + i, 1, false), t.workers[id], Number.isFinite(left) ? `${Math.ceil(left / 60)} min · ${t.resale} ${coins}` : `${t.hiredForever} · ${t.resale} ${coins}`)
-      sellButton('worker:' + id, `${t.fire} · ${coins}`, x + w - 160 * ui, mid - 17 * ui, 150 * ui, 34 * ui, true, () => (farm.workerActive(id) ? farm.fireWorker(id) : false))
+      const owed = farm.wageOwed(id)
+      const forever = farm.s.workers[id].forever
+      const help = Number.isFinite(left) ? `${Math.ceil(left / 60)} min · ${t.resale} ${coins}` : `${WAGES[id]}${t.perHour} · ${t.owed} ${owed} / ${farm.wageLimit(id)}${farm.workerWorking(id) ? '' : ' · ' + t.waitsPay}`
+      const mid = ownRow(x, y, w, rowH, () => drawFarmer(ctx, WORKER_LOOK[id], x + rowH * 0.5, y + rowH * 0.86, rowH * 0.66, clock + i, 1, false), t.workers[id], help)
+      if (forever) coinButton(owed, x + w - 270 * ui, mid - 17 * ui, 104 * ui, 34 * ui, farm.workerWorking(id) ? C.teal : C.coral, owed > 0 && farm.s.coins >= owed, () => payWorker(id, x + w - 220 * ui, mid))
+      sellButton('worker:' + id, `${t.fire} · ${Math.max(0, coins - owed)}`, x + w - 160 * ui, mid - 17 * ui, 150 * ui, 34 * ui, true, () => (farm.workerActive(id) ? farm.fireWorker(id) : false))
     })
   }
   buttons.push(box.close)
@@ -4582,7 +4700,7 @@ function workerRow(id: WorkerId, x: number, y: number, w: number, h: number) {
   else {
     const atMax = left + WORKER.duration > WORKER.maxAhead
     text(t.forHire, bx1 + bw / 2, mid - 24 * ui, 11 * ui, C.muted, 'center', 900, null)
-    text(t.forever, bx2 + bw / 2, mid - 24 * ui, 11 * ui, C.muted, 'center', 900, null)
+    text(`${t.forever} · ${WAGES[id]}${t.perHour}`, bx2 + bw / 2, mid - 24 * ui, 11 * ui, C.muted, 'center', 900, null)
     if (atMax) text(t.max, bx1 + bw / 2, mid + 4 * ui, 14 * ui, '#4f9e3a', 'center', 900, null)
     else
       coinButton(info.price, bx1, mid - bh / 2 + 5 * ui, bw, bh, C.gold, farm.s.coins >= info.price, () => {
@@ -5025,10 +5143,11 @@ function drawVisitorPanel(id: string) {
     panel = null
     return
   }
-  const box = panelFrame(clip(v.name, 22), 420, 340, v.host ? C.teal : C.rose)
+  const guest = guests.has(id)
+  const box = panelFrame(clip(v.name, 22), 420, guest ? 400 : 340, v.host ? C.teal : C.rose)
   const cx = box.x + box.w / 2
-  drawFarmer(ctx, v.look, cx, box.y + box.h * 0.5, Math.min(box.h * 0.4, 120 * ui), clock, 1, false)
-  text(v.host ? `🏠 ${t.visitingTitle} ${v.name}` : `${t.level} ${v.level}`, cx, box.y + box.h * 0.6, 14 * ui, C.text, 'center', 900, null)
+  drawFarmer(ctx, v.look, cx, box.y + box.h * (guest ? 0.4 : 0.5), Math.min(box.h * (guest ? 0.32 : 0.4), 120 * ui), clock, 1, false)
+  text(v.host ? `🏠 ${t.visitingTitle} ${v.name}` : `${t.level} ${v.level}`, cx, box.y + box.h * (guest ? 0.47 : 0.6), 14 * ui, C.text, 'center', 900, null)
   const bw = Math.min(170 * ui, box.w * 0.42)
   const room = farmRoom
   const wave = () => {
@@ -5037,6 +5156,9 @@ function drawVisitorPanel(id: string) {
     sound.coin()
   }
   if (guests.has(id)) {
+    const owed = guests.get(id)!.owed
+    text(owed > 0 ? `${t.youOwe} ${owed}${owed >= FRIEND_LIMIT ? ' · ' + t.stopsHelping : ''}` : t.nothingOwed, cx, box.y + box.h * 0.55, 13 * ui, owed >= FRIEND_LIMIT ? C.coralDark : C.muted, 'center', 800, null)
+    coinButton(owed, cx - bw / 2, box.y + box.h * 0.6, bw, 42 * ui, C.teal, owed > 0 && home.s.coins >= owed, () => payFriend(id))
     button('👋 ' + t.wave, cx - bw - 6 * ui, box.y + box.h - 60 * ui, bw, 44 * ui, C.sky, true, wave)
     button(t.sendHome, cx + 6 * ui, box.y + box.h - 60 * ui, bw, 44 * ui, C.coral, true, () => sendHome(id))
   } else button('👋 ' + t.wave, cx - bw / 2, box.y + box.h - 60 * ui, bw, 44 * ui, C.sky, true, wave)
@@ -5087,7 +5209,8 @@ function drawVisitBanner() {
   const cx = x + w / 2
   card(x, y, w, 50 * ui, 16 * ui, C.mint, 2.5)
   text(title, cx, y + 17 * ui, fitSize(title, w - 24 * ui, 15 * ui, 900), C.text, 'center', 900, null)
-  text(t.visitingHelp, cx, y + 36 * ui, fitSize(t.visitingHelp, w - 24 * ui, 11 * ui, 700), C.text, 'center', 700, null)
+  const line = owedByHost > 0 ? `💰 ${visit.name} ${t.owesYou} ${owedByHost} / ${FRIEND_LIMIT}` : t.visitingHelp
+  text(line, cx, y + 36 * ui, fitSize(line, w - 24 * ui, 11 * ui, 700), owedByHost >= FRIEND_LIMIT ? C.coralDark : C.text, 'center', 800, null)
 }
 
 /** An invitation received: it slides in, with a countdown. */
@@ -5406,6 +5529,11 @@ canvas.addEventListener('pointerdown', (event) => {
   const w = toWorld(p.x, p.y)
   if (placing) {
     hover = w
+    gesture = { mode: 'pending', startX: p.x, startY: p.y, lastX: p.x, lastY: p.y }
+    return
+  }
+  // A player standing on a field: tapping them opens their panel, it does not harvest under them.
+  if (scene === 'home' && visitorAt(w.x, w.y)) {
     gesture = { mode: 'pending', startX: p.x, startY: p.y, lastX: p.x, lastY: p.y }
     return
   }

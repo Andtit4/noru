@@ -197,6 +197,16 @@ export const WORKERS: Record<WorkerId, { level: number; price: number; forever: 
   craft: { level: 5, price: 180, forever: 4000 },
 }
 export const WORKER = { duration: 600, maxAhead: 3600, actionTime: 2 }
+/**
+ * Workers hired for good are paid a wage, by hour of work (game time), paid by hand: they stop
+ * working once they are owed WAGE_LIMIT hours of wages, until they are paid.
+ */
+export const WAGES: Record<WorkerId, number> = { field: 120, animal: 150, craft: 180 }
+export const WAGE_LIMIT = 1
+/** A friend who helps on your farm is owed a part of the value of what they harvest. */
+export const FRIEND_SHARE = 0.3
+/** Owed this much, a friend stops helping until paid. */
+export const FRIEND_LIMIT = 60
 
 /**
  * Upgrades of the farm, levels 1 to 3: fertile fields (each plot gives one more crop per level),
@@ -390,6 +400,8 @@ export interface Save {
   stock: Partial<Record<DecorKind, number>>
   /** Energy of the farmer (0 to ENERGY.max). */
   energy: number
+  /** Wages owed to the workers hired for good. */
+  wages: Record<WorkerId, number>
 }
 
 export interface RuinsState {
@@ -424,7 +436,7 @@ export function randomFarmId() {
 export const NAME_MAX = 18
 
 /** The save of version 2 (one farmhand), loaded and turned into a version 3. */
-export interface SaveV2 extends Omit<Save, 'version' | 'workers' | 'upgrades' | 'credited' | 'name' | 'online' | 'transport' | 'orchard' | 'ruins' | 'stall' | 'merchant' | 'stock' | 'energy'> {
+export interface SaveV2 extends Omit<Save, 'version' | 'workers' | 'upgrades' | 'credited' | 'name' | 'online' | 'transport' | 'orchard' | 'ruins' | 'stall' | 'merchant' | 'stock' | 'energy' | 'wages'> {
   version: 2
   helper?: { hiredUntil: number }
 }
@@ -469,6 +481,7 @@ export const NEW_SAVE = (): Save => ({
   merchant: { day: '', sold: 0 },
   stock: {},
   energy: 100,
+  wages: { field: 0, animal: 0, craft: 0 },
 })
 
 export const NEW_RUINS = (): RuinsState => ({
