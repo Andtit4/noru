@@ -345,6 +345,34 @@ Le premier jeu, **Cloud Acres** (`examples/play/cloud-acres/`), est une ferme vu
   continué de tourner, ouvriers compris), et le propriétaire peut le **raccompagner**. La ferme
   d'un ami ne se modifie pas autrement : ni boutique, ni grange, ni commandes.
 
+- **la grange** : on y voit ses produits (ils se **vendent au Marché**, voir plus bas), et on y
+  revend ce qu'on possède : animaux (un de plus ou de moins par enclos), champs, enclos, ateliers,
+  terrains, machines, décorations, ouvriers (la moitié du prix) ;
+- **l'énergie** (⚡ à côté de la roue dentée) : récolter, planter, nourrir et lancer un atelier
+  fatiguent le fermier ; à zéro, il marche lentement et ne peut plus travailler. Elle revient
+  doucement toute seule, et d'un coup en **dormant dans la maison** (en bas de la ferme) : toute
+  l'énergie la nuit, une sieste le jour. Le tracteur et les ouvriers ne fatiguent pas le fermier ;
+  la nuit, **les ouvriers rentrent dormir** dans la maison et ressortent au matin ;
+- **le jour et la nuit** : l'heure s'affiche en haut à droite (heure réelle du joueur, ou journées
+  accélérées de 24 minutes dans les paramètres). La nuit, les fenêtres et les lampadaires
+  s'allument, le fermier porte une lanterne, les animaux dorment, et des **étoiles filantes**
+  passent (on les touche pour gagner des pièces) ;
+- **les autres îles** : depuis le **ponton** (bac-nuage, 50 pièces, dès le niveau 1) ou l'**aire de
+  la montgolfière** (1 500 pièces, niveau 6). Chaque trajet coûte des pièces, le retour est gratuit :
+  - **le Verger** (15) : des arbres plantés une fois qui donnent des fruits en boucle (oranges,
+    mangues, cacao, karité) ;
+  - **l'île du Marché** (5) : le marchand des vents **achète tous les produits** (un par un ou
+    tout d'un coup), en vend au double du prix, paie le double pour un produit différent chaque
+    jour et vend des décorations uniques ; chaque joueur y tient **son étal** (3 produits) et les
+    autres joueurs présents peuvent y acheter ;
+  - **les Ruines célestes** (60) : des plateformes flottantes dans un ciel violet, un jardin de
+    cristaux et le **Gardien masqué** qui donne 5 quêtes (lanternes, cristaux, offrande, runes qui
+    ouvrent un pont de lumière secret, poussière d'étoile à ramasser la nuit), puis une offrande
+    quotidienne. La dernière quête offre le Fragment d'étoile, à poser chez soi.
+
+  Pour voir une île ou une heure directement : `?scene=orchard` (`market`, `ruins`),
+  `?light=night` (`dawn`, `golden`…).
+
 Tout est dessiné par le code (aucune image), dans un style à soi : une île flottante au-dessus d'une
 mer de nuages, contours dessinés à l'encre, ombres douces, et une lumière qui change sur 7 minutes
 (matin, midi, heure dorée, crépuscule avec des lucioles). `?light=dusk` (ou `golden`, `noon`,
