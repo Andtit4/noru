@@ -3,6 +3,7 @@
 
 import type { AnimalKind, ItemId, WorkshopKind } from './data'
 import { C, drawProduce, ellipse, leaf, paint, roundRect, shadow, wind } from './draw'
+import { drawCrystal, drawFruit } from './islandArt'
 
 type Ctx = CanvasRenderingContext2D
 
@@ -12,6 +13,14 @@ const CROP_ITEMS = ['wheat', 'carrot', 'corn', 'tomato', 'pumpkin']
 export function drawItem(ctx: Ctx, id: ItemId, x: number, y: number, s: number) {
   if (CROP_ITEMS.includes(id)) {
     drawProduce(ctx, id as 'wheat', x, y, s)
+    return
+  }
+  if (id === 'orange' || id === 'mango' || id === 'cacao' || id === 'shea') {
+    drawFruit(ctx, id, x, y, s)
+    return
+  }
+  if (id === 'crystalBlue' || id === 'crystalPink' || id === 'crystalGold') {
+    drawCrystal(ctx, id, x, y - s * 0.1, s * 0.9)
     return
   }
   const ink = Math.max(1, s * 0.05)
@@ -258,6 +267,60 @@ export function drawBarn(ctx: Ctx, x: number, y: number, w: number, h: number, t
   ctx.arc(cw * 0.45, 0, w * 0.035, 0, Math.PI * 2)
   paint(ctx, '#ffffff', ink * 0.8)
   ctx.restore()
+}
+
+/** The farmer's house: cream walls, a coral roof, a chimney that smokes; lit windows at night. */
+export function drawFarmhouse(ctx: Ctx, x: number, y: number, w: number, h: number, t: number, night: number, sleeping: boolean) {
+  const ink = Math.max(1.5, w * 0.02)
+  roundRect(ctx, x + w * 0.66, y + h * 0.02, w * 0.12, h * 0.3, 3)
+  paint(ctx, '#b0624a', ink)
+  house(ctx, x, y, w, h, '#fff1dc', C.coral, C.coralDark)
+  // Windows: warm light at night, curtains drawn while sleeping.
+  for (const wx of [0.16, 0.68]) {
+    roundRect(ctx, x + w * wx, y + h * 0.55, w * 0.16, h * 0.15, 4)
+    paint(ctx, night > 0.3 ? '#ffd98a' : '#cfe9ff', ink * 0.8)
+    if (sleeping) {
+      roundRect(ctx, x + w * wx, y + h * 0.55, w * 0.16, h * 0.15, 4)
+      paint(ctx, '#9b6bd1')
+    }
+    ctx.strokeStyle = C.ink
+    ctx.lineWidth = ink * 0.6
+    ctx.beginPath()
+    ctx.moveTo(x + w * (wx + 0.08), y + h * 0.55)
+    ctx.lineTo(x + w * (wx + 0.08), y + h * 0.7)
+    ctx.stroke()
+  }
+  door(ctx, x + w * 0.5, y + h * 0.96, w * 0.2, h * 0.3, '#8d6346')
+  // A heart on the door, and flower pots.
+  ctx.fillStyle = C.rose
+  ctx.beginPath()
+  ctx.arc(x + w * 0.48, y + h * 0.78, w * 0.018, 0, Math.PI * 2)
+  ctx.arc(x + w * 0.52, y + h * 0.78, w * 0.018, 0, Math.PI * 2)
+  ctx.moveTo(x + w * 0.465, y + h * 0.785)
+  ctx.lineTo(x + w * 0.5, y + h * 0.82)
+  ctx.lineTo(x + w * 0.535, y + h * 0.785)
+  ctx.fill()
+  for (const px of [0.08, 0.86]) {
+    roundRect(ctx, x + w * px, y + h * 0.86, w * 0.08, h * 0.1, 3)
+    paint(ctx, '#c4794f', ink * 0.7)
+    ellipse(ctx, x + w * (px + 0.04), y + h * 0.84, w * 0.05, w * 0.04, C.leaf, 0, ink * 0.5)
+    ellipse(ctx, x + w * (px + 0.04), y + h * 0.82, w * 0.018, w * 0.018, C.gold)
+  }
+  // Smoke from the chimney (and z's when someone sleeps).
+  for (let i = 0; i < 3; i++) {
+    const k = (t * 0.4 + i / 3) % 1
+    ellipse(ctx, x + w * 0.72 + Math.sin(k * 6 + i) * 4, y - k * h * 0.45, 3 + k * 8, 3 + k * 8, `rgba(255,255,255,${0.55 * (1 - k)})`)
+  }
+  if (sleeping) {
+    for (let i = 0; i < 3; i++) {
+      const k = (t * 0.6 + i / 3) % 1
+      ctx.globalAlpha = Math.sin(k * Math.PI)
+      ctx.fillStyle = '#ffffff'
+      ctx.font = `900 ${Math.round(12 + k * 10)}px system-ui, sans-serif`
+      ctx.fillText('z', x + w * 0.8 + k * 18, y + h * 0.4 - k * 40)
+      ctx.globalAlpha = 1
+    }
+  }
 }
 
 /** The orders kiosk: a striped awning over a cork board; its flag waves when orders wait. */
@@ -606,7 +669,9 @@ export function drawTree(ctx: Ctx, x: number, y: number, s: number, t: number) {
   const [dark, mid, light] = blossom ? ['#e98aa6', '#f7a8be', '#ffd0dc'] : ['#4f9e43', '#64b851', '#86cf63']
   ctx.beginPath()
   ctx.arc(x + sway, y - s * 0.14, s * 0.4, 0, Math.PI * 2)
+  ctx.moveTo(x - s * 0.02 + sway * 0.8, y - s * 0.02)
   ctx.arc(x - s * 0.26 + sway * 0.8, y - s * 0.02, s * 0.24, 0, Math.PI * 2)
+  ctx.moveTo(x + s * 0.49 + sway * 0.8, y - s * 0.04)
   ctx.arc(x + s * 0.27 + sway * 0.8, y - s * 0.04, s * 0.22, 0, Math.PI * 2)
   paint(ctx, dark, ink)
   ellipse(ctx, x - s * 0.04 + sway, y - s * 0.18, s * 0.33, s * 0.28, mid)

@@ -14,6 +14,13 @@ export type ItemId =
   | 'cheese'
   | 'sweater'
   | 'cake'
+  | 'orange'
+  | 'mango'
+  | 'cacao'
+  | 'shea'
+  | 'crystalBlue'
+  | 'crystalPink'
+  | 'crystalGold'
 
 export interface Item {
   id: ItemId
@@ -37,6 +44,15 @@ export const ITEMS: Record<ItemId, Item> = {
   cheese: { id: 'cheese', price: 42, level: 4 },
   sweater: { id: 'sweater', price: 55, level: 6 },
   cake: { id: 'cake', price: 50, level: 7 },
+  // The orchard island.
+  orange: { id: 'orange', price: 10, level: 3 },
+  mango: { id: 'mango', price: 14, level: 4 },
+  cacao: { id: 'cacao', price: 24, level: 5 },
+  shea: { id: 'shea', price: 32, level: 6 },
+  // The celestial ruins (never asked in orders: level 99).
+  crystalBlue: { id: 'crystalBlue', price: 45, level: 99 },
+  crystalPink: { id: 'crystalPink', price: 80, level: 99 },
+  crystalGold: { id: 'crystalGold', price: 160, level: 99 },
 }
 
 export type CropId = 'wheat' | 'carrot' | 'corn' | 'tomato' | 'pumpkin'
@@ -181,6 +197,16 @@ export const WORKERS: Record<WorkerId, { level: number; price: number; forever: 
   craft: { level: 5, price: 180, forever: 4000 },
 }
 export const WORKER = { duration: 600, maxAhead: 3600, actionTime: 2 }
+/**
+ * Workers hired for good are paid a wage, by hour of work (game time), paid by hand: they stop
+ * working once they are owed WAGE_LIMIT hours of wages, until they are paid.
+ */
+export const WAGES: Record<WorkerId, number> = { field: 120, animal: 150, craft: 180 }
+export const WAGE_LIMIT = 1
+/** A friend who helps on your farm is owed a part of the value of what they harvest. */
+export const FRIEND_SHARE = 0.3
+/** Owed this much, a friend stops helping until paid. */
+export const FRIEND_LIMIT = 60
 
 /**
  * Upgrades of the farm, levels 1 to 3: fertile fields (each plot gives one more crop per level),
@@ -208,14 +234,81 @@ export const SILO_LEVEL = 2
 export const BARN_BASE = 50
 export const SILO_SIZE = 50
 
-export type DecorKind = 'flowers' | 'haystack' | 'bench' | 'lamp' | 'scarecrow' | 'fountain'
-export const DECORS: Record<DecorKind, { level: number; price: number }> = {
+export type DecorKind = 'flowers' | 'haystack' | 'bench' | 'lamp' | 'scarecrow' | 'fountain' | 'lantern' | 'cloudstatue' | 'kenteflag' | 'starshard'
+/** where: 'market' (sold by the merchant of the market island), 'reward' (the ruins' last quest). */
+export const DECORS: Record<DecorKind, { level: number; price: number; where?: 'market' | 'reward' }> = {
   flowers: { level: 1, price: 20 },
   haystack: { level: 1, price: 30 },
   bench: { level: 2, price: 45 },
   lamp: { level: 3, price: 60 },
   scarecrow: { level: 3, price: 80 },
   fountain: { level: 5, price: 250 },
+  lantern: { level: 3, price: 120, where: 'market' },
+  cloudstatue: { level: 4, price: 300, where: 'market' },
+  kenteflag: { level: 3, price: 180, where: 'market' },
+  starshard: { level: 1, price: 0, where: 'reward' },
+}
+
+// --- the other islands --------------------------------------------------------------------------
+
+/** The ways to the other islands: bought once, then each trip from your farm costs a fare. */
+export type TransportId = 'ferry' | 'balloon'
+export const TRANSPORT: Record<TransportId, { level: number; price: number }> = {
+  ferry: { level: 1, price: 50 },
+  balloon: { level: 6, price: 1500 },
+}
+
+export type SceneId = 'home' | 'orchard' | 'market' | 'ruins'
+/** The islands you travel to: how, the fare of the trip, and their size in tiles. */
+export const ISLANDS: Record<Exclude<SceneId, 'home'>, { transport: TransportId; fare: number; w: number; h: number }> = {
+  orchard: { transport: 'ferry', fare: 15, w: 24, h: 14 },
+  market: { transport: 'ferry', fare: 5, w: 20, h: 12 },
+  ruins: { transport: 'balloon', fare: 60, w: 28, h: 16 },
+}
+
+/** Fruit trees of the orchard: planted once, they give fruit again and again. Times in seconds. */
+export type FruitId = 'orange' | 'mango' | 'cacao' | 'shea'
+export const FRUITS: Record<FruitId, { level: number; price: number; grow: number; every: number; yield: number; color: string }> = {
+  orange: { level: 3, price: 60, grow: 240, every: 90, yield: 4, color: '#ff9a2e' },
+  mango: { level: 4, price: 90, grow: 300, every: 120, yield: 3, color: '#ffc23d' },
+  cacao: { level: 5, price: 150, grow: 420, every: 180, yield: 3, color: '#b5652f' },
+  shea: { level: 6, price: 220, grow: 600, every: 240, yield: 2, color: '#d9c48f' },
+}
+export const ORCHARD_SPOTS = 12
+
+/** Crystals of the ruins: a star seed grows into a crystal of a random color. */
+export const STAR_SEED = { price: 40, grow: 180 }
+export const CRYSTAL_PLOTS = 6
+export type CrystalId = 'crystalBlue' | 'crystalPink' | 'crystalGold'
+
+/** The quests of the masked keeper, in order. */
+export const RUIN_QUESTS = [
+  { id: 'lanterns', coins: 120 },
+  { id: 'crystals', coins: 250, count: 5 },
+  { id: 'offering', coins: 350, needs: [{ item: 'orange' as ItemId, count: 8 }, { item: 'wheat' as ItemId, count: 10 }] },
+  { id: 'runes', coins: 400 },
+  { id: 'stardust', coins: 1000, count: 5 },
+] as const
+
+/**
+ * Energy of the farmer: working costs a little (sowing, harvesting, feeding...), it comes back slowly
+ * by itself, and sleeping in the house fills it (a full night) or gives part of it (a nap).
+ */
+export const ENERGY = { max: 100, regenEvery: 40, sow: 0.5, harvest: 1, animals: 2, workshop: 2, tree: 2, crystal: 3, nap: 40 }
+/** The market sells goods at twice their price. */
+export const MARKET_MARKUP = 2
+
+/** The stall of the market island: up to 3 offers, up to 10 of an item each. */
+export const STALL_OFFERS = 3
+export const STALL_MAX = 10
+/** The wind merchant buys one kind of goods a day at twice its price, up to this many. */
+export const MERCHANT_MAX = 20
+
+/** Today, as yyyy-mm-dd (local time): daily things change at midnight. */
+export function today() {
+  const d = new Date()
+  const two = (n: number) => String(n).padStart(2, '0')
+  return d.getFullYear() + '-' + two(d.getMonth() + 1) + '-' + two(d.getDate())
 }
 
 /** The farmer's look. */
@@ -233,8 +326,8 @@ export const HATS = ['straw', 'cap', 'bandana', 'none'] as const
 /** Trees and the pond (decoration). */
 export const TREES: [number, number, number][] = [
   [0.7, 5.2, 0.9], [0.5, 9.6, 1.1], [0.8, 13.6, 1], [9.6, 0.7, 0.9], [9.8, 4.6, 1],
-  [9.6, 8.6, 0.8], [9.7, 12.8, 1.1], [13.4, 13.6, 0.9], [19.8, 0.7, 1], [22.8, 2.2, 1.1], [23.1, 6.4, 0.9],
-  [23.1, 13.5, 1], [19.6, 13.8, 0.85], [16.5, 13.7, 1], [10.4, 14.2, 0.8], [5.2, 14.3, 0.9], [23.2, 9.2, 1],
+  [9.6, 8.6, 0.8], [9.7, 12.8, 1.1], [19.8, 0.7, 1], [23.4, 0.8, 1.05], [23.1, 6.4, 0.9],
+  [23.1, 13.5, 1], [19.6, 13.8, 0.85], [15.1, 13.9, 0.9], [5.2, 14.3, 0.9], [23.2, 9.2, 1],
 ]
 export const POND = { x: 20.2, y: 4.4, w: 2.6, h: 2.6 }
 
@@ -247,7 +340,15 @@ export interface PlotState {
 export interface PenState {
   /** 0: hungry; else game clock when the products are ready. */
   readyAt: number
+  /** Animals in the pen (default: PENS[kind].animals). */
+  animals?: number
 }
+
+/** Price of one more animal (a pen holds its starting animals + EXTRA_ANIMALS, at least 1). */
+export const ANIMAL_PRICES: Record<AnimalKind, number> = { chicken: 25, cow: 110, pig: 90, sheep: 80 }
+export const EXTRA_ANIMALS = 2
+/** What selling gives back: half of the price. */
+export const RESALE = 0.5
 
 export interface WorkshopState {
   /** Game clock at which each queued production is done (sorted). */
@@ -285,6 +386,42 @@ export interface Save {
   name: string
   /** Visible to the other players, who can invite you (and you them). */
   online: boolean
+  /** The ways to the other islands you own. */
+  transport: Record<TransportId, boolean>
+  /** Fruit trees of the orchard, by spot (0 to ORCHARD_SPOTS - 1): ripe at readyAt, grown at grownAt. */
+  orchard: Record<string, { fruit: FruitId; grownAt: number; readyAt: number }>
+  /** The celestial ruins: quest reached, lanterns lit, crystals, runes, star dust. */
+  ruins: RuinsState
+  /** What you sell on the market island (taken from the barn while offered). */
+  stall: { item: ItemId; count: number; price: number }[]
+  /** The wind merchant: real day (yyyy-mm-dd) and how many featured goods he bought that day. */
+  merchant: { day: string; sold: number }
+  /** Decorations owned, not placed yet (bought from the merchant, rewards). */
+  stock: Partial<Record<DecorKind, number>>
+  /** Energy of the farmer (0 to ENERGY.max). */
+  energy: number
+  /** Wages owed to the workers hired for good. */
+  wages: Record<WorkerId, number>
+}
+
+export interface RuinsState {
+  /** Index of the current quest (RUIN_QUESTS.length: all done). */
+  quest: number
+  /** Lanterns lit (bit mask). */
+  lanterns: number
+  /** Crystals grown since the crystals quest started. */
+  harvested: number
+  /** Crystal plots: ripe at readyAt, of a color chosen when planted. */
+  plots: Record<string, { kind: CrystalId; readyAt: number }>
+  /** The order of the runes on the mural, and how many were touched right. */
+  runeOrder: number[]
+  runeStep: number
+  /** Star dust gathered for the last quest. */
+  stardust: number
+  /** The star shard (reward of the last quest) was placed on the farm. */
+  shardPlaced: boolean
+  /** Real day (yyyy-mm-dd) of the last daily offering. */
+  offeringDay: string
 }
 
 /** A random id, made of letters and digits (the room of a farm during a session). */
@@ -299,7 +436,7 @@ export function randomFarmId() {
 export const NAME_MAX = 18
 
 /** The save of version 2 (one farmhand), loaded and turned into a version 3. */
-export interface SaveV2 extends Omit<Save, 'version' | 'workers' | 'upgrades' | 'credited' | 'name' | 'online'> {
+export interface SaveV2 extends Omit<Save, 'version' | 'workers' | 'upgrades' | 'credited' | 'name' | 'online' | 'transport' | 'orchard' | 'ruins' | 'stall' | 'merchant' | 'stock' | 'energy' | 'wages'> {
   version: 2
   helper?: { hiredUntil: number }
 }
@@ -337,6 +474,26 @@ export const NEW_SAVE = (): Save => ({
   credited: [],
   name: '',
   online: true,
+  transport: { ferry: false, balloon: false },
+  orchard: {},
+  ruins: NEW_RUINS(),
+  stall: [],
+  merchant: { day: '', sold: 0 },
+  stock: {},
+  energy: 100,
+  wages: { field: 0, animal: 0, craft: 0 },
+})
+
+export const NEW_RUINS = (): RuinsState => ({
+  quest: 0,
+  lanterns: 0,
+  harvested: 0,
+  plots: {},
+  runeOrder: [0, 1, 2, 3].sort(() => Math.random() - 0.5),
+  runeStep: 0,
+  stardust: 0,
+  shardPlaced: false,
+  offeringDay: '',
 })
 
 /** Time away that counts (the farm works up to 12 hours without the player). */

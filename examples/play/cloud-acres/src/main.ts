@@ -33,6 +33,23 @@ import {
   MAX_UPGRADE,
   NAME_MAX,
   randomFarmId,
+  ANIMAL_PRICES,
+  RESALE,
+  ISLANDS,
+  TRANSPORT,
+  FRUITS,
+  RUIN_QUESTS,
+  STALL_OFFERS,
+  STALL_MAX,
+  MERCHANT_MAX,
+  ENERGY,
+  WAGES,
+  FRIEND_SHARE,
+  FRIEND_LIMIT,
+  today,
+  type SceneId,
+  type FruitId,
+  type TransportId,
   type WorkerId,
   type UpgradeId,
   type DecorKind,
@@ -43,10 +60,38 @@ import {
   type Place,
   type Save,
 } from './data'
-import { drawAnimal, drawBarn, drawBoard, drawFence, drawItem, drawPond, drawTree, drawTrough, drawWorkshop } from './art'
+import { drawFarmhouse, drawAnimal, drawBarn, drawBoard, drawFence, drawItem, drawPond, drawTree, drawTrough, drawWorkshop } from './art'
 import { C, VILLAGERS, drawCloud, drawCoin, drawPlant, drawPlot, drawVillager, ellipse, leaf, paint, roundRect, star4 } from './draw'
 import { Farm, ORDER_SLOTS, type FarmSnapshot, type WorkerTask, type Missing } from './farm'
 import { texts } from './i18n'
+import { HOME_HOUSE, HOUSE_DOOR, houseSolid, HOME_PAD, HOME_PIER, MARKET, ORCHARD, RUINS, arrival, interactives, sceneSize, solidOn, type Interactive, type Point } from './islands'
+import {
+  drawAltar,
+  drawBalloon,
+  drawBasket,
+  drawCrystal,
+  drawCrystalPlot,
+  drawFerry,
+  drawFruit,
+  drawFruitTree,
+  drawHammock,
+  drawHut,
+  drawKeeper,
+  drawLantern,
+  drawLightBridge,
+  drawMerchant,
+  drawMural,
+  drawPalm,
+  drawPier,
+  drawRune,
+  drawSpire,
+  drawSpirit,
+  drawStall,
+  drawStardust,
+  drawStatue,
+  drawWaterfall,
+} from './islandArt'
+import { clockMode, daylightAt, formatHour, hourOfDay, setClockMode, type Daylight } from './time'
 import { drawDecor, drawFarmer, drawFarmerFace, drawForest, drawSilo, drawSprinkler, drawTractor, drawTruck, type Look } from './extras'
 
 const canvas = document.getElementById('game') as HTMLCanvasElement
@@ -64,6 +109,8 @@ const speedUp = Math.min(Math.max(Number(new URLSearchParams(location.search).ge
 let home = new Farm(null)
 /** The farm on screen: yours, or the one of a friend you visit. */
 let farm = home
+/** The island on screen: your farm (or a friend's), or another island. */
+let scene: SceneId = 'home'
 let width = 0
 let height = 0
 let dpr = 1
@@ -75,7 +122,7 @@ let clock = 0
 let dirty = false
 let saveTimer = 0
 let selected: CropId = 'wheat'
-type Panel = null | 'barn' | 'orders' | 'shop' | 'avatar' | 'online' | 'settings' | { buy: Place } | { zone: Zone } | { visitor: string } | { person: string }
+type Panel = null | 'barn' | 'orders' | 'shop' | 'avatar' | 'online' | 'settings' | { buy: Place } | { zone: Zone } | { visitor: string } | { person: string } | { travel: 'dock' | 'pad' } | { tree: number } | 'merchant' | 'stall' | 'keeper' | { seller: string }
 let panel: Panel = null
 let toast: { title: string; text: string; life: number; max?: number } | null = null
 let levelBanner: { level: number; news: string[]; life: number } | null = null
@@ -84,6 +131,8 @@ let seedBarRight = 0
 let shopTab = 0
 let tool: 'seed' | 'tractor' = 'seed'
 let placing: DecorKind | null = null
+/** The decoration being placed comes from the stock (free). */
+let placingStock = false
 let hover: { x: number; y: number } | null = null // world, for the decoration being placed
 
 // The player logged in on the website (noru play), shown in the profile badge.
@@ -106,7 +155,7 @@ const TRACTOR_HOME = { x: 1.3 * TILE, y: 4.75 * TILE }
 const tractor = { x: TRACTOR_HOME.x, y: TRACTOR_HOME.y, facing: 1, job: null as null | { place: Place; order: number[]; i: number } }
 const TRUCK_HOME = { x: 8.7 * TILE, y: 3.75 * TILE }
 // Workers (when hired) walk to ripe plots, animals and workshops, each to their own job.
-interface Worker { x: number; y: number; facing: number; task: WorkerTask | null; wait: number; fullAt: number }
+interface Worker { x: number; y: number; facing: number; task: WorkerTask | null; wait: number; fullAt: number; asleep?: boolean }
 const WORKER_HOME: Record<WorkerId, { x: number; y: number }> = {
   field: { x: 2.2 * TILE, y: 5 * TILE },
   animal: { x: 12.5 * TILE, y: 4.55 * TILE },
@@ -126,14 +175,99 @@ function taskPoint(task: WorkerTask) {
   return { x: (task.place.x + task.place.w / 2) * TILE, y: (task.place.y + task.place.h) * TILE + 12 }
 }
 
+/** Workers already told they wait for their pay (once until paid). */
+const unpaidToldAt = new Set<WorkerId>()
+
+/** Pays a worker what they are owed. */
+function payWorker(id: WorkerId, sx: number, sy: number) {
+  const paid = farm.payWages(id)
+  if (!paid) {
+    sound.denied()
+    toast = { title: t.noCoins, text: `${t.owed} : ${farm.wageOwed(id)}`, life: 2.5 }
+    return
+  }
+  flyCoins(sx, sy, paid)
+  sound.buy()
+  toast = { title: `${t.paid} · ${t.workers[id]}`, text: `-${paid}`, life: 2.5 }
+  persist()
+}
+
+/** A sleep of the farmer in the house (the screen dims, the energy fills). */
+let sleeping: { t: number; night: boolean } | null = null
+const SLEEP_TIME = 4.5
+
+function goToSleep() {
+  if (sleeping || travel) return
+  const night = light.night > 0.5
+  if (!night && home.energy >= ENERGY.max - 1) {
+    toast = { title: t.notTired, text: '', life: 2 }
+    return
+  }
+  panel = null
+  placeFarmer(HOUSE_DOOR.x * TILE, HOUSE_DOOR.y * TILE)
+  sleeping = { t: 0, night }
+  sound.dayEnd()
+}
+
+function updateSleep(dt: number) {
+  if (!sleeping) return
+  sleeping.t += dt
+  if (sleeping.t < SLEEP_TIME) return
+  home.sleep(sleeping.night)
+  toast = { title: sleeping.night ? t.goodMorning : t.napDone, text: `⚡ ${Math.round(home.energy)}`, life: 3 }
+  sleeping = null
+  sound.golden()
+  persist()
+}
+
 function updateWorker(id: WorkerId, dt: number) {
   const w = workers[id]
   if (!farm.workerActive(id)) {
     w.task = null
+    w.asleep = false
     w.x = WORKER_HOME[id].x
     w.y = WORKER_HOME[id].y
     return
   }
+  // At night, the workers go to bed in the house; they come out in the morning.
+  if (light.night > 0.6) {
+    w.task = null
+    if (w.asleep) return
+    const dx = HOUSE_DOOR.x * TILE - w.x
+    const dy = HOUSE_DOOR.y * TILE - w.y
+    const d = Math.hypot(dx, dy)
+    if (d < 6) w.asleep = true
+    else {
+      w.x += (dx / d) * Math.min(d, 130 * dt)
+      w.y += (dy / d) * Math.min(d, 130 * dt)
+      if (Math.abs(dx) > 1) w.facing = dx > 0 ? 1 : -1
+    }
+    return
+  }
+  if (w.asleep) {
+    w.asleep = false
+    w.x = HOUSE_DOOR.x * TILE
+    w.y = HOUSE_DOOR.y * TILE
+  }
+  // Not paid: they stop and wait at their place.
+  if (!farm.workerWorking(id)) {
+    w.task = null
+    if (!unpaidToldAt.has(id)) {
+      unpaidToldAt.add(id)
+      toast = { title: `💰 ${t.workers[id]}`, text: `${t.waitsPay} · ${farm.wageOwed(id)}`, life: 4 }
+      sound.denied()
+    }
+    const home2 = WORKER_HOME[id]
+    const dx = home2.x - w.x
+    const dy = home2.y - w.y
+    const d = Math.hypot(dx, dy)
+    if (d > 3) {
+      w.x += (dx / d) * Math.min(d, 120 * dt)
+      w.y += (dy / d) * Math.min(d, 120 * dt)
+    }
+    return
+  }
+  unpaidToldAt.delete(id)
   w.wait -= dt
   if (!w.task && w.wait <= 0) {
     // The nearest thing to do.
@@ -288,6 +422,8 @@ type FarmMessage =
   | { type: 'wave' }
   | { type: 'bye' }
   | { type: 'hello'; token: string }
+  | { type: 'wage'; owed: number }
+  | { type: 'pay'; coins: number }
 
 interface Person { id: string; name: string; image: HTMLImageElement | null; look: Look; level: number }
 interface Lobbyist extends Person { farmId: string; at: string }
@@ -305,7 +441,9 @@ const visitors = new Map<string, Visitor>()
 /** Invitations you sent: token -> friend (lobby id). */
 const invitesSent = new Map<string, { to: string; until: number }>()
 /** Friends on your farm (farm room ids), with a limit of actions per second. */
-const guests = new Map<string, { token: string; acts: number; second: number }>()
+const guests = new Map<string, { token: string; acts: number; second: number; owed: number; told: number }>()
+/** On a friend's farm: what the owner owes you for your help. */
+let owedByHost = 0
 /** An invitation you received. */
 let invitation: { from: Lobbyist; farm: string; token: string; life: number; max: number } | null = null
 /** The farm you visit (host: the owner's id in their farm room, once they welcomed you). */
@@ -492,8 +630,11 @@ function acceptInvitation() {
   sound.buy()
   startTravel(
     () => {
+      leaveMarket()
+      scene = 'home'
       leaveFarmRoom()
       visit = { farmId: inv.farm, token: inv.token, name: inv.from.name, host: '', since: clock, waiting: 10 }
+      owedByHost = 0
       joinFarmRoom()
     },
     () => !visit || !!visit.host,
@@ -616,7 +757,7 @@ function onFarmJoin(p: RoomPlayer<Shared>) {
 function admitGuest(p: RoomPlayer<Shared>, token: string) {
   if (!invitesSent.has(token) || !farmRoom || guests.has(p.id)) return
   invitesSent.delete(token)
-  guests.set(p.id, { token, acts: 0, second: 0 })
+  guests.set(p.id, { token, acts: 0, second: 0, owed: 0, told: -1 })
   const v = visitorOf(p)
   visitors.set(p.id, v)
   const room = farmRoom
@@ -634,7 +775,8 @@ function onFarmLeave(p: RoomPlayer<Shared>) {
     goHome(`${visit.name} ${t.hostLeft}`)
     return
   }
-  if (guests.delete(p.id) && v) toast = { title: v.name, text: t.guestLeft, life: 3 }
+  const left = guests.get(p.id)
+  if (guests.delete(p.id) && v) toast = { title: v.name, text: left && left.owed > 0 ? `${t.leftUnpaid} ${left.owed}` : t.guestLeft, life: 3.5 }
 }
 
 function onFarmMessage(data: FarmMessage, from: RoomPlayer<Shared>) {
@@ -661,6 +803,19 @@ function onFarmMessage(data: FarmMessage, from: RoomPlayer<Shared>) {
     } else if (data.type === 'snap' && visit.host && from.id === visit.host && farm !== home) {
       if (farm.applySnapshot(data.snap)) replayPending()
     } else if (data.type === 'bye' && from.id === visit.host) goHome(t.sentHome)
+    else if (data.type === 'wage' && from.id === visit.host) owedByHost = Math.max(0, Math.floor(Number(data.owed) || 0))
+    else if (data.type === 'pay' && from.id === visit.host) {
+      // Paid by the owner: never more than what they said they owed.
+      const coins = Math.min(Math.max(0, Math.floor(Number(data.coins) || 0)), Math.max(owedByHost, 0))
+      if (coins > 0) {
+        home.s.coins += coins
+        owedByHost -= coins
+        toast = { title: `${visit.name} ${t.paidYou}`, text: `+${coins}`, life: 3 }
+        flyCoins(width / 2, height / 3, coins)
+        sound.order()
+        persist()
+      }
+    }
     return
   }
   const guest = guests.get(from.id)
@@ -743,10 +898,51 @@ function doAct(f: Farm, act: Act): ActResult {
 }
 
 /** On your farm: what a friend did, applied for real (crops go to your barn). */
+/** Tells a friend what you owe them (when it changed). */
+function tellOwed(id: string) {
+  const guest = guests.get(id)
+  const room = farmRoom
+  if (!guest || !room || guest.told === guest.owed) return
+  guest.told = guest.owed
+  safely(() => room.send({ type: 'wage', owed: guest.owed }, id))
+}
+
+/** Pays a friend what you owe them for their help (the coins go to their farm). */
+function payFriend(id: string) {
+  const guest = guests.get(id)
+  const room = farmRoom
+  if (!guest || !room || guest.owed <= 0) return
+  if (home.s.coins < guest.owed) {
+    toast = { title: t.noCoins, text: `${t.youOwe} ${guest.owed}`, life: 2.5 }
+    sound.denied()
+    return
+  }
+  const coins = guest.owed
+  home.s.coins -= coins
+  guest.owed = 0
+  safely(() => room.send({ type: 'pay', coins }, id))
+  tellOwed(id)
+  const v = visitors.get(id)
+  toast = { title: `${t.paid} · ${v ? clip(v.name, 16) : ''}`, text: `-${coins}`, life: 2.5 }
+  sound.buy()
+  persist()
+}
+
 function runGuestAct(id: string, act: Act) {
   const v = visitors.get(id)
+  const guest = guests.get(id)
+  // Owed too much: they stop helping until paid.
+  if (guest && guest.owed >= FRIEND_LIMIT) {
+    guest.told = -1
+    tellOwed(id)
+    return
+  }
   const result = doAct(home, act)
   if (!v || !result) return
+  if (guest && (result.kind === 'harvest' || result.kind === 'collect')) {
+    guest.owed += Math.max(1, Math.round(ITEMS[result.item].price * result.count * FRIEND_SHARE))
+    tellOwed(id)
+  }
   const place = PLACES.find((p) => p.id === act.p)!
   let wx = (place.x + place.w / 2) * TILE
   let wy = place.y * TILE + TILE * 0.5
@@ -790,6 +986,7 @@ function returnHome(message: string | null) {
   visit = null
   farm = home
   home.fastForward(away * speedUp)
+  home.rest(away / ENERGY.regenEvery)
   pendingActs.length = 0
   placeFarmer(HOME.x, HOME.y)
   joinFarmRoom()
@@ -826,6 +1023,7 @@ function setOnline(on: boolean) {
     return
   }
   if (visit) returnHome(null)
+  leaveMarket()
   leaveFarmRoom()
   leaveLobby()
 }
@@ -937,8 +1135,9 @@ function nearVisitor() {
 }
 
 function goTo(x: number, y: number) {
-  farmer.tx = Math.min(Math.max(x, 20), WORLD_PX_W - 20)
-  farmer.ty = Math.min(Math.max(y, 40), WORLD_PX_H - 10)
+  const size = sceneSize(scene)
+  farmer.tx = Math.min(Math.max(x, 20), size.w - 20)
+  farmer.ty = Math.min(Math.max(y, 40), size.h - 10)
   farmer.idle = 0
 }
 
@@ -954,6 +1153,8 @@ let walkPlot = '' // plot under the farmer's feet (plants / harvests once per pl
 
 /** Things the farmer cannot walk through. */
 function solidAt(x: number, y: number) {
+  if (scene !== 'home') return solidOn(scene, x, y, home.bridgeOpen())
+  if (houseSolid(x, y)) return true
   if (x < 12 || y < 30 || x > WORLD_PX_W - 12 || y > WORLD_PX_H - 6) return true
   for (const p of PLACES) {
     if (p.kind === 'field') continue
@@ -990,11 +1191,17 @@ function nearZone() {
 }
 
 function useNearby() {
-  const visitor = nearVisitor()
+  const visitor = scene === 'home' ? nearVisitor() : null
   if (visitor) {
     panel = { visitor: visitor.id }
     return
   }
+  const it = nearInteractive()
+  if (it) {
+    interact(it)
+    return
+  }
+  if (scene !== 'home') return
   const place = nearPlace()
   if (place) {
     const keep = { tx: farmer.tx, ty: farmer.ty }
@@ -1044,15 +1251,17 @@ function floatText(wx: number, wy: number, text: string, color = '#ffffff', size
 const MARGIN = { side: 1.6 * TILE, top: 1.2 * TILE, bottom: 3.2 * TILE }
 
 function minZoom() {
-  return Math.max(width / (WORLD_PX_W + MARGIN.side * 2), height / (WORLD_PX_H + MARGIN.top + MARGIN.bottom))
+  const { w, h } = sceneSize(scene)
+  return Math.max(width / (w + MARGIN.side * 2), height / (h + MARGIN.top + MARGIN.bottom))
 }
 
 function clampCamera() {
   cam.zoom = Math.min(Math.max(cam.zoom, minZoom()), 2.4)
   const halfW = width / 2 / cam.zoom
   const halfH = height / 2 / cam.zoom
-  cam.x = Math.min(Math.max(cam.x, halfW - MARGIN.side), WORLD_PX_W + MARGIN.side - halfW)
-  cam.y = Math.min(Math.max(cam.y, halfH - MARGIN.top), WORLD_PX_H + MARGIN.bottom - halfH)
+  const { w, h } = sceneSize(scene)
+  cam.x = Math.min(Math.max(cam.x, halfW - MARGIN.side), w + MARGIN.side - halfW)
+  cam.y = Math.min(Math.max(cam.y, halfH - MARGIN.top), h + MARGIN.bottom - halfH)
 }
 
 const toScreen = (wx: number, wy: number) => ({ x: (wx - cam.x) * cam.zoom + width / 2, y: (wy - cam.y) * cam.zoom + height / 2 })
@@ -1068,7 +1277,7 @@ function resize() {
   canvas.style.height = height + 'px'
   ui = Math.min(Math.max(Math.min(width, height) / 420, 0.75), 1.5)
   // About 15 tiles across in landscape (the whole barn and the first fields).
-  cam.zoom = Math.max(Math.min(width / (15 * TILE), height / (9 * TILE)), Math.max(width / WORLD_PX_W, height / WORLD_PX_H) * 0.9, minZoom())
+  fitCamera()
   clampCamera()
 }
 
@@ -1191,17 +1400,20 @@ interface Walker { x: number; y: number; tx: number; ty: number; wait: number; f
 const walkers: Record<string, Walker[]> = {}
 
 function penWalkers(place: Place) {
-  if (!walkers[place.id]) {
-    walkers[place.id] = Array.from({ length: PENS[place.animal!].animals }, () => {
-      const x = (place.x + rand(0.6, place.w - 0.6)) * TILE
-      const y = (place.y + rand(0.9, place.h - 0.5)) * TILE
-      return { x, y, tx: x, ty: y, wait: rand(0, 3), facing: Math.random() < 0.5 ? 1 : -1 }
-    })
+  const list = walkers[place.id] || (walkers[place.id] = [])
+  // As many as there are animals in the pen (bought or sold).
+  const count = farm.penAnimals(place)
+  while (list.length < count) {
+    const x = (place.x + rand(0.6, place.w - 0.6)) * TILE
+    const y = (place.y + rand(0.9, place.h - 0.5)) * TILE
+    list.push({ x, y, tx: x, ty: y, wait: rand(0, 3), facing: Math.random() < 0.5 ? 1 : -1 })
   }
-  return walkers[place.id]
+  if (list.length > count) list.length = count
+  return list
 }
 
 function updateWalkers(dt: number) {
+  if (asleep()) return
   for (const place of PLACES) {
     if (place.kind !== 'pen' || !farm.usable(place)) continue
     const speed = place.animal === 'chicken' ? 40 : 22
@@ -1296,6 +1508,7 @@ function plotAt(wx: number, wy: number) {
 function placeName(place: Place) {
   if (place.animal) return t.animals[place.animal]
   if (place.workshop) return t.workshops[place.workshop]
+  if (place.kind === 'field') return `${t.places.field} ${place.id.replace('field', '')}`
   return t.places[place.kind]
 }
 
@@ -1315,6 +1528,7 @@ function tapPlace(place: Place) {
       floatText(cx, top, t.notYourFarm, '#ffe0e0', 15)
       return
     }
+    if (helpBlocked(cx, top)) return
     sendAct({ a: 'place', p: place.id })
   }
   if (!farm.owns(place.id)) {
@@ -1325,6 +1539,8 @@ function tapPlace(place: Place) {
   else if (place.kind === 'board') panel = 'orders'
   else if (place.kind === 'pen') {
     const status = farm.penStatus(place)
+    if (status !== 'busy' && !enough(ENERGY.animals, cx, top)) return
+    if (status !== 'busy') home.tire(ENERGY.animals)
     if (status === 'ready') {
       const product = farm.collectPen(place)
       if (product === 'full') barnFull(cx, top)
@@ -1351,6 +1567,8 @@ function tapPlace(place: Place) {
       floatText(cx, top, `${left} s`, '#ffffff', 16)
     }
   } else if (place.kind === 'workshop') {
+    if (!enough(ENERGY.workshop, cx, top)) return
+    home.tire(ENERGY.workshop)
     const collected = farm.collectWorkshop(place)
     if (collected === 'full') {
       barnFull(cx, top)
@@ -1377,6 +1595,19 @@ function tapPlace(place: Place) {
   }
 }
 
+/** Enough energy for some work? Otherwise the farmer says they are too tired. */
+let lastTired = -10
+function enough(cost: number, wx: number, wy: number) {
+  if (home.energy >= cost) return true
+  if (clock - lastTired > 1.5) {
+    lastTired = clock
+    sound.denied()
+    floatText(wx, wy - 30, t.tooTired, '#ffe0e0', 15)
+    if (!toast) toast = { title: t.tooTired, text: t.goSleep, life: 3 }
+  }
+  return false
+}
+
 // Swipe planting / harvesting.
 let chain = 0
 const touchedPlots = new Set<string>()
@@ -1390,15 +1621,30 @@ function touchPlot(hit: { place: Place; index: number } | null) {
   actOnPlot(hit)
 }
 
-function actOnPlot(hit: { place: Place; index: number }) {
+/** Plants or harvests a plot (`free`: the tractor does it, the farmer does not get tired). */
+/** On a friend's farm, owed too much: no more help until they pay. */
+function helpBlocked(wx: number, wy: number) {
+  if (!visit || owedByHost < FRIEND_LIMIT) return false
+  if (clock - lastDenied > 1.5) {
+    lastDenied = clock
+    sound.denied()
+    floatText(wx, wy - 30, `${visit.name} ${t.mustPayFirst}`, '#ffe0e0', 14)
+  }
+  return true
+}
+
+function actOnPlot(hit: { place: Place; index: number }, free = false) {
   const plot = farm.plots(hit.place)[hit.index]
   const col = hit.index % hit.place.w
   const row = Math.floor(hit.index / hit.place.w)
   const wx = (hit.place.x + col + 0.5) * TILE
   const wy = (hit.place.y + row + 0.5) * TILE
+  if (!free && helpBlocked(wx, wy)) return
   if (!plot.crop) {
+    if (!free && !enough(ENERGY.sow, wx, wy)) return
     const result = farm.plant(hit.place, hit.index, selected)
     if (result === 'ok') {
+      if (!free) home.tire(ENERGY.sow)
       sendAct({ a: 'plot', p: hit.place.id, i: hit.index, c: selected })
       popPlot(hit.place, hit.index)
       sound.plant()
@@ -1410,7 +1656,9 @@ function actOnPlot(hit: { place: Place; index: number }) {
       floatText(wx, wy - 20, t.noCoins, '#ffe0e0', 15)
     }
   } else if (plot.readyAt <= farm.clock) {
+    if (!free && !enough(ENERGY.harvest, wx, wy)) return
     const crop = farm.harvest(hit.place, hit.index)
+    if (crop && crop !== 'full' && !free) home.tire(ENERGY.harvest)
     if (crop === 'full') {
       if (clock - lastDenied > 1) {
         lastDenied = clock
@@ -1474,8 +1722,8 @@ function updateTractor(dt: number) {
     if (Math.abs(dx) > 1) tractor.facing = dx > 0 ? 1 : -1
   } else if (job) {
     const hit = { place: job.place, index: job.order[job.i] }
-    actOnPlot(hit)
-    if (!farm.plots(hit.place)[hit.index].crop) actOnPlot(hit)
+    actOnPlot(hit, true)
+    if (!farm.plots(hit.place)[hit.index].crop) actOnPlot(hit, true)
     job.i++
     if (job.i >= job.order.length) {
       endSwipe(tractor.x, tractor.y)
@@ -1498,7 +1746,7 @@ function updateFarmer(dt: number) {
   }
   if (kx || ky) {
     const len = Math.hypot(kx, ky)
-    const step = 190 * dt
+    const step = 190 * dt * (home.energy < 1 ? 0.55 : 1)
     const nx = farmer.x + (kx / len) * step
     const ny = farmer.y + (ky / len) * step
     // Slide along walls: try both axes, then each one.
@@ -1513,7 +1761,7 @@ function updateFarmer(dt: number) {
     farmer.idle = 0
     followCamera = true
     // Walking over a field plants and harvests, one plot at a time (with a combo).
-    const hit = plotAt(farmer.x, farmer.y - 6)
+    const hit = scene === 'home' ? plotAt(farmer.x, farmer.y - 6) : null
     const key = hit ? hit.place.id + ':' + hit.index : ''
     if (key !== walkPlot) {
       if (!hit && walkPlot) endSwipe(farmer.x, farmer.y)
@@ -1530,7 +1778,7 @@ function updateFarmer(dt: number) {
   const dy = farmer.ty - farmer.y
   const d = Math.hypot(dx, dy)
   if (d > 2) {
-    const step = Math.min(d, 170 * dt)
+    const step = Math.min(d, 170 * dt * (home.energy < 1 ? 0.55 : 1))
     farmer.x += (dx / d) * step
     farmer.y += (dy / d) * step
     if (Math.abs(dx) > 1) farmer.facing = dx > 0 ? 1 : -1
@@ -1547,6 +1795,7 @@ function canPlaceDecor(wx: number, wy: number) {
   if (ZONES.some((z) => !farm.owns(z.id) && wx > z.x * TILE && wy > z.y * TILE && wy < (z.y + z.h) * TILE)) return false
   if (wx > POND.x * TILE - 20 && wx < (POND.x + POND.w) * TILE + 20 && wy > POND.y * TILE - 10 && wy < (POND.y + POND.h) * TILE + 20) return false
   if (farm.s.decor.some((d) => Math.hypot(d.x - wx, d.y - wy) < 44)) return false
+  if (wx > (HOME_HOUSE.x - 0.4) * TILE && wx < (HOME_HOUSE.x + HOME_HOUSE.w + 0.4) * TILE && wy > HOME_HOUSE.y * TILE && wy < (HOME_HOUSE.y + HOME_HOUSE.h + 0.6) * TILE) return false
   if (Math.hypot(TRUCK_HOME.x - wx, TRUCK_HOME.y - wy) < 50 || Math.hypot(TRACTOR_HOME.x - wx, TRACTOR_HOME.y - wy) < 50) return false
   return true
 }
@@ -1558,7 +1807,7 @@ function placeDecorAt(wx: number, wy: number) {
     floatText(wx, wy - 20, t.notHere, '#ffe0e0', 15)
     return
   }
-  if (farm.placeDecor(placing, wx, wy) === 'ok') {
+  if (placingStock ? farm.placeFromStock(placing, wx, wy) : farm.placeDecor(placing, wx, wy) === 'ok') {
     sound.buy()
     burst(wx, wy - 10, 24, ['#ffd54a', '#7bc950', '#ff8fab', '#fff'], 0.9, true)
     goTo(wx + 30, wy + 10)
@@ -1609,11 +1858,14 @@ let dustTimer = 0
 
 function update(dt: number) {
   clock += dt
+  updateNight(dt)
   if (started && !paused) farm.advance(dt * speedUp)
   updateWalkers(dt)
   updateFarmer(dt)
   if (started && !paused && farm === home) for (const id of WORKER_IDS) updateWorker(id, dt)
   updateRooms(dt)
+  updateIslands(dt)
+  updateSleep(dt)
   updateLife(dt)
   for (const r of rings) r.life -= dt * 2
   rings = rings.filter((r) => r.life > 0)
@@ -1863,30 +2115,9 @@ function face(person: { image: HTMLImageElement | null; look: Look }, cx: number
 
 // --- the sky, the island and the light of the day ----------------------------------------------
 
-/** The light over 7 minutes: morning, noon, golden hour, dusk (sky top, sky bottom, light multiplied on the farm). */
-const DAY: [number, number[], number[], number[]][] = [
-  [0, [140, 196, 255], [255, 216, 190], [255, 242, 228]],
-  [0.3, [110, 188, 255], [205, 238, 255], [255, 255, 255]],
-  [0.55, [118, 148, 228], [255, 196, 140], [255, 228, 190]],
-  [0.72, [74, 72, 152], [232, 142, 162], [196, 178, 240]],
-  [0.86, [104, 124, 204], [250, 192, 190], [240, 214, 232]],
-  [1, [140, 196, 255], [255, 216, 190], [255, 242, 228]],
-]
-const DAY_LENGTH = 420
-// ?light=golden (or morning, noon, dusk) starts the day at that moment (to see it at once).
-const DAY_START = ({ morning: 0, noon: 0.3, golden: 0.55, dusk: 0.72 } as Record<string, number>)[new URLSearchParams(location.search).get('light') || ''] ?? 0.1
-
+/** The light of the moment (the player's clock, or fast days). */
 function daylight() {
-  const p = (clock / DAY_LENGTH + DAY_START) % 1
-  let i = 0
-  while (i < DAY.length - 2 && DAY[i + 1][0] < p) i++
-  const [p0, top0, bottom0, tint0] = DAY[i]
-  const [p1, top1, bottom1, tint1] = DAY[i + 1]
-  const k = (p - p0) / (p1 - p0)
-  const mix = (a: number[], b: number[]) => a.map((v, j) => v + (b[j] - v) * k)
-  const rgb = (c: number[]) => `rgb(${c.slice(0, 3).map(Math.round).join(',')})`
-  const tint = mix(tint0, tint1)
-  return { top: rgb(mix(top0, top1)), bottom: rgb(mix(bottom0, bottom1)), tint: rgb(tint), dusk: Math.max(0, 1 - Math.abs(p - 0.72) / 0.12) }
+  return daylightAt(hourOfDay(clock))
 }
 
 /** Cloud puffs around the island (world coordinates), some far below it, some in front. */
@@ -2050,6 +2281,158 @@ function drawFlock() {
   }
 }
 
+// --- night: stars, the moon, lights, shooting stars, sleeping animals --------------------------
+
+/** The light of this frame (updated every frame). */
+let light: Daylight = daylightAt(12)
+let crowed = false
+
+/** Animals sleep in the middle of the night. */
+const asleep = () => light.night > 0.6
+
+const STARS = Array.from({ length: 90 }, (_, i) => {
+  const n = Math.sin(i * 127.1 + 31.7) * 43758.5453
+  const m = Math.sin(i * 269.5 + 11.3) * 43758.5453
+  return { x: n - Math.floor(n), y: (m - Math.floor(m)) * 0.75, s: 0.6 + ((i * 37) % 10) / 8, p: i * 1.7 }
+})
+
+function drawStars(l: Daylight) {
+  if (l.night <= 0.02) return
+  for (const star of STARS) {
+    const twinkle = 0.55 + 0.45 * Math.sin(clock * 2 + star.p)
+    ctx.globalAlpha = l.night * twinkle
+    ctx.fillStyle = '#fff8e6'
+    star4(ctx, star.x * width, star.y * height, star.s * ui)
+  }
+  // The moon, with a soft halo.
+  const mx = width * 0.82
+  const my = height * 0.13
+  const r = 20 * ui
+  ctx.globalAlpha = l.night
+  ellipse(ctx, mx, my, r * 2.6, r * 2.6, 'rgba(255, 245, 210, 0.08)')
+  ellipse(ctx, mx, my, r * 1.6, r * 1.6, 'rgba(255, 245, 210, 0.12)')
+  ellipse(ctx, mx, my, r, r, '#fff6dc')
+  ellipse(ctx, mx - r * 0.3, my - r * 0.2, r * 0.22, r * 0.18, 'rgba(200, 190, 160, 0.5)')
+  ellipse(ctx, mx + r * 0.35, my + r * 0.25, r * 0.15, r * 0.13, 'rgba(200, 190, 160, 0.45)')
+  ellipse(ctx, mx + r * 0.1, my - r * 0.45, r * 0.1, r * 0.08, 'rgba(200, 190, 160, 0.4)')
+  ctx.globalAlpha = 1
+}
+
+function glow(x: number, y: number, r: number, color: string, strength: number) {
+  if (strength <= 0.01) return
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r)
+  g.addColorStop(0, color.replace('A', String(0.55 * strength)))
+  g.addColorStop(0.45, color.replace('A', String(0.22 * strength)))
+  g.addColorStop(1, color.replace('A', '0'))
+  ctx.fillStyle = g
+  ctx.beginPath()
+  ctx.arc(x, y, r, 0, Math.PI * 2)
+  ctx.fill()
+}
+
+/** At night: lit windows, street lamps, and a lantern around each farmer. */
+function drawNightLights(l: Daylight) {
+  const k = l.night
+  if (k <= 0.02) return
+  ctx.globalCompositeOperation = 'lighter'
+  const warm = 'rgba(255, 196, 110, A)'
+  for (const place of PLACES) {
+    if (!farm.usable(place)) continue
+    const x = place.x * TILE
+    const y = place.y * TILE
+    const w = place.w * TILE
+    const h = place.h * TILE
+    if (place.kind === 'barn') {
+      glow(x + w * 0.5, y + h * 0.24, 70, warm, k)
+      glow(x + w * 0.5, y + h * 0.85, 60, warm, k * 0.6)
+    } else if (place.kind === 'workshop') {
+      glow(x + w * 0.5, y + h * 0.75, 70, warm, k * 0.8)
+    } else if (place.kind === 'board') glow(x + w * 0.5, y + h * 0.4, 50, warm, k * 0.5)
+  }
+  for (const d of farm.s.decor) if (d.kind === 'lamp' || d.kind === 'lantern') glow(d.x, d.y - 50, 110, warm, k)
+  glow((HOME_HOUSE.x + HOME_HOUSE.w * 0.5) * TILE, (HOME_HOUSE.y + HOME_HOUSE.h * 0.62) * TILE, 90, warm, k)
+  // The farmer's lantern.
+  const flicker = 1 + Math.sin(clock * 9) * 0.03 + Math.sin(clock * 23) * 0.02
+  glow(farmer.x, farmer.y - 26, 140 * flicker, 'rgba(255, 214, 140, A)', k)
+  for (const v of visitors.values()) glow(v.x, v.y - 26, 110, 'rgba(255, 214, 140, A)', k * 0.8)
+  ctx.globalCompositeOperation = 'source-over'
+  // The lantern itself, in the farmer's hand.
+  if (k > 0.3) {
+    const lx = farmer.x + farmer.facing * 14
+    const ly = farmer.y - 22 + Math.sin(clock * 6) * 1
+    ctx.globalAlpha = Math.min(1, (k - 0.3) * 3)
+    roundRect(ctx, lx - 4, ly - 6, 8, 10, 3)
+    paint(ctx, '#ffe7a0', 1.2)
+    ellipse(ctx, lx, ly - 1, 2, 3, '#fff6d0')
+    ctx.globalAlpha = 1
+  }
+}
+
+interface ShootingStar { x: number; y: number; vx: number; vy: number; life: number }
+let shooting: ShootingStar | null = null
+let shootingTimer = 12
+
+function updateNight(dt: number) {
+  light = daylight()
+  // The rooster at dawn.
+  if (light.hour >= 6 && light.hour < 6.2) {
+    if (!crowed && started && !paused) {
+      crowed = true
+      sound.crow()
+    }
+  } else crowed = false
+  // Shooting stars at night: catch them for coins.
+  if (shooting) {
+    shooting.x += shooting.vx * dt
+    shooting.y += shooting.vy * dt
+    shooting.life -= dt
+    if (shooting.life <= 0) shooting = null
+  } else if (light.night > 0.7 && started && farm === home) {
+    shootingTimer -= dt
+    if (shootingTimer <= 0) {
+      shootingTimer = rand(18, 40)
+      const fromLeft = Math.random() < 0.5
+      const vx = (fromLeft ? 1 : -1) * rand(320, 420)
+      shooting = { x: cam.x - (fromLeft ? 1 : -1) * (width / cam.zoom) * 0.45, y: cam.y - (height / cam.zoom) * rand(0.15, 0.35), vx, vy: rand(90, 150), life: 2.6 }
+    }
+  }
+}
+
+function drawShootingStars(l: Daylight) {
+  if (!shooting || l.night <= 0.3) return
+  const s = shooting
+  const a = Math.min(1, s.life)
+  const tail = 0.35
+  const g = ctx.createLinearGradient(s.x, s.y, s.x - s.vx * tail, s.y - s.vy * tail)
+  g.addColorStop(0, `rgba(255, 250, 220, ${a})`)
+  g.addColorStop(1, 'rgba(255, 250, 220, 0)')
+  ctx.strokeStyle = g
+  ctx.lineWidth = 4
+  ctx.lineCap = 'round'
+  ctx.beginPath()
+  ctx.moveTo(s.x, s.y)
+  ctx.lineTo(s.x - s.vx * tail, s.y - s.vy * tail)
+  ctx.stroke()
+  ctx.fillStyle = `rgba(255, 255, 240, ${a})`
+  star4(ctx, s.x, s.y, 5 + Math.sin(clock * 20) * 1.5)
+}
+
+/** A tap on a shooting star catches it. */
+function catchShootingStar(sx: number, sy: number) {
+  if (!shooting) return false
+  const p = toScreen(shooting.x, shooting.y)
+  if (Math.hypot(p.x - sx, p.y - sy) > 46 * ui) return false
+  const coins = 10 + Math.floor(Math.random() * 21)
+  home.s.coins += coins
+  burst(shooting.x, shooting.y, 30, ['#fff8d0', '#ffe08a', '#b9a6ff', '#fff'], 1.2, true)
+  floatText(shooting.x, shooting.y - 20, `★ +${coins}`, '#fff6b3', 20)
+  flyCoins(p.x, p.y, coins)
+  sound.golden()
+  shooting = null
+  changed()
+  return true
+}
+
 function drawFireflies(dusk: number) {
   if (dusk <= 0.05) return
   ctx.globalCompositeOperation = 'lighter'
@@ -2184,8 +2567,15 @@ function drawPen(place: Place) {
     const moving = Math.hypot(w.tx - w.x, w.ty - w.y) > 2
     drawAnimal(ctx, pen.kind, w.x, w.y, pen.kind === 'chicken' ? 26 : pen.kind === 'cow' ? 54 : 40, clock + w.x, w.facing, moving)
   }
-  // Hungry animals say so.
-  if (status === 'hungry' && list.length) {
+  // Asleep at night: little z's.
+  if (asleep()) {
+    for (const [i, w] of list.entries()) {
+      const k = (clock * 0.5 + i * 0.37) % 1
+      ctx.globalAlpha = Math.sin(k * Math.PI)
+      text('z', w.x + 8 + k * 10, w.y - 30 - k * 26, 10 + k * 6, '#ffffff', 'center', 900)
+      ctx.globalAlpha = 1
+    }
+  } else if (status === 'hungry' && list.length) {
     const w = list[0]
     const k = (clock * 0.6) % 1
     if (k < 0.5) text('?', w.x + 10, w.y - 40 - k * 20, 16, '#fff', 'center', 900)
@@ -2261,18 +2651,28 @@ function drawPlaceBubble(place: Place) {
   }
 }
 
-function drawWorld(light: ReturnType<typeof daylight>) {
+function drawWorld(light: Daylight) {
+  if (scene !== 'home') {
+    drawIslandWorld(light)
+    return
+  }
   const sky = ctx.createLinearGradient(0, 0, 0, height)
   sky.addColorStop(0, light.top)
   sky.addColorStop(1, light.bottom)
   ctx.fillStyle = sky
   ctx.fillRect(0, 0, width, height)
+  drawStars(light)
   ctx.save()
   ctx.translate(width / 2, height / 2)
   ctx.scale(cam.zoom, cam.zoom)
   ctx.translate(-cam.x, -cam.y)
   drawIsland()
   drawPond(ctx, POND.x * TILE, POND.y * TILE, POND.w * TILE, POND.h * TILE, clock)
+  // The pier (cloud ferry) and the balloon pad.
+  drawPier(ctx, HOME_PIER.x * TILE, HOME_PIER.y * TILE, HOME_PIER.length * TILE, clock)
+  if (farm === home && home.s.transport.ferry) drawFerry(ctx, HOME_PIER.x * TILE + 60, (HOME_PIER.y + HOME_PIER.length) * TILE + 20, 90, clock)
+  ellipse(ctx, HOME_PAD.x * TILE, HOME_PAD.y * TILE, 50, 20, '#e6d7b8', 0, 2)
+  ellipse(ctx, HOME_PAD.x * TILE, HOME_PAD.y * TILE, 34, 12, '#d6c49c')
   // Flat things first: fields and pens.
   for (const place of PLACES) {
     if (!farm.usable(place)) continue
@@ -2311,13 +2711,28 @@ function drawWorld(light: ReturnType<typeof daylight>) {
     if (place.kind === 'workshop') tall.push({ y: y + h, draw: () => bumped(place.id, cx, y + h, () => drawWorkshop(ctx, place.workshop!, x, y, w, h, clock, farm.workshopProgress(place) >= 0)) })
   }
   for (const [tx, ty, s] of TREES) tall.push({ y: ty * TILE + 20, draw: () => drawTree(ctx, tx * TILE, ty * TILE, 70 * s, clock) })
+  {
+    const hx = HOME_HOUSE.x * TILE
+    const hy = HOME_HOUSE.y * TILE
+    const sleepingHere = farm === home && (!!sleeping || WORKER_IDS.some((id) => workers[id].asleep && home.workerActive(id)))
+    tall.push({ y: hy + HOME_HOUSE.h * TILE, draw: () => drawFarmhouse(ctx, hx, hy, HOME_HOUSE.w * TILE, HOME_HOUSE.h * TILE, clock, light.night, sleepingHere) })
+  }
+  if (farm === home && home.s.transport.balloon) tall.push({ y: HOME_PAD.y * TILE, draw: () => drawBalloon(ctx, HOME_PAD.x * TILE, HOME_PAD.y * TILE, 100, clock) })
   for (const d of farm.s.decor) tall.push({ y: d.y, draw: () => drawDecor(ctx, d.kind, d.x, d.y, clock) })
   if (farm.s.silo > 0) tall.push({ y: 3.7 * TILE, draw: () => drawSilo(ctx, 0.35 * TILE, 0.7 * TILE, 1.25 * TILE, 3 * TILE, farm.s.silo) })
   const farmerWalking = Math.hypot(farmer.tx - farmer.x, farmer.ty - farmer.y) > 2 || (started && !panel && [...held].some((k) => KEYS[k]))
   tall.push({
     y: farmer.y,
     draw: () => {
+      if (sleeping) return
       drawFarmer(ctx, look(), farmer.x, farmer.y, 46, clock, farmer.facing, farmerWalking)
+      if (home.energy < 15) {
+        // Tired: drops of sweat.
+        for (let i = 0; i < 2; i++) {
+          const k = (clock * 1.2 + i * 0.5) % 1
+          ellipse(ctx, farmer.x + 14 + i * 5, farmer.y - 48 + k * 18, 2, 3, `rgba(120, 200, 255, ${1 - k})`)
+        }
+      }
       if (visit || visitors.size) nameTag(clip(myName(), 16), farmer.x, farmer.y + 4, C.gold, C.text)
     },
   })
@@ -2326,7 +2741,7 @@ function drawWorld(light: ReturnType<typeof daylight>) {
     tall.push({ y: 1e9 - 1, draw: () => emoteBubble(e.text, farmer.x, farmer.y - 70, e.life) })
   }
   for (const id of WORKER_IDS) {
-    if (!farm.workerActive(id)) continue
+    if (!farm.workerActive(id) || (farm === home && workers[id].asleep)) continue
     const w = workers[id]
     const at = farm === home ? w : WORKER_HOME[id]
     const walking = farm === home && !!w.task
@@ -2335,7 +2750,8 @@ function drawWorld(light: ReturnType<typeof daylight>) {
       draw: () => {
         drawFarmer(ctx, WORKER_LOOK[id], at.x, at.y, 44, clock + 1.7 + WORKER_IDS.indexOf(id), farm === home ? w.facing : 1, walking)
         const left = farm.workerLeft(id)
-        nameTag(`${t.workerTag[id]} · ${Number.isFinite(left) ? Math.ceil(left / 60) + ' min' : '∞'}`, at.x, at.y + 4, '#9ee07a', C.text)
+        if (!farm.workerWorking(id)) nameTag(`💰 ${t.unpaid} · ${farm.wageOwed(id)}`, at.x, at.y + 4, C.coral, '#fff')
+        else nameTag(`${t.workerTag[id]} · ${Number.isFinite(left) ? Math.ceil(left / 60) + ' min' : '∞'}`, at.x, at.y + 4, '#9ee07a', C.text)
       },
     })
   }
@@ -2345,7 +2761,8 @@ function drawWorld(light: ReturnType<typeof daylight>) {
       draw: () => {
         const moving = v.walking || Math.hypot(v.tx - v.x, v.ty - v.y) > 2
         drawFarmer(ctx, v.look, v.x, v.y, 46, clock + v.id.length, v.facing, moving)
-        nameTag(`${v.host ? '🏠 ' : ''}${clip(v.name, 16)} · ${t.level} ${v.level}`, v.x, v.y + 4, v.host ? C.mint : C.paper, C.text)
+        const owed = guests.get(v.id)?.owed ?? 0
+        nameTag(`${v.host ? '🏠 ' : ''}${clip(v.name, 16)} · ${owed > 0 ? '💰 ' + owed : t.level + ' ' + v.level}`, v.x, v.y + 4, v.host ? C.mint : owed >= FRIEND_LIMIT ? '#ffc9bd' : C.paper, C.text)
       },
     })
     if (v.emote) {
@@ -2354,7 +2771,7 @@ function drawWorld(light: ReturnType<typeof daylight>) {
     }
   }
   if (keyboard && started && !panel && !travel) {
-    const near = nearVisitor() || nearPlace() || null
+    const near = nearVisitor() || nearInteractive() || nearPlace() || null
     const zone = near || visit ? null : nearZone()
     if (near || zone) {
       const hx = farmer.x
@@ -2437,7 +2854,9 @@ function drawWorld(light: ReturnType<typeof daylight>) {
   ctx.fillStyle = light.tint
   ctx.fillRect(-4 * TILE, -4 * TILE, WORLD_PX_W + 8 * TILE, WORLD_PX_H + 8 * TILE)
   ctx.globalCompositeOperation = 'source-over'
-  drawFireflies(light.dusk)
+  drawNightLights(light)
+  drawShootingStars(light)
+  drawFireflies(Math.max(light.dusk, light.night * 0.8))
   for (const p of particles) {
     if (p.screen) continue
     ctx.globalAlpha = Math.min(1, (p.life / p.max) * 1.5)
@@ -2460,6 +2879,1215 @@ function drawWorld(light: ReturnType<typeof daylight>) {
   ctx.globalAlpha = 1
   drawFlock()
   ctx.restore()
+}
+
+// --- the other islands: travel, the orchard, the market, the celestial ruins ------------------
+
+const AFI_LOOK: Look = { skin: SKINS[4], shirt: '#e8574a', pants: '#2f9e5b', hat: 'bandana' }
+const ISLAND_IDS = ['orchard', 'market', 'ruins'] as const
+
+/** Why you cannot leave your farm now (or null). */
+function cannotLeave() {
+  if (visit) return t.notWhileVisiting
+  if (guests.size) return t.notWithGuests
+  return null
+}
+
+/** The camera at its usual zoom, for the island on screen. */
+function fitCamera() {
+  const { w, h } = sceneSize(scene)
+  cam.zoom = Math.max(Math.min(width / (15 * TILE), height / (9 * TILE)), Math.max(width / w, height / h) * 0.9, minZoom())
+  clampCamera()
+}
+
+function travelTo(dest: SceneId) {
+  if (travel) return
+  if (dest !== 'home') {
+    const why = cannotLeave()
+    if (why) {
+      toast = { title: why, text: '', life: 2.5 }
+      sound.denied()
+      return
+    }
+    const paid = home.payFare(dest)
+    if (paid !== 'ok') {
+      sound.denied()
+      floatText(farmer.x, farmer.y - 60, paid === 'coins' ? t.noCoins : t.locked, '#ffe0e0', 15)
+      return
+    }
+    flyCoins(width / 2, height / 2, 1)
+    persist()
+  }
+  panel = null
+  placing = null
+  tool = 'seed'
+  sound.buy()
+  startTravel(
+    () => {
+      leaveMarket()
+      scene = dest
+      const at = arrival(dest)
+      placeFarmer(at.x, at.y)
+      fitCamera()
+      for (const b of butterflies) {
+        const { w, h } = sceneSize(dest)
+        b.x = b.tx = rand(0.1, 0.9) * w
+        b.y = b.ty = rand(0.1, 0.9) * h
+      }
+      if (dest === 'market') joinMarket()
+      if (dest !== 'home') toast = { title: t.islands[dest], text: dest === 'ruins' && home.ruins.quest === 0 ? t.questNew + ' : ' + t.questNames.lanterns : t.islandHelp[dest] ?? '', life: 3.5 }
+    },
+    () => true,
+  )
+}
+
+// Grounds of the islands, painted once.
+const islandGrounds: Partial<Record<SceneId, HTMLCanvasElement>> = {}
+
+function islandGround(s: SceneId) {
+  let canvas = islandGrounds[s]
+  if (canvas) return canvas
+  canvas = document.createElement('canvas')
+  const { w, h } = sceneSize(s)
+  canvas.width = w
+  canvas.height = h
+  const g = canvas.getContext('2d') as CanvasRenderingContext2D
+  const blots = (count: number, colors: string[], rx: [number, number]) => {
+    for (let i = 0; i < count; i++) {
+      g.fillStyle = pick(colors)
+      g.beginPath()
+      g.ellipse(Math.random() * w, Math.random() * h, rand(rx[0], rx[1]), rand(rx[0], rx[1]) * 0.5, rand(0, Math.PI), 0, Math.PI * 2)
+      g.fill()
+    }
+  }
+  const tufts = (count: number, color: string) => {
+    g.strokeStyle = color
+    g.lineWidth = 1.6
+    g.lineCap = 'round'
+    for (let i = 0; i < count; i++) {
+      const x = Math.random() * w
+      const y = Math.random() * h
+      g.beginPath()
+      g.moveTo(x, y)
+      g.lineTo(x - 2, y - 6)
+      g.moveTo(x, y)
+      g.lineTo(x + 2, y - 6)
+      g.stroke()
+    }
+  }
+  const path = (points: [number, number][], width: number, edge: string, fill: string) => {
+    g.lineCap = 'round'
+    g.lineJoin = 'round'
+    for (const [color, lw] of [
+      ['rgba(61, 42, 69, 0.5)', width + 10],
+      [edge, width + 6],
+      [fill, width],
+    ] as [string, number][]) {
+      g.strokeStyle = color
+      g.lineWidth = lw
+      g.beginPath()
+      points.forEach(([x, y], i) => (i ? g.lineTo(x * TILE, y * TILE) : g.moveTo(x * TILE, y * TILE)))
+      g.stroke()
+    }
+  }
+  if (s === 'orchard') {
+    g.fillStyle = '#93cf5e'
+    g.fillRect(0, 0, w, h)
+    blots(140, ['rgba(190, 235, 130, 0.3)', 'rgba(90, 160, 60, 0.2)'], [40, 110])
+    tufts(900, 'rgba(60, 120, 40, 0.4)')
+    // Red laterite paths.
+    path([[12, 13.6], [12, 4.4]], 34, '#b8603a', '#d4794a')
+    path([[1.6, 7.9], [22.4, 7.9]], 30, '#b8603a', '#d4794a')
+    for (let i = 0; i < 120; i++) {
+      g.fillStyle = pick(['#ff5a6e', '#ffd34a', '#ffffff', '#ff8fc8'])
+      g.beginPath()
+      g.arc(Math.random() * w, Math.random() * h, 2.4, 0, Math.PI * 2)
+      g.fill()
+    }
+  } else if (s === 'market') {
+    g.fillStyle = '#a8d672'
+    g.fillRect(0, 0, w, h)
+    blots(90, ['rgba(200, 235, 140, 0.3)', 'rgba(110, 170, 70, 0.18)'], [40, 100])
+    tufts(500, 'rgba(70, 130, 45, 0.4)')
+    // The plaza: cobblestones.
+    g.save()
+    roundRect(g, 1.4 * TILE, 3 * TILE, 17.2 * TILE, 7.4 * TILE, 3 * TILE)
+    g.fillStyle = '#e9d3a6'
+    g.fill()
+    g.strokeStyle = 'rgba(61, 42, 69, 0.55)'
+    g.lineWidth = 3
+    g.stroke()
+    g.clip()
+    for (let y = 3 * TILE; y < 10.4 * TILE; y += 18) {
+      for (let x = 1.4 * TILE + ((y / 18) % 2) * 12; x < 18.6 * TILE; x += 24) {
+        g.fillStyle = pick(['#f3e1b8', '#e0c693', '#ead1a0'])
+        g.beginPath()
+        g.ellipse(x, y, 10, 7, 0, 0, Math.PI * 2)
+        g.fill()
+      }
+    }
+    g.restore()
+    path([[10, 11.8], [10, 10]], 30, '#d9bd88', '#efdcb0')
+  } else {
+    // The ruins: stone platforms over the void (the void stays transparent).
+    for (const r of Object.values(RUINS.platforms)) {
+      g.save()
+      roundRect(g, r.x * TILE, r.y * TILE, r.w * TILE, r.h * TILE, 36)
+      g.fillStyle = '#5d527f'
+      g.fill()
+      g.clip()
+      for (let y = r.y * TILE; y < (r.y + r.h) * TILE; y += 40) {
+        for (let x = r.x * TILE + ((y / 40) % 2) * 20; x < (r.x + r.w) * TILE; x += 40) {
+          g.fillStyle = pick(['#665b8a', '#5a4f7d', '#6e6394', '#62578a'])
+          roundRect(g, x + 2, y + 2, 36, 36, 6)
+          g.fill()
+        }
+      }
+      blots(30, ['rgba(110, 200, 150, 0.22)', 'rgba(150, 120, 230, 0.2)'], [20, 60])
+      for (let i = 0; i < 60; i++) {
+        g.fillStyle = 'rgba(200, 255, 230, 0.5)'
+        g.beginPath()
+        g.arc(r.x * TILE + Math.random() * r.w * TILE, r.y * TILE + Math.random() * r.h * TILE, 1.6, 0, Math.PI * 2)
+        g.fill()
+      }
+      g.restore()
+      roundRect(g, r.x * TILE, r.y * TILE, r.w * TILE, r.h * TILE, 36)
+      g.strokeStyle = '#2b2048'
+      g.lineWidth = 3
+      g.stroke()
+    }
+    for (const [id, r] of Object.entries(RUINS.bridges)) {
+      if (id === 'secret') continue
+      roundRect(g, r.x * TILE, r.y * TILE, r.w * TILE, r.h * TILE, 10)
+      g.fillStyle = '#8b80a8'
+      g.fill()
+      g.strokeStyle = '#2b2048'
+      g.lineWidth = 2.5
+      g.stroke()
+      g.strokeStyle = 'rgba(40, 30, 70, 0.35)'
+      g.lineWidth = 1.5
+      const vertical = r.h > r.w
+      for (let k = 14; k < (vertical ? r.h : r.w) * TILE; k += 16) {
+        g.beginPath()
+        if (vertical) {
+          g.moveTo(r.x * TILE + 4, r.y * TILE + k)
+          g.lineTo((r.x + r.w) * TILE - 4, r.y * TILE + k)
+        } else {
+          g.moveTo(r.x * TILE + k, r.y * TILE + 4)
+          g.lineTo(r.x * TILE + k, (r.y + r.h) * TILE - 4)
+        }
+        g.stroke()
+      }
+    }
+  }
+  islandGrounds[s] = canvas
+  return canvas
+}
+
+/** An island seen from above with its cliff of earth (orchard, market). */
+function drawIslandShape(s: SceneId) {
+  const { w: W, h: H } = sceneSize(s)
+  for (let i = 0; i < 14; i++) {
+    const x = (i / 13) * W
+    drawCloud(ctx, x + Math.sin(clock * 0.15 + i) * 14, H + 110 + (i % 3) * 30, 90 + (i % 4) * 20, 'rgba(255,255,255,0.8)')
+  }
+  ctx.beginPath()
+  ctx.moveTo(10, H - 50)
+  ctx.lineTo(W - 10, H - 50)
+  for (let i = 18; i >= 0; i--) {
+    const x = (i / 18) * W
+    const n = Math.sin(i * 12.9898 + W) * 43758.5453
+    ctx.lineTo(x, H + 60 + (n - Math.floor(n)) * 60)
+  }
+  ctx.closePath()
+  paint(ctx, s === 'orchard' ? '#a8573a' : '#93603d', 3)
+  for (let i = 0; i < 8; i++) drawCloud(ctx, (i / 7) * W + Math.sin(clock * 0.2 + i) * 10, H + 70 + (i % 2) * 20, 80 + (i % 3) * 18, 'rgba(255,255,255,0.95)')
+  ctx.save()
+  roundRect(ctx, 0, 0, W, H, 60)
+  ctx.clip()
+  ctx.drawImage(islandGround(s), 0, 0)
+  ctx.restore()
+  ctx.strokeStyle = C.ink
+  ctx.lineWidth = 3
+  roundRect(ctx, 0, 0, W, H, 60)
+  ctx.stroke()
+}
+
+/** The ruins: platforms floating in a violet sky, each with its rocky underside. */
+function drawRuinsShape() {
+  for (const r of Object.values(RUINS.platforms)) {
+    const x = r.x * TILE
+    const w = r.w * TILE
+    const y = (r.y + r.h) * TILE
+    ctx.beginPath()
+    ctx.moveTo(x + 20, y - 30)
+    ctx.lineTo(x + w - 20, y - 30)
+    for (let i = 8; i >= 0; i--) {
+      const px2 = x + (i / 8) * w
+      const n = Math.sin(i * 7.7 + x) * 43758.5453
+      ctx.lineTo(px2, y + 30 + (n - Math.floor(n)) * 70 * Math.sin((i / 8) * Math.PI))
+    }
+    ctx.closePath()
+    paint(ctx, '#3a2c5e', 3)
+    // Crystals hanging under the rock.
+    for (let i = 1; i < 4; i++) {
+      const cx = x + (i / 4) * w
+      ctx.beginPath()
+      ctx.moveTo(cx - 8, y + 20)
+      ctx.lineTo(cx, y + 50 + i * 6)
+      ctx.lineTo(cx + 8, y + 20)
+      ctx.closePath()
+      paint(ctx, i % 2 ? '#9fd8ff' : '#e2a8ff', 1.5)
+    }
+  }
+  ctx.drawImage(islandGround('ruins'), 0, 0)
+}
+
+// The orchard.
+
+function emptySpot(x: number, y: number) {
+  ellipse(ctx, x, y, 26, 11, 'rgba(120, 70, 40, 0.35)', 0, 1.5)
+  ctx.strokeStyle = 'rgba(255,255,255,0.7)'
+  ctx.lineWidth = 2.5
+  ctx.beginPath()
+  ctx.moveTo(x - 6, y)
+  ctx.lineTo(x + 6, y)
+  ctx.moveTo(x, y - 5)
+  ctx.lineTo(x, y + 5)
+  ctx.stroke()
+}
+
+// The market (an online room: the players there, and their stalls).
+
+interface StallOffer { i: ItemId; c: number; p: number }
+interface MarketState { x: number; y: number; f: number; w: boolean; a: number[]; l: number; o: StallOffer[] }
+type MarketMessage =
+  | { type: 'buy'; req: string; item: ItemId; count: number; price: number }
+  | { type: 'sold'; req: string; item: ItemId; count: number; price: number }
+  | { type: 'nosale'; req: string }
+  | { type: 'wave' }
+interface Shopper extends Visitor { offers: StallOffer[] }
+
+let marketRoom: Room<MarketState, MarketMessage> | null = null
+let marketJoining = false
+const shoppers = new Map<string, Shopper>()
+const pendingBuys = new Map<string, { seller: string; until: number }>()
+let sentMarket = ''
+
+function marketState(): MarketState {
+  const s = sharedState()
+  return { x: s.x, y: s.y, f: s.f, w: s.w, a: s.a, l: s.l, o: home.s.stall.map((o) => ({ i: o.item, c: o.count, p: o.price })) }
+}
+
+function offersOf(raw: unknown): StallOffer[] {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .slice(0, STALL_OFFERS)
+    .filter((o) => o && typeof o === 'object' && Object.prototype.hasOwnProperty.call(ITEMS, o.i))
+    .map((o) => ({ i: o.i as ItemId, c: Math.max(0, Math.min(STALL_MAX, Math.floor(num(o.c, 0)))), p: Math.max(1, Math.min(9999, Math.floor(num(o.p, 1)))) }))
+    .filter((o) => o.c > 0)
+}
+
+function shopperOf(p: RoomPlayer<MarketState>): Shopper {
+  const v = visitorOf(p as unknown as RoomPlayer<Shared>)
+  return { ...v, offers: offersOf(p.state && p.state.o) }
+}
+
+async function joinMarket() {
+  if (marketRoom || marketJoining || !canGoOnline()) return
+  marketJoining = true
+  try {
+    const joined = await play.joinRoom<MarketState, MarketMessage>('market', { state: marketState(), name: myName() })
+    if (scene !== 'market') {
+      joined.leave()
+      return
+    }
+    marketRoom = joined
+    sentMarket = ''
+    shoppers.clear()
+    for (const p of joined.players.values()) shoppers.set(p.id, shopperOf(p))
+    joined.on('join', (p) => shoppers.set(p.id, shopperOf(p)))
+    joined.on('leave', (p) => {
+      shoppers.delete(p.id)
+      if (panel && typeof panel === 'object' && 'seller' in panel && panel.seller === p.id) panel = null
+    })
+    joined.on('state', (p) => {
+      const s = shoppers.get(p.id)
+      if (!s) return
+      applyShared(s, p.state as unknown as Shared)
+      s.offers = offersOf(p.state && p.state.o)
+    })
+    joined.on('message', onMarketMessage)
+    joined.on('close', () => {
+      if (marketRoom === joined) {
+        marketRoom = null
+        shoppers.clear()
+      }
+    })
+  } catch (error) {
+    play.logWarning(error)
+  } finally {
+    marketJoining = false
+  }
+}
+
+function leaveMarket() {
+  const room = marketRoom
+  marketRoom = null
+  shoppers.clear()
+  pendingBuys.clear()
+  if (room) room.leave()
+}
+
+function onMarketMessage(data: MarketMessage, from: RoomPlayer<MarketState>) {
+  const s = shoppers.get(from.id)
+  if (!s || !data || typeof data !== 'object') return
+  const room = marketRoom
+  if (data.type === 'wave') {
+    s.emote = { text: '👋 ' + t.hello, life: 2.5 }
+    sound.coin()
+  } else if (data.type === 'buy' && room) {
+    // Someone buys from your stall: checked against your offer, then you are paid.
+    const count = Math.floor(Number(data.count))
+    const ok = typeof data.req === 'string' && Object.prototype.hasOwnProperty.call(ITEMS, data.item) && count >= 1 && count <= STALL_MAX && home.sellFromStall(data.item, count, Math.floor(Number(data.price)))
+    if (ok) {
+      safely(() => room.send({ type: 'sold', req: data.req, item: data.item, count, price: Math.floor(Number(data.price)) }, from.id))
+      toast = { title: `${t.soldTo} ${clip(s.name, 16)}`, text: `${count} ${t.items[data.item].toLowerCase()} · +${count * Math.floor(Number(data.price))}`, life: 3 }
+      flyCoins(width / 2, height / 3, count * Math.floor(Number(data.price)))
+      sound.order()
+      persist()
+    } else safely(() => room.send({ type: 'nosale', req: String(data.req).slice(0, 40) }, from.id))
+  } else if (data.type === 'sold' || data.type === 'nosale') {
+    const pending = pendingBuys.get(data.req)
+    if (!pending || pending.seller !== from.id) return
+    pendingBuys.delete(data.req)
+    if (data.type === 'nosale') {
+      toast = { title: t.outOfStock, text: '', life: 2.5 }
+      sound.denied()
+      return
+    }
+    const count = Math.floor(Number(data.count))
+    const price = Math.floor(Number(data.price))
+    if (!Object.prototype.hasOwnProperty.call(ITEMS, data.item) || !(count >= 1)) return
+    home.receiveBought(data.item, count, price)
+    toast = { title: `${t.boughtFrom} ${clip(s.name, 16)}`, text: `${count} ${t.items[data.item].toLowerCase()}`, life: 3 }
+    flyToBarn(data.item, farmer.x, farmer.y - 40, count)
+    sound.buy()
+    persist()
+  }
+}
+
+/** Buys from another player's stall: your coins and your barn are checked first. */
+function buyFrom(id: string, offer: StallOffer, count: number) {
+  const room = marketRoom
+  if (!room || pendingBuys.size) return
+  if (home.s.coins < count * offer.p) {
+    toast = { title: t.noCoins, text: '', life: 2 }
+    sound.denied()
+    return
+  }
+  if (home.space() < count) {
+    barnFull(farmer.x, farmer.y - 60)
+    return
+  }
+  const req = randomFarmId()
+  pendingBuys.set(req, { seller: id, until: clock + 8 })
+  safely(() => room.send({ type: 'buy', req, item: offer.i, count, price: offer.p }, id))
+  sound.plant()
+}
+
+// The celestial ruins.
+
+interface Spirit { x: number; y: number; phase: number; hue: string }
+const spirits: Spirit[] = Array.from({ length: 6 }, (_, i) => ({ x: rand(2, 26) * TILE, y: rand(1, 14) * TILE, phase: i * 1.3, hue: ['rgba(190, 160, 255, A)', 'rgba(150, 230, 255, A)', 'rgba(255, 190, 230, A)'][i % 3] }))
+let bridgeShownAt = -1
+const dustTaken: number[] = RUINS.dust.map(() => -100)
+
+/** Star dust lying on the sanctuary at night (last quest). */
+function dustVisible(i: number) {
+  return scene === 'ruins' && home.ruins.quest === 4 && home.bridgeOpen() && light.night > 0.5 && clock - dustTaken[i] > 20
+}
+
+function updateIslands(dt: number) {
+  // Shoppers walk smoothly; your state goes to the market room.
+  for (const v of shoppers.values()) {
+    const dx = v.tx - v.x
+    const dy = v.ty - v.y
+    const d = Math.hypot(dx, dy)
+    if (d > 400) Object.assign(v, { x: v.tx, y: v.ty })
+    else if (d > 1) {
+      const step = Math.min(d, Math.max(190, d * 6) * dt)
+      v.x += (dx / d) * step
+      v.y += (dy / d) * step
+      if (Math.abs(dx) > 1) v.facing = dx > 0 ? 1 : -1
+    }
+    if (v.emote && (v.emote.life -= dt) <= 0) v.emote = null
+  }
+  const room = marketRoom
+  if (room && stateTimer === 0) {
+    const state = marketState()
+    const text = JSON.stringify(state)
+    if (text !== sentMarket) {
+      sentMarket = text
+      safely(() => room.setState(state))
+    }
+  }
+  for (const [req, p] of pendingBuys) {
+    if (clock > p.until) {
+      pendingBuys.delete(req)
+      toast = { title: t.noReply, text: '', life: 2.5 }
+    }
+  }
+  if (scene !== 'ruins') return
+  // Spirits drift; the nearest one follows the farmer.
+  spirits.forEach((s, i) => {
+    const tx = i === 0 ? farmer.x - farmer.facing * 40 : s.x + Math.sin(clock * 0.4 + s.phase) * 30
+    const ty = i === 0 ? farmer.y - 70 : s.y + Math.cos(clock * 0.5 + s.phase) * 20
+    s.x += (tx - s.x) * Math.min(1, dt * (i === 0 ? 2 : 0.3))
+    s.y += (ty - s.y) * Math.min(1, dt * (i === 0 ? 2 : 0.3))
+  })
+  if (home.bridgeOpen() && bridgeShownAt < 0) bridgeShownAt = clock
+  // Picking up star dust by walking over it.
+  RUINS.dust.forEach((p, i) => {
+    if (!dustVisible(i)) return
+    if (Math.hypot(farmer.x - p.x * TILE, farmer.y - p.y * TILE) < 34 && home.collectStardust()) {
+      dustTaken[i] = clock
+      burst(p.x * TILE, p.y * TILE, 20, ['#fff8d0', '#ffe08a', '#d8c8ff'], 0.8, true)
+      floatText(p.x * TILE, p.y * TILE - 30, `★ ${home.ruins.stardust}/5`, '#fff6b3', 16)
+      sound.harvest(home.ruins.stardust)
+      changed()
+    }
+  })
+}
+
+/** What is next to the farmer on this island (for Space and the hint). */
+function nearInteractive() {
+  let best: Interactive | null = null
+  let bestD = 64
+  for (const it of interactives(scene, home.bridgeOpen())) {
+    const d = Math.hypot(it.at.x - farmer.x, it.at.y - farmer.y)
+    if (d < bestD) {
+      bestD = d
+      best = it.what
+    }
+  }
+  return best
+}
+
+/** What was tapped on this island. */
+function interactiveAt(wx: number, wy: number) {
+  let best: Interactive | null = null
+  let bestD = 52
+  for (const it of interactives(scene, home.bridgeOpen())) {
+    const d = Math.hypot(it.at.x - wx, it.at.y - 10 - wy)
+    if (d < bestD) {
+      bestD = d
+      best = it.what
+    }
+  }
+  return best
+}
+
+function interact(it: Interactive) {
+  const at = interactives(scene, home.bridgeOpen()).find((i) => JSON.stringify(i.what) === JSON.stringify(it))?.at ?? { x: farmer.x, y: farmer.y }
+  if (it.kind === 'house') goToSleep()
+  else if (it.kind === 'dock' || it.kind === 'pad') panel = { travel: it.kind }
+  else if (it.kind === 'tree') {
+    const ripe = home.treeReady(it.spot) && home.treeGrowth(it.spot) >= 1
+    if (!ripe) {
+      panel = { tree: it.spot }
+      return
+    }
+    if (!enough(ENERGY.tree, at.x, at.y - 40)) return
+    const got = home.harvestTree(it.spot)
+    if (got && got !== 'full') home.tire(ENERGY.tree)
+    if (got === 'full') barnFull(at.x, at.y - 60)
+    else if (got) {
+      flyToBarn(got.item, at.x, at.y - 50, got.count)
+      floatText(at.x, at.y - 80, `+${got.count} ${t.items[got.item]}`, '#fff6b3', 16)
+      burst(at.x, at.y - 50, 14, [FRUITS[got.item].color, '#7bc950', '#fff'], 0.7)
+      sound.harvest(2)
+      changed()
+    }
+  } else if (it.kind === 'hut') {
+    toast = { title: 'Afi', text: t.treeHelp, life: 3 }
+    sound.coin()
+  } else if (it.kind === 'merchant') panel = 'merchant'
+  else if (it.kind === 'stall') panel = 'stall'
+  else if (it.kind === 'keeper') panel = 'keeper'
+  else if (it.kind === 'crystal') {
+    const c = home.crystal(it.plot)
+    if (c && home.crystalGrowth(it.plot) >= 1) {
+      if (!enough(ENERGY.crystal, at.x, at.y - 30)) return
+      const got = home.harvestCrystal(it.plot)
+      if (got && got !== 'full') home.tire(ENERGY.crystal)
+      if (got === 'full') barnFull(at.x, at.y - 40)
+      else if (got) {
+        flyToBarn(got, at.x, at.y - 30, 1)
+        floatText(at.x, at.y - 60, `+1 ${t.items[got]}`, '#f0e0ff', 16)
+        burst(at.x, at.y - 30, 18, ['#d8c8ff', '#9fd8ff', '#fff'], 0.8, true)
+        sound.golden()
+        changed()
+      }
+    } else if (c) floatText(at.x, at.y - 50, `${t.crystalGrowing} · ${Math.ceil(c.readyAt - home.clock)} s`, '#ffffff', 14)
+    else {
+      const result = home.plantStar(it.plot)
+      if (result === 'ok') {
+        sound.plant()
+        burst(at.x, at.y - 10, 12, ['#d8c8ff', '#fff'], 0.5, true)
+        rings.push({ x: at.x, y: at.y, life: 1, color: 'rgba(220, 200, 255, 0.9)' })
+        changed()
+      } else {
+        sound.denied()
+        floatText(at.x, at.y - 40, result === 'locked' ? t.locked : result === 'coins' ? t.noCoins : '', '#ffe0e0', 14)
+      }
+    }
+  } else if (it.kind === 'lantern') {
+    if (home.lightLantern(it.index)) {
+      sound.golden()
+      burst(at.x, at.y - 50, 24, ['#ffd98a', '#fff3c4', '#ffb35a'], 0.9, true)
+      floatText(at.x, at.y - 90, t.lanternLit, '#fff6b3', 15)
+      changed()
+    }
+  } else if (it.kind === 'rune') {
+    const result = home.touchRune(it.index)
+    if (result === 'wrong') {
+      sound.denied()
+      toast = { title: t.runeWrong, text: '', life: 2.5 }
+    } else if (result) {
+      sound.harvest(home.ruins.runeStep)
+      burst(at.x, at.y - 30, 14, ['#d8c8ff', '#fff'], 0.6, true)
+      if (result === 'done') toast = { title: t.done, text: t.keeper, life: 3 }
+      changed()
+    }
+  } else if (it.kind === 'mural') {
+    toast = { title: t.questNames.runes, text: t.questText.runes, life: 4 }
+  } else if (it.kind === 'altar') {
+    if (home.ruins.quest === 4 && home.canHandIn()) handInQuest(at)
+    else toast = { title: `★ ${home.ruins.stardust}/5`, text: t.stardustNight, life: 3 }
+  }
+}
+
+function handInQuest(at: Point) {
+  const before = home.ruins.quest
+  const coins = home.handIn()
+  if (!coins) return
+  sound.order()
+  burst(at.x, at.y - 40, 40, ['#ffd54a', '#d8c8ff', '#9fd8ff', '#fff'], 1.4, true)
+  const p = toScreen(at.x, at.y - 40)
+  flyCoins(p.x, p.y, coins)
+  toast = { title: `${t.done} ${t.questNames[RUIN_QUESTS[before].id]}`, text: before === 3 ? t.bridgeOpen : before === RUIN_QUESTS.length - 1 ? `${t.starKeeper} · ${t.shardReady}` : `+${coins}`, life: 4.5 }
+  if (before === RUIN_QUESTS.length - 1) burst(width / 2, height * 0.4, 70, ['#ffd54a', '#fff8d0', '#b9a6ff'], 2, true, true)
+  persist()
+}
+
+/** The keeper's "!" when a quest can be given. */
+function keeperHasNews() {
+  return home.canHandIn() || (home.ruins.quest >= RUIN_QUESTS.length && home.canOffer(today()))
+}
+
+// Drawing an island.
+
+function drawIslandWorld(l: Daylight) {
+  const ruins = scene === 'ruins'
+  const { w: W, h: H } = sceneSize(scene)
+  const sky = ctx.createLinearGradient(0, 0, 0, height)
+  sky.addColorStop(0, ruins ? '#140f38' : l.top)
+  sky.addColorStop(1, ruins ? '#53348a' : l.bottom)
+  ctx.fillStyle = sky
+  ctx.fillRect(0, 0, width, height)
+  if (ruins) {
+    drawStars({ ...l, night: Math.max(0.75, l.night) })
+    // Ribbons of an aurora.
+    for (let i = 0; i < 3; i++) {
+      ctx.strokeStyle = ['rgba(140, 255, 210, 0.12)', 'rgba(180, 140, 255, 0.12)', 'rgba(255, 160, 220, 0.1)'][i]
+      ctx.lineWidth = 30
+      ctx.beginPath()
+      for (let x = 0; x <= width; x += 30) ctx.lineTo(x, height * (0.15 + i * 0.08) + Math.sin(x * 0.006 + clock * 0.3 + i) * 30)
+      ctx.stroke()
+    }
+  } else drawStars(l)
+  ctx.save()
+  ctx.translate(width / 2, height / 2)
+  ctx.scale(cam.zoom, cam.zoom)
+  ctx.translate(-cam.x, -cam.y)
+  if (ruins) {
+    for (let i = 0; i < 7; i++) drawSpire(ctx, ((i * 613) % W) + 40, H * (0.25 + (i % 3) * 0.3), 120 + (i % 3) * 50, clock)
+    drawRuinsShape()
+    // The secret bridge of light.
+    const r = RUINS.bridges.secret
+    if (home.bridgeOpen()) drawLightBridge(ctx, r.x * TILE, r.y * TILE, (r.x + r.w) * TILE, r.h * TILE, bridgeShownAt < 0 ? 0 : Math.min(1, (clock - bridgeShownAt) / 1.5), clock)
+  } else drawIslandShape(scene)
+  const tall: { y: number; draw: () => void }[] = []
+  const bubbles: (() => void)[] = []
+  if (scene === 'orchard') {
+    const pier = ORCHARD.pier
+    drawPier(ctx, pier.x * TILE, pier.y * TILE, pier.length * TILE, clock)
+    drawFerry(ctx, pier.x * TILE + 60, (pier.y + pier.length) * TILE + 20, 90, clock)
+    drawWaterfall(ctx, ORCHARD.waterfall.x * TILE, H - 6, 34, 140, clock)
+    const hut = ORCHARD.hut
+    tall.push({ y: (hut.y + hut.h) * TILE, draw: () => drawHut(ctx, hut.x * TILE, hut.y * TILE, hut.w * TILE, hut.h * TILE, clock) })
+    tall.push({ y: ORCHARD.keeper.y * TILE, draw: () => drawFarmer(ctx, AFI_LOOK, ORCHARD.keeper.x * TILE, ORCHARD.keeper.y * TILE, 44, clock * 0.6, -1, false) })
+    for (const [x, y, fruit] of ORCHARD.baskets) tall.push({ y: y * TILE, draw: () => drawBasket(ctx, fruit, x * TILE, y * TILE, 40) })
+    for (const [x, y] of ORCHARD.palms) tall.push({ y: y * TILE, draw: () => drawPalm(ctx, x * TILE, y * TILE, 120, clock) })
+    const hm = ORCHARD.hammock
+    tall.push({ y: hm.y * TILE, draw: () => drawHammock(ctx, hm.x1 * TILE, hm.y * TILE, hm.x2 * TILE, clock) })
+    ORCHARD.spots.forEach((p, spot) => {
+      const tree = home.tree(spot)
+      const x = p.x * TILE
+      const y = p.y * TILE
+      if (!tree) {
+        tall.push({ y: y - 30, draw: () => emptySpot(x, y) })
+        return
+      }
+      const growth = home.treeGrowth(spot)
+      const ready = growth >= 1 && home.treeReady(spot)
+      tall.push({ y, draw: () => drawFruitTree(ctx, tree.fruit, x, y, 110, growth, ready, clock) })
+      if (ready) bubbles.push(() => bubble(x, y - 140, 20, () => drawItem(ctx, tree.fruit, x, y - 140, 26), 6))
+      else if (growth >= 1) bubbles.push(() => bubble(x, y - 140, 18, () => ring(x, y - 140, 13, 1 - (tree.readyAt - home.clock) / FRUITS[tree.fruit].every, C.gold)))
+    })
+  } else if (scene === 'market') {
+    const pier = MARKET.pier
+    drawPier(ctx, pier.x * TILE, pier.y * TILE, pier.length * TILE, clock)
+    drawFerry(ctx, pier.x * TILE + 60, (pier.y + pier.length) * TILE + 20, 90, clock)
+    const wanted = home.merchantWants(today())
+    const ms = MARKET.merchantStall
+    tall.push({ y: (ms.y + ms.h) * TILE, draw: () => drawStall(ctx, ms.x * TILE, ms.y * TILE, ms.w * TILE, ms.h * TILE, clock, (gx, gy) => [-50, -16, 18, 52].forEach((dx) => drawItem(ctx, wanted, gx + dx, gy - 6, 26))) })
+    tall.push({ y: MARKET.merchant.y * TILE, draw: () => drawMerchant(ctx, MARKET.merchant.x * TILE, MARKET.merchant.y * TILE, 60, clock) })
+    bubbles.push(() => bubble(MARKET.merchant.x * TILE + 40, MARKET.merchant.y * TILE - 90, 18, () => text('×2', MARKET.merchant.x * TILE + 40, MARKET.merchant.y * TILE - 90, 15, C.coral, 'center', 900, null), 4))
+    const mine = MARKET.myStall
+    tall.push({ y: (mine.y + mine.h) * TILE, draw: () => drawStall(ctx, mine.x * TILE, mine.y * TILE, mine.w * TILE, mine.h * TILE, clock, (gx, gy) => home.s.stall.forEach((o, i) => drawItem(ctx, o.item, gx + (i - 1) * 40, gy - 6, 28))) })
+    bubbles.push(() => nameTag(t.myStall, (mine.x + mine.w / 2) * TILE, (mine.y + mine.h) * TILE + 6, C.gold, C.text))
+    const fruits: FruitId[] = ['orange', 'mango', 'cacao']
+    MARKET.stalls.forEach((r, i) => tall.push({ y: (r.y + r.h) * TILE, draw: () => drawStall(ctx, r.x * TILE, r.y * TILE, r.w * TILE, r.h * TILE, clock + i, (gx, gy) => drawBasket(ctx, fruits[i % 3], gx, gy, 46)) }))
+    tall.push({ y: MARKET.fountain.y * TILE + 10, draw: () => drawDecor(ctx, 'fountain', MARKET.fountain.x * TILE, MARKET.fountain.y * TILE, clock) })
+    for (const [x, y] of MARKET.palms) tall.push({ y: y * TILE, draw: () => drawPalm(ctx, x * TILE, y * TILE, 120, clock) })
+    for (const s of shoppers.values()) {
+      tall.push({
+        y: s.y,
+        draw: () => {
+          drawFarmer(ctx, s.look, s.x, s.y, 46, clock + s.id.length, s.facing, s.walking || Math.hypot(s.tx - s.x, s.ty - s.y) > 2)
+          nameTag(`${clip(s.name, 14)}${s.offers.length ? ' · 🛒' : ''}`, s.x, s.y + 4, s.offers.length ? C.gold : C.paper, C.text)
+        },
+      })
+      if (s.emote) {
+        const e = s.emote
+        tall.push({ y: 1e9 - 1, draw: () => emoteBubble(e.text, s.x, s.y - 70, e.life) })
+      }
+    }
+  } else if (ruins) {
+    const pad = RUINS.pad
+    tall.push({ y: pad.y * TILE, draw: () => drawBalloon(ctx, pad.x * TILE, pad.y * TILE, 110, clock) })
+    tall.push({ y: RUINS.keeper.y * TILE, draw: () => drawKeeper(ctx, RUINS.keeper.x * TILE, RUINS.keeper.y * TILE, 80, clock) })
+    if (keeperHasNews()) bubbles.push(() => bubble(RUINS.keeper.x * TILE, RUINS.keeper.y * TILE - 120, 16, () => text('!', RUINS.keeper.x * TILE, RUINS.keeper.y * TILE - 120, 20, C.plum, 'center', 900, null), 5))
+    RUINS.plots.forEach((p, plot) => {
+      const c = home.crystal(plot)
+      const growth = home.crystalGrowth(plot)
+      tall.push({ y: p.y * TILE, draw: () => drawCrystalPlot(ctx, p.x * TILE, p.y * TILE, 70, c ? c.kind : null, growth, !!c && growth >= 1, clock) })
+    })
+    RUINS.lanterns.forEach((p, i) => tall.push({ y: p.y * TILE, draw: () => drawLantern(ctx, p.x * TILE, p.y * TILE, 70, home.lanternLit(i), clock) }))
+    const step = home.ruins.runeStep
+    RUINS.runes.forEach((p, i) => {
+      const active = home.ruins.quest > 3 || home.ruins.runeOrder.slice(0, step).includes(i)
+      tall.push({ y: p.y * TILE, draw: () => drawRune(ctx, i, p.x * TILE, p.y * TILE, 70, active, clock) })
+    })
+    const m = RUINS.mural
+    tall.push({ y: (m.y + m.h) * TILE, draw: () => drawMural(ctx, m.x * TILE, m.y * TILE, m.w * TILE, m.h * TILE, home.ruins.runeOrder, clock) })
+    for (const [x, y, broken] of RUINS.statues) tall.push({ y: y * TILE, draw: () => drawStatue(ctx, x * TILE, y * TILE, 80, broken) })
+    if (home.bridgeOpen()) tall.push({ y: RUINS.altar.y * TILE, draw: () => drawAltar(ctx, RUINS.altar.x * TILE, RUINS.altar.y * TILE, 100, home.ruins.quest === 4 ? home.ruins.stardust : 0, home.ruins.quest >= 4, clock) })
+    RUINS.dust.forEach((p, i) => {
+      if (dustVisible(i)) tall.push({ y: p.y * TILE, draw: () => drawStardust(ctx, p.x * TILE, p.y * TILE, clock) })
+    })
+  }
+  const walking = Math.hypot(farmer.tx - farmer.x, farmer.ty - farmer.y) > 2 || (started && !panel && [...held].some((k) => KEYS[k]))
+  tall.push({
+    y: farmer.y,
+    draw: () => {
+      drawFarmer(ctx, look(), farmer.x, farmer.y, 46, clock, farmer.facing, walking)
+      if (shoppers.size) nameTag(clip(myName(), 16), farmer.x, farmer.y + 4, C.gold, C.text)
+    },
+  })
+  if (myEmote) {
+    const e = myEmote
+    tall.push({ y: 1e9 - 1, draw: () => emoteBubble(e.text, farmer.x, farmer.y - 70, e.life) })
+  }
+  if (keyboard && started && !panel && !travel && nearInteractive()) {
+    const hx = farmer.x
+    const hy = farmer.y - 76 - Math.abs(Math.sin(clock * 4)) * 4
+    tall.push({
+      y: 1e9,
+      draw: () => {
+        ctx.font = '900 13px ' + FONT
+        const w = ctx.measureText(t.use).width + 20
+        roundRect(ctx, hx - w / 2, hy - 12, w, 24, 12)
+        paint(ctx, C.text, 1.5)
+        text(t.use, hx, hy, 13, '#fff', 'center', 900, null)
+      },
+    })
+  }
+  tall.sort((a, b) => a.y - b.y).forEach((item) => item.draw())
+  for (const b of bubbles) b()
+  if (!ruins) drawButterflies()
+  for (const r of rings) {
+    ctx.strokeStyle = r.color.replace(/[\d.]+\)$/, `${r.life * 0.9})`)
+    ctx.lineWidth = 3 * r.life
+    ctx.beginPath()
+    ctx.ellipse(r.x, r.y, 10 + (1 - r.life) * 30, 4 + (1 - r.life) * 12, 0, 0, Math.PI * 2)
+    ctx.stroke()
+  }
+  // The light: the hour (the ruins keep their own violet dusk).
+  ctx.globalCompositeOperation = 'multiply'
+  ctx.fillStyle = ruins ? (l.night > 0.5 ? '#9c94d8' : '#cfc6f2') : l.tint
+  ctx.fillRect(-4 * TILE, -4 * TILE, W + 8 * TILE, H + 8 * TILE)
+  ctx.globalCompositeOperation = 'lighter'
+  const k = ruins ? 1 : l.night
+  if (k > 0.02) {
+    const warm = 'rgba(255, 196, 110, A)'
+    glow(farmer.x, farmer.y - 26, 140, 'rgba(255, 214, 140, A)', ruins ? 0.6 : k)
+    if (scene === 'orchard') glow((ORCHARD.hut.x + ORCHARD.hut.w / 2) * TILE, (ORCHARD.hut.y + ORCHARD.hut.h * 0.8) * TILE, 90, warm, k)
+    if (scene === 'market') for (const r of [MARKET.merchantStall, MARKET.myStall, ...MARKET.stalls]) glow((r.x + r.w / 2) * TILE, (r.y + r.h * 0.6) * TILE, 90, warm, k * 0.8)
+    if (scene === 'orchard' || scene === 'market') {
+      const pier = scene === 'orchard' ? ORCHARD.pier : MARKET.pier
+      glow(pier.x * TILE, (pier.y + pier.length) * TILE - 40, 80, warm, k)
+    }
+    if (ruins) {
+      RUINS.lanterns.forEach((p, i) => home.lanternLit(i) && glow(p.x * TILE, p.y * TILE - 50, 130, warm, 1))
+      RUINS.plots.forEach((p, i) => home.crystal(i) && glow(p.x * TILE, p.y * TILE - 30, 60, 'rgba(200, 170, 255, A)', 0.7))
+      glow(RUINS.keeper.x * TILE, RUINS.keeper.y * TILE - 60, 90, 'rgba(190, 150, 255, A)', 0.8)
+      for (const s of spirits) glow(s.x, s.y, 50, s.hue, 0.9)
+    }
+  }
+  ctx.globalCompositeOperation = 'source-over'
+  if (ruins) spirits.forEach((s, i) => drawSpirit(ctx, s.x, s.y + Math.sin(clock * 2 + i) * 4, 7, clock + i, s.hue))
+  else {
+    drawShootingStars(l)
+    drawFireflies(Math.max(l.dusk, l.night * 0.8))
+  }
+  for (const p of particles) {
+    if (p.screen) continue
+    ctx.globalAlpha = Math.min(1, (p.life / p.max) * 1.5)
+    ctx.fillStyle = p.color
+    if (p.puff) ellipse(ctx, p.x, p.y, p.size * (1.6 - p.life / p.max), p.size * 0.7 * (1.6 - p.life / p.max), p.color)
+    else if (p.star) star4(ctx, p.x, p.y, p.size * 0.8)
+    else {
+      ctx.beginPath()
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2)
+      ctx.fill()
+    }
+  }
+  ctx.globalAlpha = 1
+  for (const f of floats) {
+    const kk = 1 - f.life
+    ctx.globalAlpha = Math.min(1, f.life * 2)
+    text(f.text, f.x, f.y, f.size * (kk < 0.15 ? easeBack(kk / 0.15) : 1), f.color)
+  }
+  ctx.globalAlpha = 1
+  ctx.restore()
+}
+
+/** On another island: its name, and the way home. */
+function drawIslandBanner() {
+  if (scene === 'home') return
+  const title = t.islands[scene]
+  const left = 205 * ui
+  const right = width - 154 * ui
+  const roomy = right - left >= 250 * ui
+  const w = roomy ? Math.min(right - left - 12 * ui, 340 * ui) : Math.min(width - 32 * ui, 340 * ui)
+  const x = roomy ? (left + right - w) / 2 : (width - w) / 2
+  const y = (roomy ? 12 * ui : 98 * ui) + Math.sin(clock * 2) * 2 * ui
+  card(x, y, w, 46 * ui, 16 * ui, scene === 'ruins' ? '#d8c8ff' : C.mint, 2.5)
+  text(title, x + 16 * ui, y + 23 * ui, fitSize(title, w - 150 * ui, 15 * ui, 900), C.text, 'left', 900, null)
+  button('🏠 ' + t.goHome, x + w - 124 * ui, y + 6 * ui, 116 * ui, 34 * ui, C.coral, !travel, () => travelTo('home'))
+}
+
+// Panels of the islands.
+
+/** Lines of a text that fit in `maxW` pixels. */
+function wrap(value: string, maxW: number, size: number, weight = 700) {
+  ctx.font = `${weight} ${Math.round(size)}px ${FONT}`
+  const lines: string[] = []
+  let line = ''
+  for (const word of value.split(' ')) {
+    const next = line ? line + ' ' + word : word
+    if (ctx.measureText(next).width > maxW && line) {
+      lines.push(line)
+      line = word
+    } else line = next
+  }
+  if (line) lines.push(line)
+  return lines
+}
+
+function drawTravelPanel(kind: 'dock' | 'pad') {
+  const transport: TransportId = kind === 'dock' ? 'ferry' : 'balloon'
+  const box = panelFrame(scene === 'home' ? t.transports[transport] : t.travel, 560, 400, kind === 'pad' ? C.plum : C.sky)
+  const x = box.x + 18 * ui
+  const w = box.w - 36 * ui
+  if (scene !== 'home') {
+    const cx = box.x + box.w / 2
+    if (kind === 'pad') drawBalloon(ctx, cx, box.y + box.h * 0.6, 120 * ui, clock)
+    else drawFerry(ctx, cx, box.y + box.h * 0.45, 150 * ui, clock)
+    button('🏠 ' + t.goBackHome, cx - 120 * ui, box.y + box.h - 64 * ui, 240 * ui, 48 * ui, C.teal, !travel, () => travelTo('home'))
+    text(t.freeTrip, cx, box.y + box.h - 10 * ui, 11 * ui, C.muted, 'center', 800, null)
+    buttons.push(box.close)
+    return
+  }
+  if (!home.s.transport[transport]) {
+    const info = TRANSPORT[transport]
+    const cx = box.x + box.w / 2
+    if (kind === 'pad') drawBalloon(ctx, cx, box.y + box.h * 0.55, 120 * ui, clock)
+    else drawFerry(ctx, cx, box.y + box.h * 0.4, 160 * ui, clock)
+    text(t.transportHelp[transport], cx, box.y + box.h * 0.68, fitSize(t.transportHelp[transport], w, 14 * ui, 800), C.muted, 'center', 800, null)
+    if (home.level < info.level) text('🔒 ' + t.levelNeeded + ' ' + info.level, cx, box.y + box.h - 40 * ui, 18 * ui, C.muted, 'center', 900, null)
+    else coinButton(info.price, cx - 100 * ui, box.y + box.h - 64 * ui, 200 * ui, 48 * ui, C.teal, home.s.coins >= info.price, () => bought(home.buyTransport(transport)))
+    buttons.push(box.close)
+    return
+  }
+  const dests = ISLAND_IDS.filter((id) => ISLANDS[id].transport === transport)
+  const why = cannotLeave()
+  const rowH = Math.min(96 * ui, (box.h - 30 * ui) / Math.max(2, dests.length))
+  dests.forEach((id, i) => {
+    const y = box.y + 12 * ui + i * rowH
+    slot(x, y, w, rowH - 10 * ui)
+    const mid = y + (rowH - 10 * ui) / 2
+    // A little view of the island.
+    ctx.save()
+    roundRect(ctx, x + 10 * ui, y + 8 * ui, rowH - 26 * ui, rowH - 26 * ui, 12 * ui)
+    ctx.clip()
+    ctx.fillStyle = id === 'ruins' ? '#3a2c6b' : '#a8d672'
+    ctx.fillRect(x, y, rowH, rowH)
+    const s = rowH - 26 * ui
+    if (id === 'orchard') drawFruitTree(ctx, 'mango', x + 10 * ui + s / 2, y + 8 * ui + s * 0.95, s * 0.75, 1, true, clock)
+    else if (id === 'market') drawStall(ctx, x + 10 * ui + s * 0.1, y + 8 * ui + s * 0.1, s * 0.8, s * 0.8, clock, null)
+    else drawKeeper(ctx, x + 10 * ui + s / 2, y + 8 * ui + s * 0.98, s * 0.8, clock)
+    ctx.restore()
+    const tx = x + rowH
+    text(t.islands[id], tx, mid - 12 * ui, fitSize(t.islands[id], w - rowH - 160 * ui, 16 * ui, 900), C.text, 'left', 900, null)
+    text(t.islandHelp[id], tx, mid + 10 * ui, fitSize(t.islandHelp[id], w - rowH - 160 * ui, 11 * ui, 700), C.muted, 'left', 700, null)
+    const fare = ISLANDS[id].fare
+    text(`${t.fare} : ${fare}`, x + w - 75 * ui, mid - 22 * ui, 11 * ui, C.muted, 'center', 900, null)
+    button(kind === 'pad' ? t.takeOff : t.go, x + w - 140 * ui, mid - 14 * ui, 130 * ui, 40 * ui, kind === 'pad' ? C.plum : C.teal, !why && home.s.coins >= fare && !travel, () => travelTo(id), coinIcon)
+  })
+  if (why) text(why, box.x + box.w / 2, box.y + box.h - 12 * ui, 12 * ui, C.coral, 'center', 800, null)
+  buttons.push(box.close)
+}
+
+function drawTreePanel(spot: number) {
+  const tree = home.tree(spot)
+  const box = panelFrame(tree ? t.items[tree.fruit] : t.plantTree, 560, 420, C.leafDark)
+  const x = box.x + 18 * ui
+  const w = box.w - 36 * ui
+  if (tree) {
+    const cx = box.x + box.w * 0.3
+    const growth = home.treeGrowth(spot)
+    const ready = growth >= 1 && home.treeReady(spot)
+    drawFruitTree(ctx, tree.fruit, cx, box.y + box.h * 0.82, 200 * ui, growth, ready, clock)
+    const info = FRUITS[tree.fruit]
+    const tx = box.x + box.w * 0.58
+    const left = Math.max(0, Math.ceil((growth < 1 ? tree.grownAt : tree.readyAt) - home.clock))
+    const status = ready ? t.ready : growth < 1 ? `${t.growing} · ${Math.ceil(left / 60)} min` : `${t.fruitsIn} ${left} s`
+    text(status, tx, box.y + box.h * 0.25, 16 * ui, C.text, 'left', 900, null)
+    text(`${info.yield} × ${t.items[tree.fruit]} / ${Math.round(info.every / 60)} min`, tx, box.y + box.h * 0.36, 12 * ui, C.muted, 'left', 800, null)
+    if (ready) button(t.collect, tx, box.y + box.h * 0.5, 180 * ui, 44 * ui, C.teal, true, () => {
+      panel = null
+      interact({ kind: 'tree', spot })
+    })
+    sellButton('tree:' + spot, `${t.pullUp} · ${Math.floor(info.price * RESALE)}`, tx, box.y + box.h * 0.72, 180 * ui, 40 * ui, true, () => {
+      const coins = home.pullTree(spot)
+      if (coins) panel = null
+      return coins || false
+    })
+    buttons.push(box.close)
+    return
+  }
+  text(t.treeHelp, box.x + box.w / 2, box.y + 14 * ui, fitSize(t.treeHelp, w, 12 * ui, 800), C.muted, 'center', 800, null)
+  const fruits = Object.keys(FRUITS) as FruitId[]
+  const rowH = Math.min(80 * ui, (box.h - 40 * ui) / fruits.length)
+  fruits.forEach((fruit, i) => {
+    const info = FRUITS[fruit]
+    const y = box.y + 32 * ui + i * rowH
+    shopRow(x, y, w, rowH, () => drawFruit(ctx, fruit, x + rowH * 0.48, y + rowH * 0.42, rowH * 0.6), t.items[fruit], `${Math.round(info.grow / 60)} min · ${info.yield} / ${Math.round(info.every / 60)} min · ${ITEMS[fruit].price}`, info.level, info.price, () => {
+      const result = home.plantTree(spot, fruit)
+      if (result === 'ok') {
+        panel = null
+        const p = ORCHARD.spots[spot]
+        burst(p.x * TILE, p.y * TILE - 20, 20, ['#7bc950', '#ffe08a', '#fff'], 0.8)
+        rings.push({ x: p.x * TILE, y: p.y * TILE, life: 1, color: 'rgba(255, 245, 220, 0.9)' })
+      }
+      bought(result === 'busy' ? 'max' : result)
+    })
+  })
+  buttons.push(box.close)
+}
+
+let merchantTab = 0
+let merchantPage = 0
+
+function drawMerchantPanel() {
+  const box = panelFrame(t.merchant, 640, 490, C.sky)
+  const day = today()
+  // Tabs: sell your goods, buy goods, today's special and the decorations.
+  const tw = (box.w - 24 * ui) / t.merchantTabs.length
+  t.merchantTabs.forEach((label, i) => {
+    const x = box.x + 12 * ui + i * tw
+    const on = i === merchantTab
+    roundRect(ctx, x + 3 * ui, box.y + 8 * ui - (on ? 3 * ui : 0), tw - 6 * ui, 34 * ui, 17 * ui)
+    paint(ctx, on ? C.sky : C.paper2, 2)
+    text(label, x + tw / 2, box.y + 25 * ui - (on ? 3 * ui : 0), fitSize(label, tw - 14 * ui, 13 * ui, 900), on ? '#fff' : C.text, 'center', 900, on ? 'rgba(61,42,69,0.5)' : null)
+    buttons.push({ x, y: box.y + 8 * ui, w: tw, h: 34 * ui, enabled: true, action: () => ((merchantTab = i), (merchantPage = 0)) })
+  })
+  const x = box.x + 16 * ui
+  const w = box.w - 32 * ui
+  const top = box.y + 52 * ui
+  const bottom = box.y + box.h - 44 * ui
+  const pager = <T,>(list: T[], perPage: number): T[] => {
+    const pages = Math.max(1, Math.ceil(list.length / perPage))
+    merchantPage = Math.min(merchantPage, pages - 1)
+    if (pages > 1) {
+      const bw = 44 * ui
+      button('◀', x + w / 2 - bw - 50 * ui, bottom + 6 * ui, bw, 32 * ui, C.sky, merchantPage > 0, () => merchantPage--)
+      text(`${merchantPage + 1} / ${pages}`, x + w / 2, bottom + 20 * ui, 14 * ui, C.text, 'center', 900, null)
+      button('▶', x + w / 2 + 50 * ui, bottom + 6 * ui, bw, 32 * ui, C.sky, merchantPage < pages - 1, () => merchantPage++)
+    }
+    return list.slice(merchantPage * perPage, merchantPage * perPage + perPage)
+  }
+  const cell = 104 * ui
+  const cols = Math.max(1, Math.floor(w / cell))
+  if (merchantTab === 0) {
+    // Sell: everything in the barn, at its price (twice for today's special).
+    const wanted = home.merchantWants(day)
+    const items = (Object.keys(ITEMS) as ItemId[]).filter((id) => home.count(id) > 0)
+    const value = home.barnValue()
+    if (!items.length) text(t.emptyBarn, box.x + box.w / 2, box.y + box.h / 2, 15 * ui, C.muted, 'center', 800, null)
+    else sellButton('market-all', `${t.sellAll} · ${value}`, x + w - 200 * ui, top, 200 * ui, 36 * ui, value > 0, () => home.sellAll())
+    const rows = Math.max(1, Math.floor((bottom - top - 44 * ui) / (cell * 1.02)))
+    const x0 = x + (w - cols * cell) / 2
+    pager(items, cols * rows).forEach((id, i) => {
+      const cx = x0 + (i % cols) * cell
+      const cy = top + 44 * ui + Math.floor(i / cols) * cell * 1.02
+      slot(cx + 4, cy, cell - 8, cell)
+      drawItem(ctx, id, cx + cell / 2, cy + cell * 0.3, cell * 0.34)
+      text(`x${home.count(id)}`, cx + cell - 14 * ui, cy + 13 * ui, 13 * ui, C.text, 'right', 900, null)
+      const special = id === wanted && home.merchantLeft(day) > 0
+      if (special) text('×2', cx + 18 * ui, cy + 13 * ui, 12 * ui, C.coral, 'center', 900, null)
+      button(`${t.sell} ${ITEMS[id].price * (special ? 2 : 1)}`, cx + 11 * ui, cy + cell * 0.62, cell - 22 * ui, cell * 0.3, special ? C.coral : C.gold, true, () => {
+        const coins = special ? home.sellToMerchant(day, 1) : home.sell(id, 1)
+        if (coins) {
+          flyCoins(cx + cell / 2, cy + cell * 0.6, coins)
+          sound.coin()
+          changed()
+        }
+      })
+    })
+  } else if (merchantTab === 1) {
+    // Buy: goods you can make (or have made), at twice their price.
+    const goods = (Object.keys(ITEMS) as ItemId[]).filter((id) => ITEMS[id].level <= home.level || home.producible().includes(id))
+    const rows = Math.max(1, Math.floor((bottom - top) / (cell * 1.02)))
+    const x0 = x + (w - cols * cell) / 2
+    pager(goods, cols * rows).forEach((id, i) => {
+      const cx = x0 + (i % cols) * cell
+      const cy = top + Math.floor(i / cols) * cell * 1.02
+      slot(cx + 4, cy, cell - 8, cell)
+      drawItem(ctx, id, cx + cell / 2, cy + cell * 0.3, cell * 0.34)
+      if (home.count(id)) text(`x${home.count(id)}`, cx + cell - 14 * ui, cy + 13 * ui, 12 * ui, C.muted, 'right', 900, null)
+      const price = home.buyPrice(id)
+      coinButton(price, cx + 11 * ui, cy + cell * 0.62, cell - 22 * ui, cell * 0.3, C.teal, home.s.coins >= price, () => {
+        const result = home.buyGoods(id, 1)
+        if (result === 'ok') {
+          flyToBarn(id, farmer.x, farmer.y - 40, 1)
+          sound.buy()
+          changed()
+        } else if (result === 'full') barnFull(farmer.x, farmer.y - 60)
+        else sound.denied()
+      })
+    })
+  } else {
+    // Today's special, and the decorations only sold here.
+    const wanted = home.merchantWants(day)
+    const left = home.merchantLeft(day)
+    drawMerchant(ctx, x + 46 * ui, top + 130 * ui, 100 * ui, clock)
+    const tx = x + 104 * ui
+    text(t.merchantHello, tx, top + 10 * ui, fitSize(t.merchantHello, w - 110 * ui, 13 * ui, 800), C.text, 'left', 800, null)
+    slot(tx, top + 24 * ui, w - 104 * ui, 88 * ui)
+    drawItem(ctx, wanted, tx + 40 * ui, top + 64 * ui, 46 * ui)
+    const label = `${t.items[wanted]} · ${ITEMS[wanted].price * 2} (×2)`
+    text(label, tx + 80 * ui, top + 48 * ui, fitSize(label, w - 210 * ui, 15 * ui, 900), C.text, 'left', 900, null)
+    text(left > 0 ? `x${home.count(wanted)} · ${left} / ${MERCHANT_MAX}` : t.merchantDone, tx + 80 * ui, top + 70 * ui, 12 * ui, C.muted, 'left', 800, null)
+    const have = Math.min(home.count(wanted), left)
+    button(t.sellAll, tx + 80 * ui, top + 80 * ui, 130 * ui, 28 * ui, C.coral, have >= 1, () => {
+      const coins = home.sellToMerchant(day, have)
+      if (coins) {
+        flyCoins(tx + 140 * ui, top + 90 * ui, coins)
+        sound.buy()
+        changed()
+      }
+    })
+    text(t.exclusives, x, top + 134 * ui, fitSize(t.exclusives, w, 13 * ui, 800), C.text, 'left', 800, null)
+    const kinds = (Object.keys(DECORS) as DecorKind[]).filter((k) => DECORS[k].where === 'market')
+    const cw = w / kinds.length
+    const cy = top + 148 * ui
+    const ch = Math.min(150 * ui, box.y + box.h - cy - 10 * ui)
+    kinds.forEach((kind, i) => {
+      const cx = x + i * cw
+      slot(cx + 5 * ui, cy, cw - 10 * ui, ch)
+      ctx.save()
+      ctx.translate(cx + cw / 2, cy + ch * 0.5)
+      ctx.scale(ui * 0.9, ui * 0.9)
+      drawDecor(ctx, kind, 0, 0, clock)
+      ctx.restore()
+      text(t.decors[kind] + (home.stockOf(kind) ? ` · x${home.stockOf(kind)}` : ''), cx + cw / 2, cy + ch * 0.6, fitSize(t.decors[kind], cw - 20 * ui, 12 * ui, 900), C.text, 'center', 900, null)
+      const info = DECORS[kind]
+      if (home.level < info.level) text('🔒 ' + t.levelNeeded + ' ' + info.level, cx + cw / 2, cy + ch * 0.8, 12 * ui, C.muted, 'center', 800, null)
+      else coinButton(info.price, cx + cw * 0.17, cy + ch * 0.7, cw * 0.66, 32 * ui, C.gold, home.s.coins >= info.price, () => bought(home.buyStock(kind)))
+    })
+  }
+  buttons.push(box.close)
+}
+
+let stallDraft: { item: ItemId | null; count: number; price: number } = { item: null, count: 1, price: 0 }
+
+function drawStallPanel() {
+  const box = panelFrame(t.myStall, 620, 480, C.gold)
+  const x = box.x + 18 * ui
+  const w = box.w - 36 * ui
+  text(t.stallHelp, box.x + box.w / 2, box.y + 12 * ui, fitSize(t.stallHelp, w, 12 * ui, 800), C.muted, 'center', 800, null)
+  // Current offers.
+  const rowH = 46 * ui
+  for (let i = 0; i < STALL_OFFERS; i++) {
+    const y = box.y + 28 * ui + i * rowH
+    slot(x, y, w, rowH - 6 * ui, home.s.stall[i] ? C.paper2 : '#f3ede4')
+    const o = home.s.stall[i]
+    const mid = y + (rowH - 6 * ui) / 2
+    if (!o) {
+      text('—', x + 24 * ui, mid, 14 * ui, C.muted, 'center', 900, null)
+      continue
+    }
+    drawItem(ctx, o.item, x + 24 * ui, mid, 26 * ui)
+    text(`${o.count} × ${t.items[o.item]} · ${o.price}`, x + 46 * ui, mid, fitSize(`${o.count} × ${t.items[o.item]} · ${o.price}`, w - 180 * ui, 14 * ui, 900), C.text, 'left', 900, null)
+    drawCoin(ctx, x + w - 150 * ui, mid, 7 * ui)
+    button(t.removeOffer, x + w - 120 * ui, mid - 15 * ui, 110 * ui, 30 * ui, '#a99bb0', true, () => {
+      home.removeOffer(i)
+      sound.plant()
+      changed()
+    })
+  }
+  // A new offer: pick goods, how many, the price.
+  const y0 = box.y + 28 * ui + STALL_OFFERS * rowH + 8 * ui
+  const items = (Object.keys(ITEMS) as ItemId[]).filter((id) => home.count(id) > 0)
+  if (stallDraft.item && home.count(stallDraft.item) <= 0) stallDraft = { item: null, count: 1, price: 0 }
+  const cell = 46 * ui
+  const cols = Math.max(1, Math.floor(w / cell))
+  items.slice(0, cols * 2).forEach((id, i) => {
+    const cx = x + (i % cols) * cell
+    const cy = y0 + Math.floor(i / cols) * cell
+    const on = stallDraft.item === id
+    roundRect(ctx, cx + 2, cy + 2, cell - 4, cell - 4, 10 * ui)
+    paint(ctx, on ? '#ffe7a0' : C.paper2, 1.5)
+    drawItem(ctx, id, cx + cell / 2, cy + cell / 2, cell * 0.55)
+    buttons.push({ x: cx, y: cy, w: cell, h: cell, enabled: true, action: () => (stallDraft = { item: id, count: 1, price: ITEMS[id].price }) })
+  })
+  if (!items.length) text(t.emptyBarn, box.x + box.w / 2, y0 + 30 * ui, 13 * ui, C.muted, 'center', 800, null)
+  const yb = y0 + cell * 2 + 10 * ui
+  const d = stallDraft
+  if (d.item) {
+    const maxCount = Math.min(STALL_MAX, home.count(d.item))
+    const step = (label: string, value: number, bx: number, change: (v: number) => void, min: number, max: number) => {
+      text(label, bx + 70 * ui, yb, 11 * ui, C.muted, 'center', 800, null)
+      button('−', bx, yb + 10 * ui, 36 * ui, 32 * ui, C.sky, value > min, () => change(Math.max(min, value - (label === t.unitPrice && value > 20 ? 5 : 1))))
+      text(String(value), bx + 70 * ui, yb + 26 * ui, 16 * ui, C.text, 'center', 900, null)
+      button('+', bx + 104 * ui, yb + 10 * ui, 36 * ui, 32 * ui, C.sky, value < max, () => change(Math.min(max, value + (label === t.unitPrice && value >= 20 ? 5 : 1))))
+    }
+    step('×', d.count, x, (v) => (stallDraft = { ...d, count: v }), 1, maxCount)
+    step(t.unitPrice, d.price, x + 160 * ui, (v) => (stallDraft = { ...d, price: v }), 1, 9999)
+    const full = home.s.stall.length >= STALL_OFFERS && !home.s.stall.some((o) => o.item === d.item && o.price === d.price)
+    button(full ? t.stallFull : t.addOffer, x + w - 180 * ui, yb + 6 * ui, 180 * ui, 40 * ui, C.teal, !full, () => {
+      if (d.item && home.addOffer(d.item, d.count, d.price) === 'ok') {
+        sound.buy()
+        stallDraft = { item: null, count: 1, price: 0 }
+        persist()
+      } else sound.denied()
+    })
+  }
+  if (!marketRoom) text(play.canJoinRooms ? t.marketEmpty : t.onlineUnavailable, box.x + box.w / 2, box.y + box.h - 12 * ui, 11 * ui, C.muted, 'center', 800, null)
+  buttons.push(box.close)
+}
+
+/** Another player at the market: their stall. */
+function drawSellerPanel(id: string) {
+  const s = shoppers.get(id)
+  if (!s) {
+    panel = null
+    return
+  }
+  const box = panelFrame(`${t.stallOf} ${clip(s.name, 16)}`, 560, 380, C.gold)
+  const x = box.x + 18 * ui
+  const w = box.w - 36 * ui
+  drawFarmer(ctx, s.look, x + 50 * ui, box.y + box.h * 0.7, 120 * ui, clock, 1, false)
+  const tx = x + 110 * ui
+  const tw = w - 110 * ui
+  if (!s.offers.length) text(t.noOffers, tx + tw / 2, box.y + box.h / 2, 14 * ui, C.muted, 'center', 800, null)
+  const rowH = Math.min(80 * ui, (box.h - 70 * ui) / 3)
+  s.offers.forEach((o, i) => {
+    const y = box.y + 12 * ui + i * rowH
+    slot(tx, y, tw, rowH - 8 * ui)
+    const mid = y + (rowH - 8 * ui) / 2
+    drawItem(ctx, o.i, tx + 30 * ui, mid, 34 * ui)
+    text(`${o.c} × ${t.items[o.i]}`, tx + 58 * ui, mid - 9 * ui, fitSize(`${o.c} × ${t.items[o.i]}`, tw - 230 * ui, 14 * ui, 900), C.text, 'left', 900, null)
+    text(`${o.p} / 1`, tx + 58 * ui, mid + 11 * ui, 12 * ui, C.goldDark, 'left', 900, null)
+    const busy = pendingBuys.size > 0
+    coinButton(o.p, tx + tw - 200 * ui, mid - 16 * ui, 90 * ui, 32 * ui, C.teal, !busy && home.s.coins >= o.p, () => buyFrom(id, o, 1))
+    button(`× ${o.c}`, tx + tw - 102 * ui, mid - 16 * ui, 92 * ui, 32 * ui, C.coral, !busy && o.c > 1 && home.s.coins >= o.p * o.c, () => buyFrom(id, o, o.c))
+  })
+  const room = marketRoom
+  button('👋 ' + t.wave, x, box.y + box.h - 50 * ui, 100 * ui, 38 * ui, C.sky, !!room, () => {
+    if (room) safely(() => room.send({ type: 'wave' }, id))
+    myEmote = { text: '👋 ' + t.hello, life: 2.5 }
+  })
+  buttons.push(box.close)
+}
+
+function drawKeeperPanel() {
+  const box = panelFrame(t.keeper, 600, 460, C.plum)
+  const x = box.x + 18 * ui
+  const w = box.w - 36 * ui
+  drawKeeper(ctx, x + 60 * ui, box.y + box.h * 0.62, 150 * ui, clock)
+  const tx = x + 130 * ui
+  const tw = w - 130 * ui
+  const r = home.ruins
+  const day = today()
+  if (r.quest >= RUIN_QUESTS.length) {
+    text(t.starKeeper, tx, box.y + 26 * ui, 16 * ui, C.plumDark, 'left', 900, null)
+    wrap(t.questsDone, tw, 13 * ui).forEach((line, i) => text(line, tx, box.y + 56 * ui + i * 18 * ui, 13 * ui, C.text, 'left', 700, null))
+    slot(tx, box.y + 120 * ui, tw, 96 * ui)
+    drawCrystal(ctx, 'crystalPink', tx + 40 * ui, box.y + 168 * ui, 50 * ui, clock)
+    text(t.dailyOffering, tx + 80 * ui, box.y + 150 * ui, fitSize(t.dailyOffering, tw - 90 * ui, 13 * ui, 900), C.text, 'left', 900, null)
+    text(r.offeringDay === day ? t.offeringDone : `x${home.count('crystalPink')} · +300`, tx + 80 * ui, box.y + 172 * ui, 12 * ui, C.muted, 'left', 800, null)
+    button(t.handIn, tx + 80 * ui, box.y + 184 * ui, 130 * ui, 28 * ui, C.plum, home.canOffer(day), () => {
+      const coins = home.offer(day)
+      if (coins) {
+        flyCoins(width / 2, height / 2, coins)
+        sound.order()
+        persist()
+      }
+    })
+    if (home.stockOf('starshard')) text(t.shardReady, tx, box.y + box.h - 16 * ui, fitSize(t.shardReady, tw, 11 * ui, 800), C.muted, 'left', 800, null)
+    buttons.push(box.close)
+    return
+  }
+  const quest = RUIN_QUESTS[r.quest]
+  text(`${r.quest + 1}/${RUIN_QUESTS.length} · ${t.questNames[quest.id]}`, tx, box.y + 24 * ui, fitSize(t.questNames[quest.id], tw, 16 * ui, 900), C.plumDark, 'left', 900, null)
+  wrap(t.questText[quest.id], tw, 13 * ui).forEach((line, i) => text(line, tx, box.y + 54 * ui + i * 19 * ui, 13 * ui, C.text, 'left', 700, null))
+  const p = home.questProgress()
+  const by = box.y + box.h - 120 * ui
+  roundRect(ctx, tx, by, tw, 14 * ui, 7 * ui)
+  paint(ctx, '#e8e0f5', 1.5)
+  roundRect(ctx, tx, by, tw * Math.min(1, p.have / p.need), 14 * ui, 7 * ui)
+  paint(ctx, C.plum)
+  text(`${p.have} / ${p.need}`, tx + tw / 2, by + 26 * ui, 12 * ui, C.text, 'center', 900, null)
+  if (r.quest === 4 && light.night < 0.5) text(t.stardustNight, tx + tw / 2, by - 12 * ui, 11 * ui, C.coral, 'center', 800, null)
+  text(`${t.reward} : ${quest.coins}`, tx, box.y + box.h - 56 * ui + 14 * ui, 13 * ui, C.goldDark, 'left', 900, null)
+  button(r.quest === 4 ? '★ ' + t.handIn : t.handIn, tx + tw - 160 * ui, box.y + box.h - 62 * ui, 160 * ui, 44 * ui, C.plum, home.canHandIn() && r.quest !== 4, () => handInQuest({ x: RUINS.keeper.x * TILE, y: RUINS.keeper.y * TILE }))
+  buttons.push(box.close)
 }
 
 // --- interface -------------------------------------------------------------------------------
@@ -2525,6 +4153,35 @@ function drawHud() {
   ellipse(ctx, 0, 0, gr * 0.2, gr * 0.2, C.paper)
   ctx.restore()
   buttons.push({ x: gx - gr, y: gy - gr, w: gr * 2, h: gr * 2, enabled: true, action: () => (panel = 'settings') })
+  // Energy.
+  const ex = gx + gr + 8 * ui
+  const ew = 112 * ui
+  const eh = 22 * ui
+  const e = home.energy / ENERGY.max
+  const low = e < 0.2
+  card(ex, gy - eh / 2, ew, eh, eh / 2, C.paper, 2)
+  ctx.beginPath()
+  const bx = ex + 13 * ui
+  const by = gy
+  ctx.moveTo(bx + 2 * ui, by - 7 * ui)
+  ctx.lineTo(bx - 4 * ui, by + 1 * ui)
+  ctx.lineTo(bx, by + 1 * ui)
+  ctx.lineTo(bx - 2 * ui, by + 7 * ui)
+  ctx.lineTo(bx + 4 * ui, by - 1 * ui)
+  ctx.lineTo(bx, by - 1 * ui)
+  ctx.closePath()
+  paint(ctx, low ? C.coral : C.gold, 1.2)
+  const barX = ex + 24 * ui
+  const barW = ew - 58 * ui
+  roundRect(ctx, barX, gy - 4 * ui, barW, 8 * ui, 4 * ui)
+  paint(ctx, '#eadfce', 1.2)
+  const pulse = low ? 0.6 + 0.4 * Math.sin(clock * 6) : 1
+  ctx.globalAlpha = pulse
+  roundRect(ctx, barX, gy - 4 * ui, barW * Math.max(0.04, e), 8 * ui, 4 * ui)
+  paint(ctx, e > 0.5 ? '#7fcf5a' : e > 0.2 ? C.gold : C.coral)
+  ctx.globalAlpha = 1
+  text(String(Math.floor(home.energy)), ex + ew - 10 * ui, gy, 11 * ui, C.text, 'right', 900, null)
+  buttons.push({ x: ex, y: gy - eh / 2, w: ew, h: eh, enabled: true, action: () => (toast = { title: `⚡ ${Math.floor(home.energy)} / ${ENERGY.max}`, text: t.energyHelp, life: 3.5 }) })
   // Coins, counting up and down.
   if (shownCoins < 0) shownCoins = home.s.coins
   shownCoins += (home.s.coins - shownCoins) * Math.min(1, 0.15 + Math.abs(home.s.coins - shownCoins) * 0.0005)
@@ -2547,6 +4204,36 @@ function drawHud() {
     text(on ? `${count} ${t.online}` : t.offline, width - 26 * ui, oy + 13 * ui, 13 * ui, C.text, 'right', 900, null)
     buttons.push({ x: width - 146 * ui, y: oy, w: 130 * ui, h: 26 * ui, enabled: true, action: () => (panel = on ? 'online' : 'settings') })
   }
+  drawClock(width - 146 * ui, ly + (play.canJoinRooms ? 76 : 44) * ui)
+}
+
+/** The time of day: the sun or the moon, and the hour (tap: settings). */
+function drawClock(x: number, y: number) {
+  const w = 130 * ui
+  const h = 26 * ui
+  const night = light.night > 0.5
+  card(x, y, w, h, h / 2, night ? '#3b3a72' : C.paper, 2)
+  const cx = x + 16 * ui
+  const cy = y + h / 2
+  if (night) {
+    ellipse(ctx, cx, cy, 7 * ui, 7 * ui, '#fff6dc')
+    ellipse(ctx, cx + 3.5 * ui, cy - 2 * ui, 6 * ui, 6 * ui, '#3b3a72')
+  } else {
+    ctx.save()
+    ctx.translate(cx, cy)
+    ctx.rotate(clock * 0.5)
+    ctx.fillStyle = C.gold
+    for (let i = 0; i < 8; i++) {
+      ctx.rotate(Math.PI / 4)
+      ctx.fillRect(-1 * ui, 6 * ui, 2 * ui, 3 * ui)
+    }
+    ctx.restore()
+    ellipse(ctx, cx, cy, 5.5 * ui, 5.5 * ui, C.gold, 0, 1.5)
+  }
+  const fast = clockMode() === 'fast'
+  text(formatHour(light.hour), x + w - 12 * ui, cy, 14 * ui, night ? '#fff6dc' : C.text, 'right', 900, null)
+  if (fast) text('×60', x + 34 * ui, cy, 10 * ui, night ? '#c9c2ff' : C.muted, 'left', 900, null)
+  buttons.push({ x, y, w, h, enabled: true, action: () => (panel = 'settings') })
 }
 
 function drawSeedBar() {
@@ -2699,27 +4386,185 @@ function slot(x: number, y: number, w: number, h: number, color: string = C.pape
   paint(ctx, color, 1.5)
 }
 
-function drawBarnPanel() {
-  const box = panelFrame(`${t.barn} · ${farm.used()}/${farm.capacity()}`, 560, 430, C.teal)
-  const items = (Object.keys(ITEMS) as ItemId[]).filter((id) => farm.count(id) > 0)
-  if (!items.length) text(t.emptyBarn, box.x + box.w / 2, box.y + box.h / 2, 15 * ui, C.muted, 'center', 800, null)
-  const cell = 98 * ui
-  const cols = Math.max(1, Math.floor((box.w - 20 * ui) / cell))
-  const x0 = box.x + (box.w - cols * cell) / 2
-  items.forEach((id, i) => {
-    const x = x0 + (i % cols) * cell
-    const y = box.y + 10 * ui + Math.floor(i / cols) * cell * 1.08
-    slot(x + 4, y, cell - 8, cell)
-    drawItem(ctx, id, x + cell / 2, y + cell * 0.3 + Math.sin(clock * 2 + i) * 1.5, cell * 0.36)
-    text(`x${farm.count(id)}`, x + cell - 14 * ui, y + 13 * ui, 13 * ui, C.text, 'right', 900, null)
-    button(`${t.sell} ${ITEMS[id].price}`, x + 12 * ui, y + cell * 0.62, cell - 24 * ui, cell * 0.3, C.gold, true, () => {
-      const coins = farm.sell(id, 1)
-      if (coins) {
-        flyCoins(x + cell / 2, y + cell * 0.6, coins)
-        changed()
-      }
-    })
+let barnTab = 0
+let barnPage = 0
+/** A sale waiting for a second tap ("Sure?"), for a few seconds. */
+let confirmSale: { key: string; until: number } | null = null
+
+/** A button that asks once before selling: the first tap arms it, the second one sells. */
+function sellButton(key: string, label: string, x: number, y: number, w: number, h: number, enabled: boolean, sell: () => number | false) {
+  const armed = !!confirmSale && confirmSale.key === key && clock < confirmSale.until
+  button(armed ? t.sure : label, x, y, w, h, armed ? C.coral : C.gold, enabled, () => {
+    if (!armed) {
+      confirmSale = { key, until: clock + 3 }
+      sound.plant()
+      return
+    }
+    confirmSale = null
+    const coins = sell()
+    if (coins === false || (coins === 0 && key !== 'worker:' + key.split(':')[1])) {
+      sound.denied()
+      return
+    }
+    if (coins > 0) flyCoins(x + w / 2, y, coins)
+    burst(x + w / 2, y, 16, ['#ffd54a', '#ffe08a', '#fff'], 0.8, true, true)
+    sound.buy()
+    persist()
   })
+}
+
+/** Pages of rows: ◀ 1/3 ▶ under a list. Returns the rows of the current page. */
+function paged<T>(list: T[], perPage: number, x: number, y: number, w: number): T[] {
+  const pages = Math.max(1, Math.ceil(list.length / perPage))
+  barnPage = Math.min(barnPage, pages - 1)
+  if (pages > 1) {
+    const bw = 44 * ui
+    button('◀', x + w / 2 - bw - 50 * ui, y, bw, 32 * ui, C.sky, barnPage > 0, () => barnPage--)
+    text(`${barnPage + 1} / ${pages}`, x + w / 2, y + 14 * ui, 14 * ui, C.text, 'center', 900, null)
+    button('▶', x + w / 2 + 50 * ui, y, bw, 32 * ui, C.sky, barnPage < pages - 1, () => barnPage++)
+  }
+  return list.slice(barnPage * perPage, barnPage * perPage + perPage)
+}
+
+/** A row of the barn's "own" tabs: icon, name, help, buttons. */
+function ownRow(x: number, y: number, w: number, h: number, icon: () => void, name: string, help: string) {
+  slot(x, y, w, h - 6 * ui)
+  icon()
+  const mid = y + (h - 6 * ui) / 2
+  const textW = w - h * 1.05 - 230 * ui
+  text(name, x + h * 1.05, mid - 9 * ui, fitSize(name, textW, 14 * ui, 900), C.text, 'left', 900, null)
+  text(help, x + h * 1.05, mid + 10 * ui, fitSize(help, textW, 11 * ui, 700), C.muted, 'left', 700, null)
+  return mid
+}
+
+function drawBarnPanel() {
+  const box = panelFrame(`${t.barn} · ${farm.used()}/${farm.capacity()}`, 640, 470, C.teal)
+  // Tabs.
+  const tw = (box.w - 24 * ui) / t.barnTabs.length
+  t.barnTabs.forEach((label, i) => {
+    const x = box.x + 12 * ui + i * tw
+    const on = i === barnTab
+    roundRect(ctx, x + 3 * ui, box.y + 8 * ui - (on ? 3 * ui : 0), tw - 6 * ui, 34 * ui, 17 * ui)
+    paint(ctx, on ? C.teal : C.paper2, 2)
+    text(label, x + tw / 2, box.y + 25 * ui - (on ? 3 * ui : 0), fitSize(label, tw - 14 * ui, 13 * ui, 900), on ? '#fff' : C.text, 'center', 900, on ? 'rgba(61,42,69,0.5)' : null)
+    buttons.push({ x, y: box.y + 8 * ui, w: tw, h: 34 * ui, enabled: true, action: () => ((barnTab = i), (barnPage = 0)) })
+  })
+  const x = box.x + 16 * ui
+  const w = box.w - 32 * ui
+  const top = box.y + 52 * ui
+  const bottom = box.y + box.h - 44 * ui
+  const rowH = Math.min(70 * ui, (bottom - top) / 4)
+  const perPage = Math.max(1, Math.floor((bottom - top) / rowH))
+  const pagerY = bottom + 6 * ui
+  if (barnTab === 0) {
+    // Goods: sell one at a time, or everything.
+    const items = (Object.keys(ITEMS) as ItemId[]).filter((id) => farm.count(id) > 0)
+    const value = farm.barnValue()
+    if (!items.length) text(t.emptyBarn, box.x + box.w / 2, box.y + box.h / 2, 15 * ui, C.muted, 'center', 800, null)
+    // Goods are sold at the market island.
+    text(`${t.sellAtMarket} · ${value}`, x, top + 18 * ui, fitSize(`${t.sellAtMarket} · ${value}`, w - 230 * ui, 13 * ui, 800), C.muted, 'left', 800, null)
+    button('🛒 ' + t.goToMarket, x + w - 210 * ui, top, 210 * ui, 36 * ui, C.teal, scene !== 'market', () => (scene === 'home' ? (panel = { travel: 'dock' }) : travelTo('market')))
+    const cell = 92 * ui
+    const cols = Math.max(1, Math.floor(w / cell))
+    const rows = Math.max(1, Math.floor((bottom - top - 44 * ui) / (cell * 1.04)))
+    const x0 = x + (w - cols * cell) / 2
+    paged(items, cols * rows, x, pagerY, w).forEach((id, i) => {
+      const cx = x0 + (i % cols) * cell
+      const cy = top + 44 * ui + Math.floor(i / cols) * cell * 1.04
+      slot(cx + 4, cy, cell - 8, cell)
+      drawItem(ctx, id, cx + cell / 2, cy + cell * 0.3 + Math.sin(clock * 2 + i) * 1.5, cell * 0.36)
+      text(`x${farm.count(id)}`, cx + cell - 14 * ui, cy + 13 * ui, 13 * ui, C.text, 'right', 900, null)
+      drawCoin(ctx, cx + cell * 0.36, cy + cell * 0.76, 7 * ui)
+      text(String(ITEMS[id].price), cx + cell * 0.46, cy + cell * 0.76, 12 * ui, C.goldDark, 'left', 900, null)
+    })
+  } else if (barnTab === 1) {
+    // Animals: one more, one less.
+    const pens = PLACES.filter((p) => p.kind === 'pen' && farm.usable(p))
+    if (!pens.length) text(t.noAnimals, box.x + box.w / 2, box.y + box.h / 2, 15 * ui, C.muted, 'center', 800, null)
+    paged(pens, perPage, x, pagerY, w).forEach((place, i) => {
+      const y = top + i * rowH
+      const n = farm.penAnimals(place)
+      const max = farm.penAnimalsMax(place)
+      const price = ANIMAL_PRICES[place.animal!]
+      const mid = ownRow(x, y, w, rowH, () => drawAnimal(ctx, place.animal!, x + rowH * 0.5, y + rowH * 0.5, rowH * 0.62, clock + i, 1, false), `${placeName(place)} · ${n}/${max}`, `${t.items[PENS[place.animal!].product.item]} : ${farm.penProduct(place).count} · ${t.resale} ${Math.floor(price * RESALE)}`)
+      const bw = 104 * ui
+      const bh = 34 * ui
+      sellButton(`animal:${place.id}`, `− ${Math.floor(price * RESALE)}`, x + w - bw * 2 - 18 * ui, mid - bh / 2, bw, bh, n > 1, () => farm.sellAnimal(place))
+      coinButton(price, x + w - bw - 10 * ui, mid - bh / 2, bw, bh, C.teal, n < max && farm.s.coins >= price, () => {
+        const result = farm.buyAnimal(place)
+        bought(result)
+      })
+    })
+  } else if (barnTab === 2) {
+    // Buildings, land, machines and decorations.
+    type Own = { key: string; icon: () => void; name: string; coins: number; can: boolean; sell: () => number }
+    const own: Own[] = []
+    for (const place of PLACES) {
+      if (!farm.canSellPlace(place)) continue
+      own.push({
+        key: 'place:' + place.id,
+        icon: () => {},
+        name: placeName(place),
+        coins: farm.placeResale(place),
+        can: true,
+        sell: () => {
+          delete walkers[place.id]
+          return farm.sellPlace(place)
+        },
+      })
+    }
+    for (const zone of ZONES) if (farm.owns(zone.id)) own.push({ key: 'zone:' + zone.id, icon: () => {}, name: t.zones[zone.id], coins: Math.floor(zone.price * RESALE), can: farm.canSellZone(zone), sell: () => farm.sellZone(zone) })
+    for (const id of ['tractor', 'truck'] as MachineId[]) if (farm.s.machines[id]) own.push({ key: 'machine:' + id, icon: () => {}, name: t.machines[id], coins: Math.floor(MACHINES[id].price * RESALE), can: farm.canSellMachine(id), sell: () => farm.sellMachine(id) })
+    farm.s.decor.forEach((d, index) => own.push({ key: `decor:${index}:${d.kind}`, icon: () => {}, name: t.decors[d.kind], coins: Math.floor(DECORS[d.kind].price * RESALE), can: true, sell: () => farm.sellDecor(index) }))
+    if (!own.length) text(t.nothingToSell, box.x + box.w / 2, box.y + box.h / 2, 15 * ui, C.muted, 'center', 800, null)
+    paged(own, perPage, x, pagerY, w).forEach((o, i) => {
+      const y = top + i * rowH
+      const [kind, id] = o.key.split(':')
+      const s = rowH * 0.62
+      const icon = () => {
+        const cx = x + rowH * 0.5
+        const cy = y + rowH * 0.5
+        if (kind === 'place') {
+          const place = PLACES.find((p) => p.id === id)!
+          if (place.kind === 'pen') drawAnimal(ctx, place.animal!, cx, cy, s, clock, 1, false)
+          else if (place.kind === 'workshop') drawWorkshop(ctx, place.workshop!, cx - s * 0.5, cy - s * 0.55, s, s, clock, false)
+          else drawPlot(ctx, cx, cy, s * 0.8, 0, false)
+        } else if (kind === 'zone') {
+          ctx.save()
+          roundRect(ctx, cx - s / 2, cy - s / 2, s, s, 8 * ui)
+          ctx.clip()
+          drawForest(ctx, cx - s / 2, cy - s / 2, s, s, clock)
+          ctx.restore()
+        } else if (kind === 'machine') {
+          if (id === 'tractor') drawTractor(ctx, cx, cy + s * 0.35, s * 0.9, 1, clock, false)
+          else drawTruck(ctx, cx, cy + s * 0.35, s * 0.9, 1, clock, false, false)
+        } else {
+          ctx.save()
+          ctx.translate(cx, cy + s * 0.3)
+          ctx.scale(s / 70, s / 70)
+          drawDecor(ctx, o.key.split(':')[2], 0, 0, clock)
+          ctx.restore()
+        }
+      }
+      const mid = ownRow(x, y, w, rowH, icon, o.name, o.can ? `${t.resale} ${o.coins}` : t.sellFieldsFirst)
+      sellButton(o.key, `${t.sell} · ${o.coins}`, x + w - 150 * ui, mid - 17 * ui, 140 * ui, 34 * ui, o.can, o.sell)
+    })
+  } else {
+    // Workers.
+    const hired = WORKER_IDS.filter((id) => farm.workerActive(id))
+    if (!hired.length) text(t.noWorkers, box.x + box.w / 2, box.y + box.h / 2, 15 * ui, C.muted, 'center', 800, null)
+    paged(hired, perPage, x, pagerY, w).forEach((id, i) => {
+      const y = top + i * rowH
+      const left = farm.workerLeft(id)
+      const coins = farm.workerResale(id)
+      const owed = farm.wageOwed(id)
+      const forever = farm.s.workers[id].forever
+      const help = Number.isFinite(left) ? `${Math.ceil(left / 60)} min · ${t.resale} ${coins}` : `${WAGES[id]}${t.perHour} · ${t.owed} ${owed} / ${farm.wageLimit(id)}${farm.workerWorking(id) ? '' : ' · ' + t.waitsPay}`
+      const mid = ownRow(x, y, w, rowH, () => drawFarmer(ctx, WORKER_LOOK[id], x + rowH * 0.5, y + rowH * 0.86, rowH * 0.66, clock + i, 1, false), t.workers[id], help)
+      if (forever) coinButton(owed, x + w - 270 * ui, mid - 17 * ui, 104 * ui, 34 * ui, farm.workerWorking(id) ? C.teal : C.coral, owed > 0 && farm.s.coins >= owed, () => payWorker(id, x + w - 220 * ui, mid))
+      sellButton('worker:' + id, `${t.fire} · ${Math.max(0, coins - owed)}`, x + w - 160 * ui, mid - 17 * ui, 150 * ui, 34 * ui, true, () => (farm.workerActive(id) ? farm.fireWorker(id) : false))
+    })
+  }
   buttons.push(box.close)
 }
 
@@ -2855,7 +4700,7 @@ function workerRow(id: WorkerId, x: number, y: number, w: number, h: number) {
   else {
     const atMax = left + WORKER.duration > WORKER.maxAhead
     text(t.forHire, bx1 + bw / 2, mid - 24 * ui, 11 * ui, C.muted, 'center', 900, null)
-    text(t.forever, bx2 + bw / 2, mid - 24 * ui, 11 * ui, C.muted, 'center', 900, null)
+    text(`${t.forever} · ${WAGES[id]}${t.perHour}`, bx2 + bw / 2, mid - 24 * ui, 11 * ui, C.muted, 'center', 900, null)
     if (atMax) text(t.max, bx1 + bw / 2, mid + 4 * ui, 14 * ui, '#4f9e3a', 'center', 900, null)
     else
       coinButton(info.price, bx1, mid - bh / 2 + 5 * ui, bw, bh, C.gold, farm.s.coins >= info.price, () => {
@@ -2951,6 +4796,14 @@ function drawShopPanel() {
       }, t.machines[id], t.machineHelp[id], MACHINES[id].level, farm.s.machines[id] ? null : MACHINES[id].price, () => bought(farm.buyMachine(id)))
       y += rowH
     }
+    for (const id of ['ferry', 'balloon'] as TransportId[]) {
+      const iy = y
+      shopRow(x, y, w, rowH, () => {
+        if (id === 'ferry') drawFerry(ctx, x + rowH * 0.45, iy + rowH * 0.5, rowH * 0.7, clock)
+        else drawBalloon(ctx, x + rowH * 0.45, iy + rowH * 0.85, rowH * 0.55, clock)
+      }, t.transports[id], t.transportHelp[id], TRANSPORT[id].level, farm.s.transport[id] ? null : TRANSPORT[id].price, () => bought(farm.buyTransport(id)))
+      y += rowH
+    }
   } else if (shopTab === 3) {
     for (const id of UPGRADE_IDS) {
       const uy = y
@@ -2970,10 +4823,11 @@ function drawShopPanel() {
   } else if (shopTab === 5) {
     drawCoinsTab(x, y, w, box.h - 64 * ui)
   } else {
-    const kinds = Object.keys(DECORS) as DecorKind[]
+    // Decorations of the shop, then those of your stock (merchant, rewards) to place for free.
+    const kinds = (Object.keys(DECORS) as DecorKind[]).filter((k) => !DECORS[k].where || farm.stockOf(k) > 0)
     const cols = 3
     const cw = w / cols
-    const ch = Math.min(134 * ui, (box.h - 70 * ui) / 2)
+    const ch = Math.min(134 * ui, (box.h - 70 * ui) / Math.ceil(kinds.length / cols))
     kinds.forEach((kind, i) => {
       const cx = x + (i % cols) * cw
       const cy = y + Math.floor(i / cols) * ch
@@ -2987,13 +4841,20 @@ function drawShopPanel() {
       const info = DECORS[kind]
       const bw = cw * 0.66
       const bh = 32 * ui
-      if (farm.level < info.level) text('🔒 ' + t.levelNeeded + ' ' + info.level, cx + cw / 2, cy + ch * 0.76, 12 * ui, C.muted, 'center', 800, null)
-      else
-        coinButton(info.price, cx + (cw - bw) / 2, cy + ch * 0.64, bw, bh, C.gold, farm.s.coins >= info.price, () => {
-          placing = kind
-          panel = null
-          hover = toWorld(width / 2, height / 2)
-        })
+      const start = (stock: boolean) => {
+        if (scene !== 'home' || visit) {
+          toast = { title: t.notHere, text: '', life: 2 }
+          sound.denied()
+          return
+        }
+        placing = kind
+        placingStock = stock
+        panel = null
+        hover = toWorld(width / 2, height / 2)
+      }
+      if (info.where) button(`${t.place} · x${farm.stockOf(kind)}`, cx + (cw - bw) / 2, cy + ch * 0.64, bw, bh, C.teal, true, () => start(true))
+      else if (farm.level < info.level) text('🔒 ' + t.levelNeeded + ' ' + info.level, cx + cw / 2, cy + ch * 0.76, 12 * ui, C.muted, 'center', 800, null)
+      else coinButton(info.price, cx + (cw - bw) / 2, cy + ch * 0.64, bw, bh, C.gold, farm.s.coins >= info.price, () => start(false))
     })
   }
   buttons.push(box.close)
@@ -3141,10 +5002,10 @@ function setSound(on: boolean) {
 }
 
 function drawSettingsPanel() {
-  const box = panelFrame(t.settings, 520, 430, C.sky)
+  const box = panelFrame(t.settings, 520, 500, C.sky)
   const x = box.x + 22 * ui
   const w = box.w - 44 * ui
-  const rowH = Math.min(84 * ui, (box.h - 20 * ui) / 4)
+  const rowH = Math.min(84 * ui, (box.h - 20 * ui) / 5)
   let y = box.y + 12 * ui
   // Nickname.
   slot(x, y, w, rowH - 10 * ui)
@@ -3184,6 +5045,16 @@ function drawSettingsPanel() {
   text(t.soundHelp, x + 16 * ui, y + 38 * ui, 11 * ui, C.muted, 'left', 700, null)
   const on = soundOn()
   toggle(on, x + w - 70 * ui, y + (rowH - 10 * ui) / 2 - 15 * ui, 56 * ui, 30 * ui, true, () => setSound(!on))
+  y += rowH
+  // The clock.
+  slot(x, y, w, rowH - 10 * ui)
+  const real = clockMode() === 'real'
+  text(t.realTime, x + 16 * ui, y + 18 * ui, 15 * ui, C.text, 'left', 900, null)
+  text(real ? t.realTimeHelp : t.fastDays, x + 16 * ui, y + 38 * ui, fitSize(real ? t.realTimeHelp : t.fastDays, w - 110 * ui, 11 * ui, 700), C.muted, 'left', 700, null)
+  toggle(real, x + w - 70 * ui, y + (rowH - 10 * ui) / 2 - 15 * ui, 56 * ui, 30 * ui, true, () => {
+    setClockMode(real ? 'fast' : 'real')
+    sound.plant()
+  })
   y += rowH
   // My farmer.
   button('👤 ' + t.myFarmer, x + w * 0.2, y + 4 * ui, w * 0.6, 46 * ui, C.plum, !visit, () => (panel = 'avatar'))
@@ -3272,10 +5143,11 @@ function drawVisitorPanel(id: string) {
     panel = null
     return
   }
-  const box = panelFrame(clip(v.name, 22), 420, 340, v.host ? C.teal : C.rose)
+  const guest = guests.has(id)
+  const box = panelFrame(clip(v.name, 22), 420, guest ? 400 : 340, v.host ? C.teal : C.rose)
   const cx = box.x + box.w / 2
-  drawFarmer(ctx, v.look, cx, box.y + box.h * 0.5, Math.min(box.h * 0.4, 120 * ui), clock, 1, false)
-  text(v.host ? `🏠 ${t.visitingTitle} ${v.name}` : `${t.level} ${v.level}`, cx, box.y + box.h * 0.6, 14 * ui, C.text, 'center', 900, null)
+  drawFarmer(ctx, v.look, cx, box.y + box.h * (guest ? 0.4 : 0.5), Math.min(box.h * (guest ? 0.32 : 0.4), 120 * ui), clock, 1, false)
+  text(v.host ? `🏠 ${t.visitingTitle} ${v.name}` : `${t.level} ${v.level}`, cx, box.y + box.h * (guest ? 0.47 : 0.6), 14 * ui, C.text, 'center', 900, null)
   const bw = Math.min(170 * ui, box.w * 0.42)
   const room = farmRoom
   const wave = () => {
@@ -3284,6 +5156,9 @@ function drawVisitorPanel(id: string) {
     sound.coin()
   }
   if (guests.has(id)) {
+    const owed = guests.get(id)!.owed
+    text(owed > 0 ? `${t.youOwe} ${owed}${owed >= FRIEND_LIMIT ? ' · ' + t.stopsHelping : ''}` : t.nothingOwed, cx, box.y + box.h * 0.55, 13 * ui, owed >= FRIEND_LIMIT ? C.coralDark : C.muted, 'center', 800, null)
+    coinButton(owed, cx - bw / 2, box.y + box.h * 0.6, bw, 42 * ui, C.teal, owed > 0 && home.s.coins >= owed, () => payFriend(id))
     button('👋 ' + t.wave, cx - bw - 6 * ui, box.y + box.h - 60 * ui, bw, 44 * ui, C.sky, true, wave)
     button(t.sendHome, cx + 6 * ui, box.y + box.h - 60 * ui, bw, 44 * ui, C.coral, true, () => sendHome(id))
   } else button('👋 ' + t.wave, cx - bw / 2, box.y + box.h - 60 * ui, bw, 44 * ui, C.sky, true, wave)
@@ -3334,7 +5209,8 @@ function drawVisitBanner() {
   const cx = x + w / 2
   card(x, y, w, 50 * ui, 16 * ui, C.mint, 2.5)
   text(title, cx, y + 17 * ui, fitSize(title, w - 24 * ui, 15 * ui, 900), C.text, 'center', 900, null)
-  text(t.visitingHelp, cx, y + 36 * ui, fitSize(t.visitingHelp, w - 24 * ui, 11 * ui, 700), C.text, 'center', 700, null)
+  const line = owedByHost > 0 ? `💰 ${visit.name} ${t.owesYou} ${owedByHost} / ${FRIEND_LIMIT}` : t.visitingHelp
+  text(line, cx, y + 36 * ui, fitSize(line, w - 24 * ui, 11 * ui, 700), owedByHost >= FRIEND_LIMIT ? C.coralDark : C.text, 'center', 800, null)
 }
 
 /** An invitation received: it slides in, with a countdown. */
@@ -3369,6 +5245,29 @@ function drawInvitation() {
   button(t.decline, x + 12 * ui, y + h - 60 * ui, bw, 42 * ui, '#a99bb0', true, declineInvitation)
   button(t.accept, x + 24 * ui + bw, y + h - 60 * ui, bw, 42 * ui, C.teal, !travel, acceptInvitation)
   ctx.restore()
+}
+
+/** The farmer sleeps: the screen goes dark, z's float, the energy bar fills. */
+function drawSleep() {
+  if (!sleeping) return
+  buttons.push({ x: 0, y: 0, w: width, h: height, enabled: true, action: () => {} })
+  const k = sleeping.t / SLEEP_TIME
+  const a = Math.min(1, k * 4, (1 - k) * 4)
+  ctx.fillStyle = `rgba(20, 16, 48, ${0.82 * a})`
+  ctx.fillRect(0, 0, width, height)
+  ctx.globalAlpha = a
+  for (let i = 0; i < 3; i++) {
+    const z = (sleeping.t * 0.5 + i / 3) % 1
+    text('Z', width / 2 + 30 * ui + z * 50 * ui, height * 0.42 - z * 70 * ui, (20 + z * 26) * ui, '#e8e0ff', 'center', 900)
+  }
+  text(sleeping.night ? t.sleepingNight : t.napping, width / 2, height * 0.55, 20 * ui, '#fff', 'center', 900)
+  const w = Math.min(width - 60, 260 * ui)
+  const fill = Math.min(1, (home.energy + (sleeping.night ? ENERGY.max : ENERGY.nap) * Math.min(1, k * 1.3)) / ENERGY.max)
+  roundRect(ctx, (width - w) / 2, height * 0.62, w, 14 * ui, 7 * ui)
+  paint(ctx, 'rgba(255,255,255,0.2)', 2)
+  roundRect(ctx, (width - w) / 2, height * 0.62, w * fill, 14 * ui, 7 * ui)
+  paint(ctx, '#7fcf5a')
+  ctx.globalAlpha = 1
 }
 
 /** Between two farms: a curtain of clouds sweeps across the screen. */
@@ -3517,7 +5416,6 @@ function draw() {
   buttons = []
   framed = false
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-  const light = daylight()
   drawWorld(light)
   if (!started) {
     drawTitle()
@@ -3530,9 +5428,11 @@ function draw() {
     panelAt = clock
   }
   drawHud()
-  drawSeedBar()
+  if (scene === 'home') drawSeedBar()
+  else seedBarRight = 0
   drawMenuButtons()
   drawVisitBanner()
+  drawIslandBanner()
   drawOverlays()
   if (placing) drawPlacingBanner()
   if (panel === 'barn') drawBarnPanel()
@@ -3541,6 +5441,12 @@ function draw() {
   else if (panel === 'avatar') drawAvatarPanel()
   else if (panel === 'online') drawOnlinePanel()
   else if (panel === 'settings') drawSettingsPanel()
+  else if (panel === 'merchant') drawMerchantPanel()
+  else if (panel === 'stall') drawStallPanel()
+  else if (panel === 'keeper') drawKeeperPanel()
+  else if (panel && 'travel' in panel) drawTravelPanel(panel.travel)
+  else if (panel && 'tree' in panel) drawTreePanel(panel.tree)
+  else if (panel && 'seller' in panel) drawSellerPanel(panel.seller)
   else if (panel && 'visitor' in panel) drawVisitorPanel(panel.visitor)
   else if (panel && 'person' in panel) drawPersonPanel(panel.person)
   else if (panel && 'zone' in panel) drawZonePanel(panel.zone)
@@ -3556,6 +5462,7 @@ function draw() {
     paint(ctx, 'rgba(61, 42, 69, 0.85)', 2)
     text('⌨ ' + t.clickToFocus, width / 2, height - 118 * ui, fitSize('⌨ ' + t.clickToFocus, w - 20 * ui, 13 * ui, 800), '#fff', 'center', 800, null)
   }
+  drawSleep()
   drawTravel()
   if (paused) {
     ctx.fillStyle = 'rgba(40, 25, 55, 0.5)'
@@ -3618,13 +5525,19 @@ canvas.addEventListener('pointerdown', (event) => {
       return
     }
   }
+  if (catchShootingStar(p.x, p.y)) return
   const w = toWorld(p.x, p.y)
   if (placing) {
     hover = w
     gesture = { mode: 'pending', startX: p.x, startY: p.y, lastX: p.x, lastY: p.y }
     return
   }
-  const hit = plotAt(w.x, w.y)
+  // A player standing on a field: tapping them opens their panel, it does not harvest under them.
+  if (scene === 'home' && visitorAt(w.x, w.y)) {
+    gesture = { mode: 'pending', startX: p.x, startY: p.y, lastX: p.x, lastY: p.y }
+    return
+  }
+  const hit = scene === 'home' ? plotAt(w.x, w.y) : null
   if (hit && tool === 'tractor' && !visit) {
     sendTractor(hit.place)
     gesture = null
@@ -3634,7 +5547,7 @@ canvas.addEventListener('pointerdown', (event) => {
     touchPlot(hit)
     goTo((hit.place.x + hit.place.w / 2) * TILE, (hit.place.y + hit.place.h) * TILE + 14)
   } else {
-    gesture = { mode: 'pending', startX: p.x, startY: p.y, lastX: p.x, lastY: p.y, place: placeAt(w.x, w.y) }
+    gesture = { mode: 'pending', startX: p.x, startY: p.y, lastX: p.x, lastY: p.y, place: scene === 'home' ? placeAt(w.x, w.y) : undefined }
   }
 })
 
@@ -3677,13 +5590,17 @@ function pointerEnd(event: PointerEvent) {
   if (!gesture) return
   const p = position(event)
   const w = toWorld(p.x, p.y)
-  const visitor = gesture.mode === 'pending' && !placing ? visitorAt(w.x, w.y) : null
+  const visitor = gesture.mode === 'pending' && !placing && scene === 'home' ? visitorAt(w.x, w.y) : null
+  const tapped = gesture.mode === 'pending' && !placing && !visitor ? interactiveAt(w.x, w.y) : null
+  const shopper = gesture.mode === 'pending' && scene === 'market' ? [...shoppers.values()].find((s) => Math.abs(w.x - s.x) < 26 && w.y > s.y - 64 && w.y < s.y + 12) : null
   if (gesture.mode === 'farm') endSwipe(w.x, w.y)
+  else if (shopper) panel = { seller: shopper.id }
+  else if (tapped) interact(tapped)
   else if (visitor) panel = { visitor: visitor.id }
   else if (gesture.mode === 'pending' && placing) placeDecorAt(w.x, w.y)
   else if (gesture.mode === 'pending' && gesture.place) tapPlace(gesture.place)
   else if (gesture.mode === 'pending') {
-    const zone = visit ? null : zoneAt(w.x, w.y)
+    const zone = visit || scene !== 'home' ? null : zoneAt(w.x, w.y)
     if (zone) panel = { zone }
     else goTo(w.x, w.y)
   }
@@ -3716,7 +5633,7 @@ window.addEventListener('keydown', (event) => {
     if (key === ' ' || key === 'Enter') startGame()
     return
   }
-  if (paused || travel) return
+  if (paused || travel || sleeping) return
   if (invitation && !panel) {
     if (key === 'Enter' || key === 'y') {
       acceptInvitation()
@@ -3802,4 +5719,18 @@ play
     loadShop()
     joinLobby()
     joinFarmRoom()
+    // ?scene=orchard (or market, ruins) starts on that island (to see it at once).
+    const start = new URLSearchParams(location.search).get('scene')
+    if (start === 'orchard' || start === 'market' || start === 'ruins') {
+      scene = start
+      const at = arrival(start)
+      placeFarmer(at.x, at.y)
+      fitCamera()
+      if (start === 'market') joinMarket()
+    }
+    // ?panel=keeper (merchant, stall, travel-dock, travel-pad, tree-3...) opens a window (development).
+    const open = new URLSearchParams(location.search).get('panel') || ''
+    if (open === 'keeper' || open === 'merchant' || open === 'stall' || open === 'barn' || open === 'shop' || open === 'settings') panel = open
+    else if (open.startsWith('travel-')) panel = { travel: open === 'travel-pad' ? 'pad' : 'dock' }
+    else if (open.startsWith('tree-')) panel = { tree: Math.max(0, Math.min(11, Number(open.slice(5)) || 0)) }
   })

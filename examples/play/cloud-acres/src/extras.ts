@@ -306,6 +306,97 @@ export function drawDecor(ctx: Ctx, kind: string, x: number, y: number, t: numbe
     ellipse(ctx, -3, -12, 1.5, 1.5, C.ink)
     ellipse(ctx, 3, -12, 1.5, 1.5, C.ink)
     ctx.restore()
+  } else if (kind === 'lantern') {
+    // A paper lantern hanging from a curved pole.
+    shadow(ctx, x, y + 2, 12, 4)
+    ctx.strokeStyle = C.woodDark
+    ctx.lineWidth = 3
+    ctx.beginPath()
+    ctx.moveTo(x - 6, y)
+    ctx.quadraticCurveTo(x - 8, y - 50, x + 10, y - 58)
+    ctx.stroke()
+    const sway = Math.sin(t * 1.8) * 0.12
+    ctx.save()
+    ctx.translate(x + 10, y - 56)
+    ctx.rotate(sway)
+    ellipse(ctx, 0, 14, 10, 13, C.coral, 0, 1.5)
+    ctx.strokeStyle = 'rgba(61,42,69,0.35)'
+    ctx.lineWidth = 1
+    for (const dy of [8, 14, 20]) {
+      ctx.beginPath()
+      ctx.moveTo(-9, dy)
+      ctx.lineTo(9, dy)
+      ctx.stroke()
+    }
+    ellipse(ctx, 0, 14, 4, 6, 'rgba(255, 230, 150, 0.85)')
+    roundRect(ctx, -4, 0, 8, 3, 1)
+    paint(ctx, C.gold)
+    ctx.restore()
+  } else if (kind === 'cloudstatue') {
+    // A stone cloud with a calm face, on a plinth.
+    shadow(ctx, x, y + 2, 24, 7)
+    roundRect(ctx, x - 16, y - 12, 32, 13, 3)
+    paint(ctx, '#cfc8dc', 1.5)
+    const bob = Math.sin(t * 1.2) * 1.5
+    ctx.beginPath()
+    for (const [dx, dy, r] of [
+      [-12, -24, 10],
+      [0, -32, 13],
+      [13, -24, 10],
+    ]) {
+      ctx.moveTo(x + dx + r, y + dy + bob)
+      ctx.arc(x + dx, y + dy + bob, r, 0, Math.PI * 2)
+    }
+    paint(ctx, '#f2eef8', 1.5)
+    ctx.fillRect(x - 12, y - 24 + bob, 25, 10)
+    ellipse(ctx, x - 5, y - 28 + bob, 1.6, 1, C.ink)
+    ellipse(ctx, x + 5, y - 28 + bob, 1.6, 1, C.ink)
+    ctx.strokeStyle = C.ink
+    ctx.lineWidth = 1.2
+    ctx.beginPath()
+    ctx.arc(x, y - 25 + bob, 3, 0.3, Math.PI - 0.3)
+    ctx.stroke()
+  } else if (kind === 'kenteflag') {
+    // A tall pole with a kente-patterned flag waving.
+    shadow(ctx, x, y + 2, 10, 4)
+    roundRect(ctx, x - 2, y - 70, 4, 72, 2)
+    paint(ctx, C.woodDark, 1.2)
+    ellipse(ctx, x, y - 71, 3.5, 3.5, C.gold, 0, 1)
+    const colors = [C.gold, '#2f9e5b', C.coral, '#2b2235']
+    for (let i = 0; i < 8; i++) {
+      const wv = Math.sin(t * 4 - i * 0.7) * 3
+      for (let j = 0; j < 3; j++) {
+        ctx.fillStyle = colors[(i + j * 2) % colors.length]
+        ctx.fillRect(x + 2 + i * 4.5, y - 68 + j * 7 + wv, 4.6, 7)
+      }
+    }
+    ctx.strokeStyle = C.ink
+    ctx.lineWidth = 1.2
+    ctx.strokeRect(x + 2, y - 68 + Math.sin(t * 4) * 3, 36, 21)
+  } else if (kind === 'starshard') {
+    // The reward of the ruins: a shard of star floating over a stone.
+    shadow(ctx, x, y + 2, 18, 5)
+    roundRect(ctx, x - 14, y - 10, 28, 11, 4)
+    paint(ctx, '#8b80a8', 1.5)
+    const bob = Math.sin(t * 1.5) * 3
+    ellipse(ctx, x, y - 34 + bob, 22, 22, `rgba(255, 240, 180, ${0.18 + 0.08 * Math.sin(t * 3)})`)
+    ctx.beginPath()
+    ctx.moveTo(x, y - 52 + bob)
+    ctx.lineTo(x + 9, y - 34 + bob)
+    ctx.lineTo(x, y - 18 + bob)
+    ctx.lineTo(x - 9, y - 34 + bob)
+    ctx.closePath()
+    paint(ctx, '#fff1b0', 1.5)
+    ctx.beginPath()
+    ctx.moveTo(x, y - 52 + bob)
+    ctx.lineTo(x + 9, y - 34 + bob)
+    ctx.lineTo(x, y - 18 + bob)
+    ctx.closePath()
+    paint(ctx, '#ffd95a')
+    for (let i = 0; i < 4; i++) {
+      const a = t + (i / 4) * Math.PI * 2
+      ellipse(ctx, x + Math.cos(a) * 16, y - 34 + bob + Math.sin(a) * 6, 1.5, 1.5, '#fff8d8')
+    }
   } else if (kind === 'fountain') {
     ellipse(ctx, x, y, 34, 14, '#d8d2e4', 0, 2)
     ellipse(ctx, x, y - 2, 29, 10, C.water)
